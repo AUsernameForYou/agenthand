@@ -103,7 +103,10 @@ def test_cut_out_without_concept_plans_internally():
     assert _ledger_records() == []
 
 
-def test_draw_runs_the_real_pipeline_with_a_placeholder_plate():
+def test_draw_runs_the_real_pipeline_with_a_placeholder_plate(monkeypatch):
+    # The placeholder plate is offline dev mode now (draw is wired to
+    # muse-image-1.0); the test opts in through the explicit flag.
+    monkeypatch.setenv("AGENTHAND_DRAW_PLACEHOLDER_PLATE", "1")
     store = AssetStore(config.get_data_dir())
     fg = _seed_foreground(store)
 
@@ -138,11 +141,13 @@ def test_draw_rejects_a_non_foreground_before_billing():
     assert _ledger_records() == []  # refused before the gate: no reservation
 
 
-def test_stub_calls_refuse_when_ledger_already_over_cap():
-    # Seed the ledger past the cap; even $0 stub calls must refuse, because
-    # the choke point checks before the (future) billable call. draw is
-    # the remaining $0-through-the-gate tool (its plate is still local);
-    # wired cut_out checks configuration before it ever reaches the gate.
+def test_stub_calls_refuse_when_ledger_already_over_cap(monkeypatch):
+    # Seed the ledger past the cap; even $0 calls must refuse, because
+    # the choke point checks before the billable call. draw in its
+    # offline dev mode (placeholder plate behind the flag) is the
+    # remaining $0-through-the-gate path; the wired tools check
+    # configuration and reserve real amounts before they reach it.
+    monkeypatch.setenv("AGENTHAND_DRAW_PLACEHOLDER_PLATE", "1")
     store = AssetStore(config.get_data_dir())
     fg = _seed_foreground(store)
     path = config.get_ledger_path()

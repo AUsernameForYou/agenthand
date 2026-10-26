@@ -239,3 +239,67 @@ the hackathon credits to land.
 - scripts/smoke_cut_out.py added (image path + optional concept;
   prints the result and new ledger lines). NOT run: live verification
   of cut_out against the real API is the next step.
+
+## 2026-10-26 - draw wired to Muse Image (live verification pending)
+
+- meta_client.generate_background_plate is the draw plate path: it
+  reserves the per-image price ($0.01) through billed_call, calls
+  muse-image-1.0, stores the result as a background_plate asset, and
+  settles at the actual usage (images=1). The raw call lives in
+  _request_plate_image beside the other transports (injectable client,
+  built with max_retries=0 like the rest); it accepts b64_json or a
+  url payload and normalizes whatever returns to RGBA PNG bytes.
+- The caller's scene words are wrapped, verbatim, in a fixed plate
+  instruction: an EMPTY scene, a clear unobstructed central surface,
+  no product, no people, no text. What comes back is a stage, never a
+  picture of a product; the image model never receives product pixels.
+- Plate size behavior: the request asks for the supported size closest
+  to the product's dimensions from the standard OpenAI-style list
+  (1024x1024, 1536x1024, 1024x1536, 1792x1024, 1024x1792; nearest
+  aspect ratio, larger plate wins ties). The compositor then fits the
+  returned plate to the product's exact dimensions — the plate adapts,
+  the product layer is never scaled, per the Fidelity Lock rule
+  already in composite.py.
+- draw flow: validate (kind, lineage, integrity) before anything is
+  billed — unchanged — then reserve + generate the plate, composite
+  through the real draw_product, and return the composite handle, an
+  image preview, and the fidelity receipt computed from the REAL
+  composite. The receipt now also pins the plate (asset handle plus
+  file and pixel hashes). If the compositor ever measured changed
+  opaque pixels, draw returns a FIDELITY_VIOLATION error instead of
+  shipping a false receipt.
+- Failure behavior: no key -> NOT_CONFIGURED before billing, no ledger
+  write. Plate-call failures return structured errors with the
+  reservation counted: IMAGE_REFUSED (explicit safety refusal),
+  BAD_IMAGE_RESPONSE (no usable image), IMAGE_CALL_FAILED (transport
+  raised). A failed draw never regenerates the product and never
+  substitutes the placeholder plate; the placeholder survives ONLY
+  behind the explicit AGENTHAND_DRAW_PLACEHOLDER_PLATE dev flag, for
+  offline tests and no-key demos.
+- API contract assumptions, recorded for live verification:
+  muse-image-1.0 is called via client.images.generate (OpenAI-style)
+  with model/prompt/size/n and returns data[0].b64_json (a url payload
+  is handled as a fallback); the endpoint accepts the standard
+  OpenAI-style sizes listed above — if it takes arbitrary WxH sizes,
+  closest_image_size's candidate list is the only thing to widen; a
+  safety refusal surfaces either as an item-level refusal field, an
+  empty data list with a refusal/error on the response, or a raised
+  SDK error. If the live contract differs, _request_plate_image and
+  _plate_bytes_from_response in meta_client are where the correction
+  lands.
+- Tests: 106 pass (was 95). New offline suite (test_draw.py, mocked
+  images transport): the live plate priced at $0.01 and settled with
+  images=1, the wrapped prompt carrying the scene words verbatim, the
+  closest-size choice, a mocked plate composited under a known
+  foreground with opaque pixels byte-identical, the plate pinned in
+  the receipt, the empty/refusal/transport failure shapes with spend
+  counted, NOT_CONFIGURED with no ledger write, a non-foreground
+  refused before any reservation or API call, the placeholder working
+  only under its flag, and an explicit assertion that a mocked draw
+  leaves the repo's real ledger byte-identical. The two placeholder
+  tests in test_tools.py now opt into the dev flag explicitly.
+- scripts/smoke_draw.py added (photo path + scene prompt runs
+  cut_out -> draw; --asset runs draw directly on a foreground handle;
+  prints results, the fidelity receipt, and new ledger lines). NOT
+  run: live verification of draw against the real API is the next
+  step.

@@ -111,3 +111,18 @@ def get_meta_api_key() -> str | None:
     _load_dotenv()
     raw = os.environ.get("META_API_KEY", "").strip()
     return raw or None
+
+
+def use_placeholder_plate() -> bool:
+    """True when draw may use the local placeholder plate (dev only).
+
+    AGENTHAND_DRAW_PLACEHOLDER_PLATE=1 (also true/yes/on) puts draw in
+    its offline mode: the background plate is the deterministic local
+    placeholder from composite.py and no image-model call is made. This
+    exists ONLY for offline tests and no-key demos. Live mode is the
+    default: without the flag, draw calls muse-image-1.0 and never
+    silently substitutes the placeholder for a real plate.
+    """
+    _load_dotenv()
+    raw = os.environ.get("AGENTHAND_DRAW_PLACEHOLDER_PLATE", "").strip().lower()
+    return raw in ("1", "true", "yes", "on")

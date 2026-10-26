@@ -632,3 +632,263 @@ def segment_image(
         usage["input_tokens"] = int(getattr(raw_usage, "input_tokens", 0) or 0)
         usage["output_tokens"] = int(getattr(raw_usage, "output_tokens", 0) or 0)
     return _responses_output_text(response), usage
+
+
+# ---------------------------------------------------------------------------
+# Muse Image background plates (images API transport).
+# ---------------------------------------------------------------------------
+
+# Sizes the image call may request. The Meta image endpoint's exact
+# size list is not yet verified live; these are the standard
+# OpenAI-style sizes, and the request always uses the closest one to
+# the product's dimensions. The compositor then fits the returned
+# plate to the product's exact dimensions (plate only; the product
+# layer is never scaled), so a size that is merely close costs nothing
+# in fidelity. If the live endpoint accepts arbitrary WxH sizes, this
+# list is the only thing to widen.
+_IMAGE_SIZE_CANDIDATES: tuple[tuple[int, int], ...] = (
+    (1024, 1024),
+    (1536, 1024),
+    (1024, 1536),
+    (1792, 1024),
+    (1024, 1792),
+)
+
+# The fixed plate instruction wrapped around the caller's scene words.
+# The plate is a STAGE, not a picture of the product: it must come back
+# empty, with a clear place for the product to sit, because the real
+# product layer is composited onto it locally under the Fidelity Lock.
+_PLATE_INSTRUCTION = (
+    "An empty scene photographed straight-on: the setting described "
+    "below, with a clear, unobstructed flat surface in the center "
+    "foreground where an object will be placed later. The scene is "
+    "EMPTY: no product, no featured object on the central surface, no "
+    "people, no animals, no text, no logos, no watermark. Scene: "
+)
+
+
+class ImageResultError(RuntimeError):
+    """Raised when a muse-image plate call cannot produce a plate.
+
+    Codes:
+        IMAGE_REFUSED: the model refused the prompt (safety filter) or
+            returned an explicit refusal instead of an image.
+        BAD_IMAGE_RESPONSE: the call completed but carried no usable
+            image (no data, undecodable bytes).
+        IMAGE_CALL_FAILED: the transport call itself raised (HTTP
+            error, timeout, ...).
+
+    When this propagates out of the billed_call fn, the reservation
+    stays counted: the call may have billed, so the spend is treated
+    as spent.
+    """
+
+    def __init__(self, code: str, message: str):
+        super().__init__(message)
+        self.code = code
+
+
+def wrap_plate_prompt(scene_prompt: str) -> str:
+    """Wrap the caller's scene words in the fixed empty-plate instruction.
+
+    The user's scene description is preserved verbatim at the end; the
+    wrapper only adds the constraints that make the result a usable
+    plate (empty, centered surface, no product/people/text).
+    """
+    return _PLATE_INSTRUCTION + scene_prompt
+
+
+def closest_image_size(width: int | None, height: int | None) -> str:
+    """The supported request size closest to the given dimensions.
+
+    Closest means nearest aspect ratio; ties go to the larger plate,
+    because the compositor's fit downscales more gracefully than it
+    upscales. Unknown dimensions fall back to the square default.
+    """
+    if not width or not height:
+        return "1024x1024"
+    target = math.log(width / height)
+
+    def score(candidate: tuple[int, int]) -> tuple[float, int]:
+        w, h = candidate
+        return (abs(math.log(w / h) - target), -(w * h))
+
+    best = min(_IMAGE_SIZE_CANDIDATES, key=score)
+    return f"{best[0]}x{best[1]}"
+
+
+def project_draw_cost_usd(model: str) -> float:
+    """Worst-case USD projection for one draw invocation: one plate image."""
+    return pricing.estimate_cost_usd(model, images=1)
+
+
+def _plate_bytes_from_response(response) -> bytes:
+    """Extract normalized RGBA PNG bytes from an images API response.
+
+    Accepts b64_json (the usual OpenAI-compatible shape) or a url
+    (fetched once). Raises ImageResultError: IMAGE_REFUSED for an
+    explicit refusal, BAD_IMAGE_RESPONSE for anything else unusable.
+    """
+    data = getattr(response, "data", None) or []
+    if not data:
+        refusal = getattr(response, "refusal", None) or getattr(
+            response, "error", None
+        )
+        if refusal:
+            raise ImageResultError(
+                "IMAGE_REFUSED",
+                f"The image model refused the plate prompt: {refusal}",
+            )
+        raise ImageResultError(
+            "BAD_IMAGE_RESPONSE",
+            "The image model returned no image data for the plate prompt.",
+        )
+    item = data[0]
+    refusal = getattr(item, "refusal", None)
+    if refusal:
+        raise ImageResultError(
+            "IMAGE_REFUSED",
+            f"The image model refused the plate prompt: {refusal}",
+        )
+    raw: bytes | None = None
+    b64 = getattr(item, "b64_json", None)
+    if isinstance(b64, str) and b64:
+        try:
+            raw = base64.b64decode(b64)
+        except (ValueError, TypeError) as exc:
+            raise ImageResultError(
+                "BAD_IMAGE_RESPONSE",
+                f"The plate image payload is not valid base64: {exc}",
+            ) from exc
+    if raw is None:
+        url = getattr(item, "url", None)
+        if isinstance(url, str) and url:
+            import urllib.request
+
+            try:
+                with urllib.request.urlopen(url, timeout=60) as fh:
+                    raw = fh.read()
+            except Exception as exc:  # noqa: BLE001 - reported as a call failure
+                raise ImageResultError(
+                    "IMAGE_CALL_FAILED",
+                    f"Fetching the generated plate image failed: {exc}",
+                ) from exc
+    if not raw:
+        raise ImageResultError(
+            "BAD_IMAGE_RESPONSE",
+            "The image model returned an item with neither b64_json nor url.",
+        )
+    # Normalize whatever came back (PNG, JPEG, ...) to RGBA PNG bytes so
+    # the asset store, hashes, and compositor all see one format.
+    from io import BytesIO
+
+    from PIL import Image
+
+    try:
+        with Image.open(BytesIO(raw)) as img:
+            img.load()
+            buffer = BytesIO()
+            img.convert("RGBA").save(buffer, format="PNG")
+            return buffer.getvalue()
+    except Exception as exc:  # noqa: BLE001 - any decode failure is unusable
+        raise ImageResultError(
+            "BAD_IMAGE_RESPONSE",
+            f"The plate payload does not decode as an image: {exc}",
+        ) from exc
+
+
+def _request_plate_image(
+    prompt: str,
+    width: int | None,
+    height: int | None,
+    *,
+    model: str,
+    client=None,
+) -> tuple[bytes, UsageDict]:
+    """One real muse-image call; returns (plate PNG bytes, usage).
+
+    `prompt` is the caller's raw scene description; the fixed plate
+    instruction is wrapped around it here so no caller can forget it.
+    Usage reports images=1 (the model is priced per image successfully
+    returned); token counts, if the response carries them, are merged
+    in for the receipt but do not affect the per-image price.
+
+    This function performs network I/O and must only be invoked inside
+    a billed_call fn (generate_background_plate, today). `client` is
+    injectable for offline tests; when omitted, the real client is
+    built (which raises NotConfiguredError if no key is configured).
+    """
+    if client is None:
+        client = build_client()
+    size = closest_image_size(width, height)
+    try:
+        response = client.images.generate(
+            model=model,
+            prompt=wrap_plate_prompt(prompt),
+            size=size,
+            n=1,
+        )
+    except ImageResultError:
+        raise
+    except Exception as exc:  # noqa: BLE001 - SDK/transport failure
+        raise ImageResultError(
+            "IMAGE_CALL_FAILED",
+            f"The muse-image plate call failed: {exc}",
+        ) from exc
+    png_bytes = _plate_bytes_from_response(response)
+    usage: UsageDict = {"images": 1}
+    raw_usage = getattr(response, "usage", None)
+    if raw_usage is not None:
+        usage["input_tokens"] = int(getattr(raw_usage, "input_tokens", 0) or 0)
+        usage["output_tokens"] = int(getattr(raw_usage, "output_tokens", 0) or 0)
+    return png_bytes, usage
+
+
+def generate_background_plate(
+    prompt: str,
+    width: int | None,
+    height: int | None,
+    *,
+    model: str = "muse-image-1.0",
+    store=None,
+    client=None,
+) -> tuple[str, dict]:
+    """Generate a background plate through the billing choke point.
+
+    Reserves the per-image price, calls muse-image-1.0 for an EMPTY
+    scene plate (the caller's scene words wrapped in the fixed plate
+    instruction), stores the returned image as a background_plate
+    asset, and settles at the actual usage (one image). Returns
+    (plate handle, billing summary from billed_call).
+
+    The plate is requested at the supported size closest to
+    (width, height) — the product's dimensions — and is deliberately
+    NOT fitted here: the compositor fits the plate to the product's
+    exact dimensions, which is the Fidelity Lock rule (the plate
+    adapts, the product never does).
+
+    Raises NotConfiguredError before any reservation when no key is
+    configured, ImageResultError (spend counted) when the call fails
+    or is refused, and SpendCapExceeded when the reservation would
+    exceed the cap.
+    """
+    if store is None:
+        from .assets import AssetStore
+
+        store = AssetStore(config.get_data_dir())
+    from .assets import KIND_PLATE
+
+    projected = project_draw_cost_usd(model)
+    outcome: dict = {}
+
+    def _call() -> UsageDict:
+        png_bytes, usage = _request_plate_image(
+            prompt, width, height, model=model, client=client
+        )
+        outcome["handle"] = store.put_bytes(
+            png_bytes, kind=KIND_PLATE, suffix=".png"
+        )
+        return usage
+
+    billing = billed_call("draw", model, projected, _call)
+    return outcome["handle"], billing
