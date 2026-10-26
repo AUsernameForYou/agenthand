@@ -146,3 +146,44 @@ the hackathon credits to land.
   is repaired once (usage summed across both calls) and fails closed
   when the repair also falls short. The two scaffold-era tests that
   encoded identify's stub shape were updated to the wired contract.
+
+## 2026-10-26 - First live identify call: truncation found and fixed (live re-verification pending)
+
+- First live smoke (scripts/smoke_identify.py, real key, real call):
+  HTTP 200 from api.meta.ai, but the tool returned BAD_MODEL_RESPONSE —
+  "Identify response is not valid JSON: Unterminated string starting
+  at line 1 column 461". The response was cut off mid-string at
+  max_tokens=1024. The fail-closed path behaved as designed: the
+  reservation was written before the call and stayed counted.
+- Settlement check against the real ledger (data/ledger.jsonl): the
+  smoke call (call_id ff934d79819b4af89fb6725f6f936151) has exactly one
+  line, the pending reservation at $0.01323, and no settled line —
+  correct for a raised call under reserve-then-settle: no settlement is
+  written on failure and ledger_total_usd counts the reservation
+  exactly once (total verified at $0.01323; not dropped, not doubled).
+- Fixes:
+  - max_tokens raised 1024 -> 2048 (IDENTIFY_MAX_TOKENS);
+    project_identify_cost_usd prices from the same constant, so the
+    worst-case reservation tracks the new bound (6x4 test image:
+    $0.01323 -> $0.0188), keeping the x2 repair-call factor.
+  - The identify prompt now demands brevity inside the schema fields:
+    description at most 40 words, each listing bullet at most 12
+    words, condition_notes at most 25 words. Schema unchanged.
+  - Raw-response capture: when an identify response body cannot be
+    parsed as JSON, the full raw text is saved to
+    data/debug/identify-<call_id>.txt (named via a context var set by
+    billed_call, so the file correlates with the ledger call) and the
+    BAD_MODEL_RESPONSE error result carries debug_path. Raw model text
+    is never written to the ledger.
+- Test hermeticity: the repo .env now holds a real key for manual
+  smokes, and config's dotenv loader was leaking it into
+  tests/test_tools.py — its cut_out internal-plan test made real API
+  calls during two suite runs in this session (spend reserved in tmp
+  ledgers; the real ledger was not touched). The module's autouse
+  fixture now deletes META_API_KEY and pins the dotenv loader off, so
+  the suite is fully offline again.
+- Tests: 77 pass (was 76), including a new offline test with a mocked
+  truncated JSON body asserting BAD_MODEL_RESPONSE, the debug file's
+  path and contents, no raw text in the ledger, and the reservation
+  counted exactly once. Live re-verification pending: re-run
+  scripts/smoke_identify.py with the key configured.

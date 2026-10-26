@@ -35,6 +35,7 @@ import json
 import math
 import uuid
 from collections.abc import Callable
+from contextvars import ContextVar
 from pathlib import Path
 
 from . import config, ledger, pricing
@@ -43,6 +44,14 @@ from . import config, ledger, pricing
 UsageDict = dict[str, int]
 
 _USAGE_KEYS = ("input_tokens", "output_tokens", "cached_input_tokens", "images")
+
+# The call_id of the billed_call currently running its fn, if any.
+# billed_call sets it so code deep inside a call (the identify response
+# parser, say) can name its debug artifacts after the ledger call they
+# belong to without threading the id through every signature.
+_current_call_id: ContextVar[str | None] = ContextVar(
+    "agenthand_current_call_id", default=None
+)
 
 
 def _lock_file(data_dir: Path):
@@ -113,7 +122,13 @@ def billed_call(
         )
 
     # Call. If this raises, the reservation stays counted; do not settle.
-    usage = fn() or {}
+    # The call_id rides a context var while fn runs so nested code can
+    # correlate its debug artifacts with this call's ledger records.
+    token = _current_call_id.set(call_id)
+    try:
+        usage = fn() or {}
+    finally:
+        _current_call_id.reset(token)
     usage = {key: int(usage.get(key, 0)) for key in _USAGE_KEYS}
 
     actual_usd = pricing.estimate_cost_usd(model, **usage) if model else 0.0
@@ -153,10 +168,11 @@ def billed_call(
 META_BASE_URL = "https://api.meta.ai/v1"
 
 # Bounded output for the identify call: the structured result is a short
-# description, a few phrases, and listing copy — well under this. The
-# bound is set explicitly on every request because the reservation is
-# priced from it.
-IDENTIFY_MAX_TOKENS = 1024
+# description, a few phrases, and listing copy. The bound is set
+# explicitly on every request because the reservation is priced from
+# it. 2048 (raised from 1024): the first live response (2026-10-26)
+# came back truncated mid-string at the 1024 bound, unparseable.
+IDENTIFY_MAX_TOKENS = 2048
 
 # Allowance for the text side of the identify request (instructions plus
 # schema overhead) when projecting the worst-case input size.
@@ -178,7 +194,21 @@ class IdentifyResultError(RuntimeError):
     alternates contract the repair attempt could not fix. When this
     propagates out of a billed_call fn, the reservation stays counted:
     the call may have billed, so the spend is treated as spent.
+
+    Attributes:
+        raw_response: The full raw model text when the failure is an
+            unparseable response body, else None. Raw model text is
+            never written to the ledger (the ledger records costs and
+            counts only); vision_identify saves it to a debug file.
+        debug_path: Path of the debug file raw_response was saved to,
+            set by the capture step in vision_identify; None when no
+            capture happened.
     """
+
+    def __init__(self, message: str, *, raw_response: str | None = None):
+        super().__init__(message)
+        self.raw_response = raw_response
+        self.debug_path: str | None = None
 
 
 def require_meta_api_key() -> str:
@@ -274,16 +304,18 @@ _IDENTIFY_SCHEMA: dict = {
 
 _IDENTIFY_INSTRUCTIONS = (
     "You are the planning step of a listing-production pipeline. Look at "
-    "the product photo and return the structured result. description: a "
-    "short factual description of the product. concept: ONE short noun "
-    "phrase naming the product, suitable for text-prompted image "
-    "segmentation (e.g. 'brown leather wallet') — the product only, no "
-    "background, no adjectives about the scene. alternates: at least 2 "
-    "different fallback noun phrases for the same product, for use if "
-    "the first phrase segments poorly. suggested_title: a marketplace "
-    "listing title. listing_bullets: 3 to 5 short selling points a buyer "
-    "can verify from the photo. condition_notes: visible wear, damage, "
-    "or defects; say so plainly, or state that none are visible."
+    "the product photo and return the structured result. Be brief in "
+    "every field; the length limits are hard. description: a short "
+    "factual description of the product, at most 40 words. concept: ONE "
+    "short noun phrase naming the product, suitable for text-prompted "
+    "image segmentation (e.g. 'brown leather wallet') — the product "
+    "only, no background, no adjectives about the scene. alternates: at "
+    "least 2 different fallback noun phrases for the same product, for "
+    "use if the first phrase segments poorly. suggested_title: a "
+    "marketplace listing title. listing_bullets: 3 to 5 short selling "
+    "points a buyer can verify from the photo, each at most 12 words. "
+    "condition_notes: visible wear, damage, or defects, in at most 25 "
+    "words; say so plainly, or state that none are visible."
 )
 
 
@@ -326,7 +358,8 @@ def _parse_identify_payload(content: str) -> dict:
         payload = json.loads(content)
     except (json.JSONDecodeError, TypeError) as exc:
         raise IdentifyResultError(
-            f"Identify response is not valid JSON: {exc}"
+            f"Identify response is not valid JSON: {exc}",
+            raw_response=content if isinstance(content, str) else None,
         ) from exc
     if not isinstance(payload, dict):
         raise IdentifyResultError("Identify response is not a JSON object.")
@@ -376,6 +409,29 @@ def _parse_identify_payload(content: str) -> dict:
     }
 
 
+def _capture_raw_response(content: str) -> Path:
+    """Save a raw, unparseable model response under the data dir.
+
+    The text lands in data/debug/identify-<call_id>.txt — operational
+    state beside the asset store, named for the ledger call that
+    produced it. It never goes in the ledger itself: the ledger records
+    costs and counts only, never model text.
+    """
+    call_id = _current_call_id.get() or uuid.uuid4().hex
+    debug_dir = config.get_data_dir() / "debug"
+    debug_dir.mkdir(parents=True, exist_ok=True)
+    path = debug_dir / f"identify-{call_id}.txt"
+    path.write_text(content, encoding="utf-8")
+    return path
+
+
+def _with_debug_capture(exc: IdentifyResultError) -> IdentifyResultError:
+    """Save an unparseable response's raw text and point the error at it."""
+    if exc.raw_response is not None and exc.debug_path is None:
+        exc.debug_path = str(_capture_raw_response(exc.raw_response))
+    return exc
+
+
 def vision_identify(
     png_bytes: bytes,
     *,
@@ -388,7 +444,10 @@ def vision_identify(
     structured-output request and returns (plan, usage). If the first
     response's only defect is too few usable alternates, ONE text-only
     repair call asks for more phrases (its usage is added to the total);
-    a response that is still unusable raises IdentifyResultError.
+    a response that is still unusable raises IdentifyResultError. An
+    unparseable response body (e.g. output truncated at max_tokens) is
+    saved verbatim to data/debug/identify-<call_id>.txt before raising,
+    and the error carries the path as `debug_path`.
 
     This function performs network I/O and must only be invoked as the
     fn of billed_call, so the spend is reserved before it runs and
@@ -418,6 +477,11 @@ def vision_identify(
     try:
         return _parse_identify_payload(content), usage
     except IdentifyResultError as exc:
+        if exc.raw_response is not None:
+            # Unparseable body (truncated, prose, ...): keep the raw
+            # text in a debug file so the failure can be diagnosed, and
+            # let the error carry the path back to the caller.
+            raise _with_debug_capture(exc) from exc
         if not str(exc).startswith("ALTERNATES_SHORTFALL"):
             raise
 
@@ -468,9 +532,11 @@ def vision_identify(
         if not isinstance(extra, list):
             raise TypeError("'alternates' is not a list")
     except (json.JSONDecodeError, TypeError, KeyError) as exc:
-        raise IdentifyResultError(
-            f"Alternates repair response is unusable: {exc}"
-        ) from exc
+        err = IdentifyResultError(
+            f"Alternates repair response is unusable: {exc}",
+            raw_response=repair_content,
+        )
+        raise _with_debug_capture(err) from exc
     merged = dict(partial)
     merged["alternates"] = list(partial.get("alternates") or []) + list(extra)
     # Final contract check; raises if the repair did not fix the shortfall.

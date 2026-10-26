@@ -10,6 +10,7 @@ import base64
 import json
 import os
 from io import BytesIO
+from pathlib import Path
 from types import SimpleNamespace
 
 os.environ.setdefault("AGENTHAND_DATA_DIR", "/tmp/agenthand-test-placeholder")
@@ -168,6 +169,39 @@ def test_identify_malformed_response_fails_closed_and_reservation_counts(monkeyp
     # The billed reservation stays counted as spend; nothing settled.
     records = _records()
     assert [r["phase"] for r in records] == ["pending"]
+    projected = meta_client.project_identify_cost_usd("muse-spark-1.3", 6, 4)
+    assert records[0]["usd_estimate"] == projected
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == projected
+    assert result["error"]["cost_counted_usd"] == projected
+
+
+def test_identify_truncated_response_saves_raw_to_debug_file(monkeypatch):
+    # The first live failure mode: output cut off mid-string at the
+    # token bound, so the body is a JSON prefix that never closes.
+    full = _good_content()
+    truncated = full[: len(full) // 2]
+    assert truncated != full
+    _install_fake(monkeypatch, [_response(truncated)])
+    result = server.identify(_data_uri())
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "BAD_MODEL_RESPONSE"
+
+    # The full raw body was saved under data/debug/, named for the
+    # ledger call, and the error result points at it.
+    records = _records()
+    assert [r["phase"] for r in records] == ["pending"]
+    debug_path = result["error"].get("debug_path")
+    assert debug_path
+    path = Path(debug_path)
+    assert path.parent == config.get_data_dir() / "debug"
+    assert path.name == f"identify-{records[0]['call_id']}.txt"
+    assert path.read_text(encoding="utf-8") == truncated
+
+    # The raw model text never lands in the ledger...
+    assert truncated not in config.get_ledger_path().read_text(encoding="utf-8")
+    # ...and the reservation is counted exactly once: not dropped,
+    # not double-counted.
     projected = meta_client.project_identify_cost_usd("muse-spark-1.3", 6, 4)
     assert records[0]["usd_estimate"] == projected
     assert ledger.ledger_total_usd(config.get_ledger_path()) == projected

@@ -22,6 +22,13 @@ from agenthand.assets import AssetStore  # noqa: E402
 @pytest.fixture(autouse=True)
 def scratch_data_dir(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTHAND_DATA_DIR", str(tmp_path))
+    # These tests exercise the UNCONFIGURED identify path (no key, so
+    # the plan degrades to empty). Keep them hermetic: drop any ambient
+    # key and pin the dotenv loader off, so a real key in the repo .env
+    # (used for manual live smokes) can never leak in and turn a test
+    # into a live API call.
+    monkeypatch.delenv("META_API_KEY", raising=False)
+    monkeypatch.setattr(config, "_DOTENV_LOADED", True)
     yield tmp_path
 
 

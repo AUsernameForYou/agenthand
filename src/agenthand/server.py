@@ -37,7 +37,8 @@ so no external call is made). identify IS wired to the real vision model
 plus listing copy, or a structured error (NOT_CONFIGURED when no
 META_API_KEY is set — checked before any billing, so no ledger write;
 BAD_MODEL_RESPONSE when the model's answer is unusable — the billed
-reservation stays counted). cut_out's segmentation model is not wired
+reservation stays counted; an unparseable body is saved raw under
+data/debug/ and its path rides in the error). cut_out's segmentation model is not wired
 yet; it exercises the ingest, planning, and billing plumbing and returns
 a structured "not yet wired" result.
 """
@@ -201,7 +202,9 @@ def _run_identify(store: AssetStore, handle: str) -> dict:
       so nothing is written to the ledger for a setup problem.
     - BAD_MODEL_RESPONSE: the model's response was unusable. The call
       went through the choke point and its reservation stays counted as
-      spend; cost_counted_usd reports the reserved amount.
+      spend; cost_counted_usd reports the reserved amount. When the body
+      was unparseable, its full raw text was saved under data/debug/
+      and debug_path points at that file.
 
     SpendCapExceeded propagates: an exhausted budget refuses loudly
     rather than degrading into an empty plan.
@@ -229,13 +232,14 @@ def _run_identify(store: AssetStore, handle: str) -> dict:
             "identify", IDENTIFY_MODEL, projected, _call
         )
     except meta_client.IdentifyResultError as exc:
-        return {
-            "error": {
-                "code": "BAD_MODEL_RESPONSE",
-                "message": str(exc),
-                "cost_counted_usd": projected,
-            }
+        error = {
+            "code": "BAD_MODEL_RESPONSE",
+            "message": str(exc),
+            "cost_counted_usd": projected,
         }
+        if getattr(exc, "debug_path", None):
+            error["debug_path"] = exc.debug_path
+        return {"error": error}
     plan = dict(outcome["plan"])
     plan["model"] = IDENTIFY_MODEL
     plan["cost_usd"] = billing["actual_usd"]
