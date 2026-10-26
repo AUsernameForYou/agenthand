@@ -102,3 +102,47 @@ the hackathon credits to land.
   plate, known foreground, zero changed opaque pixels). A live stdio
   smoke test exercises tools/list, resource templates, all three tools,
   and reading the composite back through its resource URI.
+
+## 2026-10-26 - identify wired to the Meta Model API (live verification pending key)
+
+- identify now makes the real vision call. `meta_client.py` gained the
+  live client path: an OpenAI-compatible client (new `openai` dependency)
+  built against https://api.meta.ai/v1 with max_retries=0, so no SDK
+  retry can bypass the spend gate. The call runs only as the fn of
+  billed_call: the reservation is priced as a worst case (image tokens
+  estimated from pixel dimensions at one token per 32x32 patch, plus a
+  bounded max_tokens of 1024 at the output price, times two to cover the
+  one possible repair call), and settlement is priced from the usage the
+  response actually returns — receipts now carry real token counts for
+  identify.
+- The request asks muse-spark-1.3 for strict structured output
+  (json_schema, strict): description, concept (one short noun phrase
+  for segmentation), alternates, plus the listing fields from the J1
+  framing fix — suggested_title, listing_bullets (3-5), condition_notes.
+  The concept/alternates contract is enforced after the call: if the
+  only defect is fewer than 2 usable alternates, one text-only repair
+  call asks for more phrases (its usage is added to the settlement);
+  anything still unusable raises and the reservation stays counted.
+- Key handling: the key is read from META_API_KEY (environment, or a
+  local .env loaded by config — .env is gitignored, verified; no key
+  material exists in the repo). The key check runs BEFORE billed_call:
+  with no key configured, identify returns a structured NOT_CONFIGURED
+  error and writes nothing to the ledger. An unusable model response
+  returns a structured BAD_MODEL_RESPONSE error with the counted cost
+  attached. cut_out's internal planning step runs this same identify
+  path and degrades to an empty plan (with the error surfaced as
+  plan_error) when planning fails.
+- Live smoke script at scripts/smoke_identify.py: takes an image path,
+  runs identify through the tool layer, prints the structured result
+  and the ledger receipt lines. NOT run yet — no API key exists on this
+  machine. Live verification of identify waits for the key to be
+  provided; everything else about the wiring is covered offline.
+- Tests: 76 pass (was 66). New tests/test_identify.py runs the whole
+  path against a mocked transport: structured output parses into the
+  result shape and settles with non-zero token counts on the receipt;
+  a malformed response fails closed with the reservation counted;
+  a missing key yields NOT_CONFIGURED with zero ledger writes; an
+  over-cap ledger refuses before any API call; the alternates shortfall
+  is repaired once (usage summed across both calls) and fails closed
+  when the repair also falls short. The two scaffold-era tests that
+  encoded identify's stub shape were updated to the wired contract.

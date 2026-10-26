@@ -32,10 +32,14 @@ the ledger directly.
 
 Status: draw's compositing pipeline runs locally end to end today with a
 deterministic placeholder plate (the background model is not wired yet,
-so no external call is made). identify's vision model and cut_out's
-segmentation model are not wired yet either; those tools exercise the
-ingest, planning, and billing plumbing and return structured
-"not yet wired" results.
+so no external call is made). identify IS wired to the real vision model
+(muse-spark-1.3) through the billing choke point: it returns the plan
+plus listing copy, or a structured error (NOT_CONFIGURED when no
+META_API_KEY is set — checked before any billing, so no ledger write;
+BAD_MODEL_RESPONSE when the model's answer is unusable — the billed
+reservation stays counted). cut_out's segmentation model is not wired
+yet; it exercises the ingest, planning, and billing plumbing and returns
+a structured "not yet wired" result.
 """
 
 from __future__ import annotations
@@ -155,10 +159,12 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     handle = ingest.ingest(image, store)
     concept_source = "provided"
     alternates: list[str] = []
+    plan_error = None
     if concept is None:
-        plan = _plan_cut(handle)
+        plan = _plan_cut(store, handle)
         concept = plan["concept"]
         alternates = plan["alternates"]
+        plan_error = plan.get("error")
         concept_source = "identify_internal"
     meta_client.billed_call(
         "cut_out",
@@ -175,6 +181,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         "concept": concept,
         "concept_source": concept_source,
         "alternates": alternates,
+        "plan_error": plan_error,
         "output_asset": None,
         "mask_asset": None,
         "model": CUT_OUT_MODEL,
@@ -182,19 +189,81 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     }
 
 
-def _plan_cut(handle: str) -> dict:
+def _run_identify(store: AssetStore, handle: str) -> dict:
+    """Run the real identify planning step for a stored photo.
+
+    On success returns the plan (description, concept, alternates,
+    listing fields) plus cost_usd, usage, and call_id from the settled
+    receipt. Expected failures return {"error": {...}} instead of
+    raising:
+
+    - NOT_CONFIGURED: no META_API_KEY. Checked before billed_call runs,
+      so nothing is written to the ledger for a setup problem.
+    - BAD_MODEL_RESPONSE: the model's response was unusable. The call
+      went through the choke point and its reservation stays counted as
+      spend; cost_counted_usd reports the reserved amount.
+
+    SpendCapExceeded propagates: an exhausted budget refuses loudly
+    rather than degrading into an empty plan.
+    """
+    try:
+        meta_client.require_meta_api_key()
+    except meta_client.NotConfiguredError as exc:
+        return {"error": {"code": "NOT_CONFIGURED", "message": str(exc)}}
+
+    record = store.get_record(handle)
+    store.verify_integrity(handle)
+    png_bytes = store.read_bytes(handle)
+    projected = meta_client.project_identify_cost_usd(
+        IDENTIFY_MODEL, record.width, record.height
+    )
+    outcome: dict = {}
+
+    def _call() -> dict:
+        plan, usage = meta_client.vision_identify(png_bytes, model=IDENTIFY_MODEL)
+        outcome["plan"] = plan
+        return usage
+
+    try:
+        billing = meta_client.billed_call(
+            "identify", IDENTIFY_MODEL, projected, _call
+        )
+    except meta_client.IdentifyResultError as exc:
+        return {
+            "error": {
+                "code": "BAD_MODEL_RESPONSE",
+                "message": str(exc),
+                "cost_counted_usd": projected,
+            }
+        }
+    plan = dict(outcome["plan"])
+    plan["model"] = IDENTIFY_MODEL
+    plan["cost_usd"] = billing["actual_usd"]
+    plan["usage"] = billing["usage"]
+    plan["call_id"] = billing["call_id"]
+    return plan
+
+
+def _plan_cut(store: AssetStore, handle: str) -> dict:
     """The identify planning step, as shared internal logic.
 
     cut_out calls this when no concept is supplied, so the plan is
-    produced inside the chain instead of by a separate tool call. The
-    vision model is not wired yet; the stub plan carries no concept.
+    produced inside the chain instead of by a separate tool call. An
+    expected identify failure (not configured, unusable response)
+    degrades to an empty plan with the error attached: cut_out's own
+    segmentation step is still stubbed, so the chain reports the
+    planning gap in its result instead of crashing.
     """
-    return {
-        "description": None,
-        "concept": None,
-        "alternates": [],
-        "model": IDENTIFY_MODEL,
-    }
+    result = _run_identify(store, handle)
+    if "error" in result:
+        return {
+            "description": None,
+            "concept": None,
+            "alternates": [],
+            "model": IDENTIFY_MODEL,
+            "error": result["error"],
+        }
+    return result
 
 
 @mcp.tool()
@@ -206,33 +275,51 @@ def identify(image: str) -> dict:
             http(s) URL, or a base64 data URI. It is ingested and
             normalized first.
 
-    Returns the plan cut_out consumes: a structured description of the
-    product plus the noun-phrase concept suitable for text-prompted
-    segmentation ("brown leather wallet"), with alternate phrasings the
-    mask-recovery loop can retry with when the first mask is poor. This
+    Reads the photo with the vision model and returns the plan the
+    chain consumes: a structured description, the noun-phrase concept
+    suitable for text-prompted segmentation ("brown leather wallet")
+    with at least two alternate phrasings the mask-recovery loop can
+    retry with, plus listing copy (suggested_title, listing_bullets,
+    condition_notes). The call is billed through the spend-cap choke
+    point and the result carries its actual cost and token usage.
+
+    Without META_API_KEY configured the tool returns a structured
+    NOT_CONFIGURED error and makes no call (and no ledger entry). This
     tool exists to serve the chain; the sellable outputs are cut_out's
-    transparent PNG and draw's staged composite with its fidelity receipt.
+    transparent PNG and draw's staged composite with its fidelity
+    receipt.
     """
     store = _store()
     handle = ingest.ingest(image, store)
-    meta_client.billed_call(
-        "identify",
-        IDENTIFY_MODEL,
-        0.0,
-        lambda: {},
-        status="stub",
-        note=STUB_NOTE,
-    )
-    plan = _plan_cut(handle)
+    result = _run_identify(store, handle)
+    if "error" in result:
+        return {
+            "status": "error",
+            "tool": "identify",
+            "image": handle,
+            "description": None,
+            "concept": None,
+            "alternates": [],
+            "suggested_title": None,
+            "listing_bullets": [],
+            "condition_notes": None,
+            "model": IDENTIFY_MODEL,
+            "error": result["error"],
+        }
     return {
-        "status": "not_yet_wired",
+        "status": "ok",
         "tool": "identify",
         "image": handle,
-        "description": plan["description"],
-        "concept": plan["concept"],
-        "alternates": plan["alternates"],
+        "description": result["description"],
+        "concept": result["concept"],
+        "alternates": result["alternates"],
+        "suggested_title": result["suggested_title"],
+        "listing_bullets": result["listing_bullets"],
+        "condition_notes": result["condition_notes"],
         "model": IDENTIFY_MODEL,
-        "note": STUB_NOTE,
+        "cost_usd": result["cost_usd"],
+        "usage": result["usage"],
+        "call_id": result["call_id"],
     }
 
 

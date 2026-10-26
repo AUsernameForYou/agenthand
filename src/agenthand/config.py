@@ -25,6 +25,7 @@ DEFAULT_TOTAL_SPEND_CAP_USD = 120.00
 
 def get_data_dir() -> Path:
     """Local data dir holding the asset store and the cost ledger."""
+    _load_dotenv()
     raw = os.environ.get("AGENTHAND_DATA_DIR", "").strip()
     if raw:
         return Path(raw).expanduser()
@@ -43,6 +44,7 @@ def get_total_spend_cap_usd() -> float:
     unparseable, non-finite (NaN/inf), or negative raises ValueError:
     a cap we cannot interpret must stop spend, not wave it through.
     """
+    _load_dotenv()
     raw = os.environ.get("AGENTHAND_TOTAL_SPEND_CAP_USD", "").strip()
     if not raw:
         return DEFAULT_TOTAL_SPEND_CAP_USD
@@ -64,3 +66,48 @@ def get_total_spend_cap_usd() -> float:
             "a spend cap cannot be negative."
         )
     return min(value, HARD_CEILING_USD)
+
+
+_DOTENV_LOADED = False
+
+
+def _load_dotenv() -> None:
+    """Load KEY=VALUE pairs from a local .env file into os.environ.
+
+    The current directory and the project root are checked. A variable
+    already present in the environment always wins: the file never
+    overwrites it. Loaded at most once per process. The .env file is
+    operator-local state (it is gitignored) and is where the Meta API key
+    lives on a dev machine; committed code never carries key material.
+    """
+    global _DOTENV_LOADED
+    if _DOTENV_LOADED:
+        return
+    _DOTENV_LOADED = True
+    candidates = [Path.cwd() / ".env", Path(__file__).resolve().parents[2] / ".env"]
+    seen: set[Path] = set()
+    for path in candidates:
+        if path in seen or not path.is_file():
+            continue
+        seen.add(path)
+        for line in path.read_text(encoding="utf-8").splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            name, _, value = line.partition("=")
+            name = name.strip()
+            value = value.strip().strip('"').strip("'")
+            if name:
+                os.environ.setdefault(name, value)
+
+
+def get_meta_api_key() -> str | None:
+    """The Meta Model API key, from META_API_KEY (environment or .env).
+
+    Returns None when no key is configured. Callers that need to make a
+    real API call must treat None as "not configured" and refuse before
+    any money moves; the key value itself is never logged or stored.
+    """
+    _load_dotenv()
+    raw = os.environ.get("META_API_KEY", "").strip()
+    return raw or None

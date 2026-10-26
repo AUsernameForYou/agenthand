@@ -54,22 +54,20 @@ def _seed_foreground(store: AssetStore) -> str:
     )
 
 
-def test_identify_stub_ingests_and_bills_through_the_choke_point():
+def test_identify_without_key_returns_not_configured_and_bills_nothing(monkeypatch):
+    # No META_API_KEY anywhere: identify is wired now, so instead of a
+    # stub result it returns a structured NOT_CONFIGURED error — and the
+    # key check happens before billing, so the ledger stays empty.
+    monkeypatch.delenv("META_API_KEY", raising=False)
     result = server.identify(_data_uri())
-    assert result["status"] == "not_yet_wired"
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "NOT_CONFIGURED"
     assert result["concept"] is None
     assert result["alternates"] == []
-    # The photo was ingested: the result carries a real, stored handle.
+    # The photo was still ingested: the result carries a real handle.
     assert result["image"].startswith("asset://")
     AssetStore(config.get_data_dir()).get_record(result["image"])
-
-    # One billable call = a pending reservation + its settlement.
-    records = _ledger_records()
-    assert [r["phase"] for r in records] == ["pending", "settled"]
-    assert records[0]["tool"] == "identify"
-    assert records[0]["model"] == "muse-spark-1.3"
-    assert records[0]["status"] == "stub"
-    assert records[0]["call_id"] == records[1]["call_id"]
+    assert _ledger_records() == []
 
 
 def test_cut_out_with_concept_stub_shape_and_receipt():
@@ -137,4 +135,4 @@ def test_stub_calls_refuse_when_ledger_already_over_cap():
         path, ledger.Receipt(tool="identify", model="muse-wonder-1.0", usd_estimate=200.00)
     )
     with pytest.raises(ledger.SpendCapExceeded):
-        server.identify(_data_uri())
+        server.cut_out(_data_uri(), "brown leather wallet")
