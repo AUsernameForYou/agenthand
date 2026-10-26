@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "agenthand"
+version = "0.1.0"
+description = "agenthand: an MCP server that gives AI sales agents three production tools - identify, cut_out, draw - for turning messy product photos into listing-ready images."
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "Proprietary" }
+authors = [
+    { name = "Daniel Wagner" },
+]
+dependencies = [
+    "mcp>=2.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+]
+
+[project.scripts]
+agenthand = "agenthand.server:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/agenthand"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
