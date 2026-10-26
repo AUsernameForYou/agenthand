@@ -187,3 +187,55 @@ the hackathon credits to land.
   path and contents, no raw text in the ledger, and the reservation
   counted exactly once. Live re-verification pending: re-run
   scripts/smoke_identify.py with the key configured.
+
+## 2026-10-26 - cut_out wired to SAM 3.1 (live verification pending)
+
+- cut_out now calls the real segmentation model (sam-3.1) through the
+  billing choke point. The call is priced per processed image
+  ($2.50 / 1,000): the reservation for one cut_out invocation is the
+  per-image rate times the maximum attempts the recovery loop may make
+  (2), and settlement counts one image per attempt actually made.
+- Mask parsing uses Meta's OFFICIAL parser package, meta-sam-parser
+  0.1.0 (PyPI, Meta Platforms, Inc. — the SAM 3 segmentation protocol
+  implementation), added as a dependency. All wire-format knowledge is
+  isolated in a new module, sam_masks.py — the marked swap boundary:
+  the rest of agenthand consumes decoded full-frame binary masks and
+  never sees a payload string. If the parser is ever replaced, that
+  module is the only file that changes.
+- New module segmentation.py: mask QA and the bounded recovery loop.
+  QA rejects a mask that is empty (coverage < 0.1%), ~the whole frame
+  (>= 98%), or fragmented (largest connected component < 75% of mask
+  pixels). The loop tries the concept phrase, then retries ONCE with
+  the first alternate from identify; a SAM zero-match is a normal
+  outcome that drives the retry, not an exception. Every attempt is
+  traced (phrase, outcome, coverage, components, rejection). Total
+  failure returns a structured NO_MATCH or POOR_MASK error with the
+  trace and the attempts' spend counted; an unparseable SAM response
+  is BAD_MODEL_RESPONSE with the reservation counted.
+- On success the foreground is the source pixels through the accepted
+  mask (nothing regenerated), stored as kind=foreground_png with
+  source_asset_id = the source photo; the mask is stored as
+  kind=mask_png on the same chain. The result carries source /
+  foreground / mask file + pixel hashes, usage (images), and the
+  settled cost. When several mask records come back, the largest is
+  the candidate and the record count rides in the trace.
+- SAM response contract assumptions, recorded for live verification:
+  sam-3.1 is a Responses API model (the official parser is built
+  around Responses streams), called via client.responses.create with
+  an input_text phrase + input_image data URI; the segmentation
+  arrives as special-token text in output_text (one `<0f>` line,
+  box-local mask rasters placed at the records' half-open bounds);
+  usage is metered as one image per call. If the live contract
+  differs, meta_client.segment_image and sam_masks are where the
+  correction lands.
+- Tests: 95 pass (was 77). New offline suites with mocked transport:
+  wire parsing incl. the parser package's published lossless example,
+  QA rejections (empty, full-frame, fragmented), foreground pixel
+  equality where mask alpha is 255, the recovery path (zero-match then
+  accepted alternate), persistent failure with spend counted once per
+  attempt, NOT_CONFIGURED with no ledger write, and over-cap refusal
+  before any API call. The suite is hermetic against the real key in
+  both directions (repo .env pinned off; ambient key overridden).
+- scripts/smoke_cut_out.py added (image path + optional concept;
+  prints the result and new ledger lines). NOT run: live verification
+  of cut_out against the real API is the next step.

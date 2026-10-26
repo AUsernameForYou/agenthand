@@ -38,17 +38,21 @@ plus listing copy, or a structured error (NOT_CONFIGURED when no
 META_API_KEY is set — checked before any billing, so no ledger write;
 BAD_MODEL_RESPONSE when the model's answer is unusable — the billed
 reservation stays counted; an unparseable body is saved raw under
-data/debug/ and its path rides in the error). cut_out's segmentation model is not wired
-yet; it exercises the ingest, planning, and billing plumbing and returns
-a structured "not yet wired" result.
+data/debug/ and its path rides in the error). cut_out IS wired to the
+real segmentation model (sam-3.1) through the same choke point: it
+returns the transparent foreground and mask handles with their hashes
+and the attempt trace, or a structured error (NOT_CONFIGURED, NO_MATCH,
+POOR_MASK, BAD_MODEL_RESPONSE) with the attempts' spend counted.
 """
 
 from __future__ import annotations
 
+from io import BytesIO
+
 from mcp.server.mcpserver import Image, MCPServer
 
-from . import composite, config, ingest, meta_client
-from .assets import HANDLE_PREFIX, AssetStore
+from . import composite, config, ingest, meta_client, segmentation
+from .assets import HANDLE_PREFIX, KIND_FOREGROUND, KIND_MASK, AssetStore
 
 # mcp Python SDK v2: the high-level server class is MCPServer
 # (renamed from FastMCP in v1).
@@ -150,14 +154,30 @@ def cut_out(image: str, concept: str | None = None) -> dict:
             ("brown leather wallet"). When omitted, the identify planning
             step runs internally to produce the concept and alternates.
 
-    Wired behavior: the segmentation model returns a mask for the concept;
-    the mask is quality-checked (a bounded recovery loop retries once with
-    an alternate concept phrase on a poor mask, traced in the receipt);
-    the extracted foreground is stored untouched in the asset store with
-    its hashes recorded, and the new asset handle is returned.
+    Calls SAM 3.1 with the concept phrase and decodes the returned mask
+    (Meta's official parser, behind the sam_masks boundary). The mask
+    is quality-checked — coverage sane (not empty, not ~the whole
+    frame) and dominated by one connected region — and on a zero-match
+    or a poor mask the loop retries ONCE with the first alternate
+    phrase; every attempt is traced in the result. The foreground is
+    the source pixels through the accepted mask, nothing regenerated;
+    foreground and mask are stored with their hashes and lineage to the
+    source photo.
+
+    Failures return a structured error: NOT_CONFIGURED (no META_API_KEY;
+    checked before billing, so no ledger write), NO_MATCH / POOR_MASK
+    (no usable mask after the bounded attempts; the attempts' spend
+    stays counted), BAD_MODEL_RESPONSE (SAM output unusable; spend
+    counted). A planning failure inside the chain (concept omitted and
+    identify failed) surfaces as that step's error code with
+    plan_error attached.
     """
     store = _store()
     handle = ingest.ingest(image, store)
+    source_record = store.get_record(handle)
+    store.verify_integrity(handle)
+    source_image = store.read_image(handle)
+
     concept_source = "provided"
     alternates: list[str] = []
     plan_error = None
@@ -167,26 +187,115 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         alternates = plan["alternates"]
         plan_error = plan.get("error")
         concept_source = "identify_internal"
-    meta_client.billed_call(
-        "cut_out",
-        CUT_OUT_MODEL,
-        0.0,
-        lambda: {},
-        status="stub",
-        note=STUB_NOTE,
+
+    def _error(code: str, message: str, **extra) -> dict:
+        return {
+            "status": "error",
+            "tool": "cut_out",
+            "image": handle,
+            "concept": concept,
+            "concept_source": concept_source,
+            "alternates": alternates,
+            "plan_error": plan_error,
+            "output_asset": None,
+            "mask_asset": None,
+            "model": CUT_OUT_MODEL,
+            "error": {"code": code, "message": message, **extra},
+        }
+
+    if concept is None:
+        # The planning step produced no phrase to segment with (its own
+        # error, e.g. NOT_CONFIGURED, rides in plan_error). No SAM call
+        # is possible and none is billed.
+        code = (plan_error or {}).get("code", "NO_CONCEPT")
+        return _error(
+            code,
+            "No segmentation concept available: the identify planning "
+            "step did not produce one.",
+        )
+
+    try:
+        meta_client.require_meta_api_key()
+    except meta_client.NotConfiguredError as exc:
+        return _error("NOT_CONFIGURED", str(exc))
+
+    # The attempt loop is bounded: the concept, plus one recovery retry
+    # with the first alternate. The reservation prices exactly the
+    # attempts the loop may make.
+    phrases = [concept, *alternates[: meta_client.SAM_MAX_ATTEMPTS - 1]]
+    projected = meta_client.project_cut_out_cost_usd(CUT_OUT_MODEL, len(phrases))
+    outcome: dict = {}
+
+    def _run_attempts() -> dict:
+        result = segmentation.run_attempts(
+            store.read_bytes(handle),
+            phrases,
+            model=CUT_OUT_MODEL,
+            frame_width=source_image.width,
+            frame_height=source_image.height,
+        )
+        outcome.update(result)
+        return result["usage"]
+
+    try:
+        billing = meta_client.billed_call(
+            "cut_out", CUT_OUT_MODEL, projected, _run_attempts
+        )
+    except segmentation.CutOutResultError as exc:
+        return _error(
+            exc.code,
+            str(exc),
+            attempts=exc.attempts,
+            cost_counted_usd=projected,
+        )
+
+    mask_buffer = BytesIO()
+    outcome["mask_image"].save(mask_buffer, format="PNG")
+    mask_handle = store.put_bytes(
+        mask_buffer.getvalue(),
+        kind=KIND_MASK,
+        suffix=".png",
+        source_asset_id=source_record.asset_id,
     )
+    foreground = segmentation.extract_foreground(source_image, outcome["mask_image"])
+    foreground_handle = store.put_image(
+        foreground,
+        kind=KIND_FOREGROUND,
+        source_asset_id=source_record.asset_id,
+    )
+    foreground_record = store.get_record(foreground_handle)
+    mask_record = store.get_record(mask_handle)
+
     return {
-        "status": "not_yet_wired",
+        "status": "ok",
         "tool": "cut_out",
         "image": handle,
-        "concept": concept,
+        "concept": outcome["phrase"],
+        "requested_concept": concept,
         "concept_source": concept_source,
         "alternates": alternates,
         "plan_error": plan_error,
-        "output_asset": None,
-        "mask_asset": None,
+        "output_asset": foreground_handle,
+        "mask_asset": mask_handle,
+        "hashes": {
+            "source": {
+                "sha256": source_record.sha256,
+                "pixel_sha256": source_record.pixel_sha256,
+            },
+            "foreground": {
+                "sha256": foreground_record.sha256,
+                "pixel_sha256": foreground_record.pixel_sha256,
+            },
+            "mask": {
+                "sha256": mask_record.sha256,
+                "pixel_sha256": mask_record.pixel_sha256,
+            },
+        },
+        "attempts": outcome["attempts"],
         "model": CUT_OUT_MODEL,
-        "note": STUB_NOTE,
+        "cost_usd": billing["actual_usd"],
+        "usage": billing["usage"],
+        "call_id": billing["call_id"],
     }
 
 

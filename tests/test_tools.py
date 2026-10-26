@@ -77,26 +77,30 @@ def test_identify_without_key_returns_not_configured_and_bills_nothing(monkeypat
     assert _ledger_records() == []
 
 
-def test_cut_out_with_concept_stub_shape_and_receipt():
+def test_cut_out_with_concept_but_no_key_is_not_configured():
+    # cut_out is wired now: with a concept supplied but no key anywhere,
+    # it returns a structured NOT_CONFIGURED error — the key check runs
+    # before billing, so the ledger stays empty.
     result = server.cut_out(_data_uri(), "brown leather wallet")
-    assert result["status"] == "not_yet_wired"
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "NOT_CONFIGURED"
     assert result["concept"] == "brown leather wallet"
     assert result["concept_source"] == "provided"
     assert result["output_asset"] is None
-
-    records = _ledger_records()
-    assert [r["phase"] for r in records] == ["pending", "settled"]
-    assert records[0]["tool"] == "cut_out"
-    assert records[0]["model"] == "sam-3.1"
+    assert _ledger_records() == []
 
 
 def test_cut_out_without_concept_plans_internally():
     result = server.cut_out(_data_uri())
     assert result["concept_source"] == "identify_internal"
-    # The internal planning step is the (stubbed) identify logic: no
-    # concept yet, but the plumbing path is the one the wired tool uses.
+    # The internal planning step is the real identify: unconfigured
+    # here, so it degrades to an empty plan and cut_out surfaces the
+    # planning step's error instead of segmenting without a concept.
+    assert result["status"] == "error"
     assert result["concept"] is None
     assert result["alternates"] == []
+    assert result["plan_error"]["code"] == "NOT_CONFIGURED"
+    assert _ledger_records() == []
 
 
 def test_draw_runs_the_real_pipeline_with_a_placeholder_plate():
@@ -136,10 +140,14 @@ def test_draw_rejects_a_non_foreground_before_billing():
 
 def test_stub_calls_refuse_when_ledger_already_over_cap():
     # Seed the ledger past the cap; even $0 stub calls must refuse, because
-    # the choke point checks before the (future) billable call.
+    # the choke point checks before the (future) billable call. draw is
+    # the remaining $0-through-the-gate tool (its plate is still local);
+    # wired cut_out checks configuration before it ever reaches the gate.
+    store = AssetStore(config.get_data_dir())
+    fg = _seed_foreground(store)
     path = config.get_ledger_path()
     ledger.append_receipt(
         path, ledger.Receipt(tool="identify", model="muse-wonder-1.0", usd_estimate=200.00)
     )
     with pytest.raises(ledger.SpendCapExceeded):
-        server.cut_out(_data_uri(), "brown leather wallet")
+        server.draw(fg, "a regal, warmly lit reading room")

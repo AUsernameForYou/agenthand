@@ -75,9 +75,13 @@ class _FakeCompletions:
 
 
 class _FakeClient:
-    def __init__(self, responses):
+    def __init__(self, responses, sam_responses=()):
         self.completions = _FakeCompletions(responses)
         self.chat = SimpleNamespace(completions=self.completions)
+        # cut_out is wired now: its SAM transport is client.responses.
+        self.responses = _FakeCompletions(
+            [SimpleNamespace(output_text=text) for text in sam_responses]
+        )
 
 
 def _install_fake(monkeypatch, responses) -> _FakeClient:
@@ -146,13 +150,21 @@ def test_identify_success_parses_plan_and_settles_with_real_usage(monkeypatch):
 
 
 def test_cut_out_plans_internally_with_the_real_identify(monkeypatch):
-    _install_fake(monkeypatch, [_response(_good_content())])
+    client = _FakeClient(
+        [_response(_good_content())], sam_responses=["", ""]
+    )
+    monkeypatch.setattr(meta_client, "build_client", lambda: client)
     result = server.cut_out(_data_uri())
     assert result["concept_source"] == "identify_internal"
     assert result["concept"] == "brown leather wallet"
     assert result["alternates"] == GOOD_PAYLOAD["alternates"]
     assert result["plan_error"] is None
-    # Both the internal identify call and cut_out's own stub call billed.
+    # The plan came from the real identify, and cut_out then spent its
+    # two bounded SAM attempts on it (both zero-match here, scripted).
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "NO_MATCH"
+    assert len(client.responses.calls) == 2
+    # Both the internal identify call and cut_out's SAM call billed.
     tools = [r["tool"] for r in _records() if r["phase"] == "pending"]
     assert tools == ["identify", "cut_out"]
 

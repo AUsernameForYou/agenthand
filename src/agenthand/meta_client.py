@@ -541,3 +541,94 @@ def vision_identify(
     merged["alternates"] = list(partial.get("alternates") or []) + list(extra)
     # Final contract check; raises if the repair did not fix the shortfall.
     return _parse_identify_payload(json.dumps(merged)), usage
+
+
+# ---------------------------------------------------------------------------
+# SAM 3.1 segmentation calls (Responses API transport).
+# ---------------------------------------------------------------------------
+
+# The mask-recovery loop's bound: the concept phrase, plus ONE retry
+# with the first alternate. The reservation for a cut_out call is priced
+# at this many images, so the loop can never spend past its projection.
+SAM_MAX_ATTEMPTS = 2
+
+
+def project_cut_out_cost_usd(model: str, max_attempts: int = SAM_MAX_ATTEMPTS) -> float:
+    """Worst-case USD projection for one cut_out invocation.
+
+    SAM is priced per processed image: one image per attempt, times the
+    maximum attempts the recovery loop may make.
+    """
+    return pricing.estimate_cost_usd(model, images=max_attempts)
+
+
+def _responses_output_text(response) -> str:
+    """Extract the text lane from a Responses API result.
+
+    Prefers the SDK's ``output_text`` convenience property; falls back
+    to concatenating the text parts of the output items (the shape a
+    mocked or non-SDK response may carry). Missing text reads as "",
+    which the SAM parser treats as a valid empty lane (zero-match).
+    """
+    text = getattr(response, "output_text", None)
+    if isinstance(text, str):
+        return text
+    parts: list[str] = []
+    for item in getattr(response, "output", None) or []:
+        for content in getattr(item, "content", None) or []:
+            value = getattr(content, "text", None)
+            if isinstance(value, str):
+                parts.append(value)
+    return "".join(parts)
+
+
+def segment_image(
+    png_bytes: bytes,
+    phrase: str,
+    *,
+    model: str,
+    client=None,
+) -> tuple[str, UsageDict]:
+    """One real SAM segmentation call; returns (output_text, usage).
+
+    Sends the normalized PNG and the concept phrase to sam-3.1 and
+    returns the model's raw output text — the special-token
+    segmentation lane that sam_masks.parse_sam_masks decodes. Usage
+    reports images=1 (SAM is priced per processed image); any token
+    counts the response carries are merged in for the receipt, though
+    the pricing table meters sam-3.1 on images alone.
+
+    Contract assumption, recorded for the live verification: SAM 3.1 on
+    the Meta Model API is a Responses API model — the official
+    meta-sam-parser is built around Responses streams — so the call is
+    client.responses.create with an input_text phrase and an
+    input_image data URI, and the segmentation text arrives as
+    output_text. If the live contract differs, this function (and the
+    sam_masks boundary) is where the correction lands.
+
+    This function performs network I/O and must only be invoked inside
+    a billed_call fn (segmentation.run_attempts, today). `client` is
+    injectable for offline tests; when omitted, the real client is
+    built (which raises NotConfiguredError if no key is configured).
+    """
+    if client is None:
+        client = build_client()
+    data_uri = "data:image/png;base64," + base64.b64encode(png_bytes).decode()
+    response = client.responses.create(
+        model=model,
+        input=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": phrase},
+                    {"type": "input_image", "image_url": data_uri},
+                ],
+            }
+        ],
+    )
+    usage: UsageDict = {"images": 1}
+    raw_usage = getattr(response, "usage", None)
+    if raw_usage is not None:
+        usage["input_tokens"] = int(getattr(raw_usage, "input_tokens", 0) or 0)
+        usage["output_tokens"] = int(getattr(raw_usage, "output_tokens", 0) or 0)
+    return _responses_output_text(response), usage

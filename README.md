@@ -81,10 +81,11 @@ state means no spend.
 Hackathon build in progress (Meta Global AI Developer Hackathon, Oct 26 -
 Nov 4, 2026). `draw`'s Fidelity Lock pipeline (lineage checks, integrity
 verification, deterministic compositing, fidelity receipt) runs locally
-end to end with a deterministic placeholder background plate. `identify`'s
-vision model and `cut_out`'s segmentation model are stubbed: they exercise
-the ingest, planning, and billing plumbing and return structured "not yet
-wired" results. No external API calls are made yet.
+end to end with a deterministic placeholder background plate; its
+background model is not wired yet. `identify` is wired to the real vision
+model (muse-spark-1.3) and `cut_out` to the real segmentation model
+(sam-3.1), both through the spend-cap billing choke point; cut_out's live
+verification is still pending.
 
 ## Run it
 
