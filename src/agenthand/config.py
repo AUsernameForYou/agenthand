@@ -7,13 +7,20 @@ cap simply by setting variables before a call.
 
 from __future__ import annotations
 
+import math
 import os
 from pathlib import Path
 
-# The hackathon credit amount. This is the ONLY authorized Meta Model API
-# spend unless Daniel raises it explicitly; the ledger gate in ledger.py
-# refuses any billable call that would push total spend past this value.
-DEFAULT_TOTAL_SPEND_CAP_USD = 150.00
+# The hackathon credit amount, and the absolute ceiling for the spend cap.
+# This is the ONLY authorized Meta Model API spend unless Daniel raises it
+# explicitly; the environment variable below may only ever LOWER the cap
+# toward zero, never raise it past this ceiling.
+HARD_CEILING_USD = 150.00
+
+# The working cap the server actually runs with by default: below the
+# credit amount, so estimate drift cannot spend the last of the credits
+# and reach the card on file.
+DEFAULT_TOTAL_SPEND_CAP_USD = 120.00
 
 
 def get_data_dir() -> Path:
@@ -29,7 +36,31 @@ def get_ledger_path() -> Path:
 
 
 def get_total_spend_cap_usd() -> float:
+    """The working spend cap in USD.
+
+    AGENTHAND_TOTAL_SPEND_CAP_USD may lower the cap (down to 0). A value
+    above the hard ceiling is clamped to the ceiling. A value that is
+    unparseable, non-finite (NaN/inf), or negative raises ValueError:
+    a cap we cannot interpret must stop spend, not wave it through.
+    """
     raw = os.environ.get("AGENTHAND_TOTAL_SPEND_CAP_USD", "").strip()
-    if raw:
-        return float(raw)
-    return DEFAULT_TOTAL_SPEND_CAP_USD
+    if not raw:
+        return DEFAULT_TOTAL_SPEND_CAP_USD
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"AGENTHAND_TOTAL_SPEND_CAP_USD={raw!r} is not a number; "
+            "refusing to run with an uninterpretable spend cap."
+        ) from exc
+    if not math.isfinite(value):
+        raise ValueError(
+            f"AGENTHAND_TOTAL_SPEND_CAP_USD={raw!r} is not finite; "
+            "refusing to run with an unbounded spend cap."
+        )
+    if value < 0:
+        raise ValueError(
+            f"AGENTHAND_TOTAL_SPEND_CAP_USD={raw!r} is negative; "
+            "a spend cap cannot be negative."
+        )
+    return min(value, HARD_CEILING_USD)

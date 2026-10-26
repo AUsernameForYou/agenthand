@@ -1,10 +1,19 @@
-"""Asset store: handles, hashes, integrity."""
+"""Asset store: handles, hashes, integrity, sidecars, lineage."""
 
 import hashlib
+import json
+from io import BytesIO
 
 import pytest
+from PIL import Image
 
-from agenthand.assets import AssetStore
+from agenthand.assets import AssetIntegrityError, AssetStore
+
+
+def _png_bytes(color=(200, 30, 30, 255), size=(6, 4)) -> bytes:
+    buffer = BytesIO()
+    Image.new("RGBA", size, color).save(buffer, format="PNG")
+    return buffer.getvalue()
 
 
 def test_put_and_read_roundtrip(tmp_path):
@@ -24,13 +33,30 @@ def test_sha256_recorded_at_ingest(tmp_path):
     assert store.sha256_of(handle) == hashlib.sha256(payload).hexdigest()
 
 
-def test_verify_integrity_detects_tampering(tmp_path):
+def test_record_is_a_sidecar_not_a_global_index(tmp_path):
     store = AssetStore(tmp_path)
-    handle = store.put_bytes(b"original", kind="foreground_png", suffix=".png")
-    assert store.verify_integrity(handle) is True
+    handle = store.put_bytes(b"bytes", kind="source_photo")
+    asset_id = AssetStore.parse_handle(handle)
+    assert (tmp_path / "assets" / f"{asset_id}.json").exists()
+    assert not (tmp_path / "assets.json").exists()
 
-    store.resolve(handle).write_bytes(b"regenerated - not the real product")
-    assert store.verify_integrity(handle) is False
+
+def test_pixel_hash_recorded_for_real_images(tmp_path):
+    store = AssetStore(tmp_path)
+    handle = store.put_bytes(_png_bytes(), kind="source_photo", suffix=".png")
+    record = store.get_record(handle)
+    assert record.pixel_sha256 is not None
+    assert (record.width, record.height) == (6, 4)
+
+
+def test_verify_integrity_passes_then_raises_on_tampering(tmp_path):
+    store = AssetStore(tmp_path)
+    handle = store.put_bytes(_png_bytes(), kind="foreground_png", suffix=".png")
+    store.verify_integrity(handle)  # does not raise
+
+    store.resolve(handle).write_bytes(_png_bytes(color=(1, 2, 3, 255)))
+    with pytest.raises(AssetIntegrityError):
+        store.verify_integrity(handle)
 
 
 def test_derived_asset_records_its_source(tmp_path):
@@ -41,6 +67,46 @@ def test_derived_asset_records_its_source(tmp_path):
         b"cutout", kind="foreground_png", suffix=".png", source_asset_id=source_id
     )
     assert store.get_record(cut).source_asset_id == source_id
+
+
+def test_lineage_walks_to_the_root(tmp_path):
+    store = AssetStore(tmp_path)
+    photo = store.put_bytes(b"photo", kind="source_photo")
+    photo_id = AssetStore.parse_handle(photo)
+    mask = store.put_bytes(b"mask", kind="mask_png", source_asset_id=photo_id)
+    fg = store.put_bytes(
+        b"fg", kind="foreground_png", source_asset_id=AssetStore.parse_handle(mask)
+    )
+    chain = store.lineage(fg)
+    assert [r.kind for r in chain] == ["foreground_png", "mask_png", "source_photo"]
+    assert chain[-1].asset_id == photo_id
+
+
+def test_legacy_index_is_still_readable(tmp_path):
+    # A data dir written by the first scaffold (single assets.json index,
+    # record without pixel fields) must keep working after the sidecar
+    # migration.
+    store = AssetStore(tmp_path)
+    store.assets_dir.mkdir(parents=True)
+    payload = b"legacy bytes"
+    (store.assets_dir / "legacy1.png").write_bytes(payload)
+    index = {
+        "legacy1": {
+            "asset_id": "legacy1",
+            "sha256": hashlib.sha256(payload).hexdigest(),
+            "kind": "source_photo",
+            "filename": "legacy1.png",
+            "byte_size": len(payload),
+            "created_at": "2026-10-26T00:00:00+00:00",
+            "source_asset_id": None,
+        }
+    }
+    (tmp_path / "assets.json").write_text(json.dumps(index), encoding="utf-8")
+
+    assert store.read_bytes("asset://legacy1") == payload
+    record = store.get_record("asset://legacy1")
+    assert record.kind == "source_photo"
+    assert record.pixel_sha256 is None
 
 
 def test_bad_handles_raise(tmp_path):

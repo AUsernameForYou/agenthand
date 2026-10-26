@@ -63,3 +63,95 @@ def test_corrupt_ledger_fails_closed(tmp_path):
     path.write_text("{not json}\n", encoding="utf-8")
     with pytest.raises(ledger.SpendCapExceeded):
         ledger.check_spend_cap(path, projected_usd=0.01, cap_usd=150.00)
+
+
+def test_negative_ledger_line_fails_closed(tmp_path):
+    # A crafted negative line would "refund" the budget if it were summed.
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(
+        json.dumps({"tool": "x", "model": None, "usd_estimate": -50.0}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ledger.SpendCapExceeded):
+        ledger.ledger_total_usd(path)
+
+
+def test_nan_ledger_line_fails_closed(tmp_path):
+    # JSON accepts the NaN literal; comparisons against NaN are all False,
+    # which would silently disable the cap if the line were summed.
+    path = tmp_path / "ledger.jsonl"
+    path.write_text(
+        '{"tool":"x","model":null,"usd_estimate":NaN}\n', encoding="utf-8"
+    )
+    with pytest.raises(ledger.SpendCapExceeded):
+        ledger.ledger_total_usd(path)
+
+
+def test_nan_projection_refused(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    with pytest.raises(ledger.SpendCapExceeded):
+        ledger.check_spend_cap(path, projected_usd=float("nan"), cap_usd=150.00)
+    with pytest.raises(ledger.SpendCapExceeded):
+        ledger.check_spend_cap(path, projected_usd=1.0, cap_usd=float("inf"))
+
+
+def test_pending_reservation_counts_at_projection(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    ledger.append_receipt(
+        path,
+        ledger.Receipt(
+            tool="identify",
+            model="muse-spark-1.3",
+            usd_estimate=3.25,
+            phase=ledger.PHASE_PENDING,
+            call_id="call-1",
+        ),
+    )
+    assert ledger.ledger_total_usd(path) == 3.25
+
+
+def test_settlement_supersedes_reservation(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    ledger.append_receipt(
+        path,
+        ledger.Receipt(
+            tool="identify",
+            model="muse-spark-1.3",
+            usd_estimate=3.25,
+            phase=ledger.PHASE_PENDING,
+            call_id="call-1",
+        ),
+    )
+    ledger.append_receipt(
+        path,
+        ledger.Receipt(
+            tool="identify",
+            model="muse-spark-1.3",
+            usd_estimate=1.10,
+            phase=ledger.PHASE_SETTLED,
+            call_id="call-1",
+        ),
+    )
+    # The actual replaces the projection; it is not added to it.
+    assert ledger.ledger_total_usd(path) == 1.10
+
+
+def test_usage_fields_round_trip(tmp_path):
+    path = tmp_path / "ledger.jsonl"
+    ledger.append_receipt(
+        path,
+        ledger.Receipt(
+            tool="identify",
+            model="muse-spark-1.3",
+            usd_estimate=0.42,
+            input_tokens=1000,
+            output_tokens=250,
+            cached_input_tokens=400,
+            images=2,
+        ),
+    )
+    record = json.loads(path.read_text(encoding="utf-8").strip())
+    assert record["input_tokens"] == 1000
+    assert record["output_tokens"] == 250
+    assert record["cached_input_tokens"] == 400
+    assert record["images"] == 2
