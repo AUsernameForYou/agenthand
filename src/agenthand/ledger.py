@@ -19,12 +19,22 @@ Fail-closed means exactly that: a missing ledger reads as $0.00 (nothing
 has been spent yet), but a ledger line that cannot be parsed, or whose
 amount is negative or non-finite, raises. When spend state is unknown or
 invalid, the server does not spend.
+
+Durability: appends are flushed and fsynced before append_receipt
+returns, so a crash or power loss cannot silently drop a receipt the
+caller believes is recorded. A crash DURING the write itself can still
+tear the final line — and reads deliberately do not tolerate that: a
+torn line's amount is unknowable, and a torn pending reservation, if
+skipped, would understate spend exactly when the cap matters most. A
+torn tail therefore keeps failing closed (the operator repairs the
+file) rather than risking an undercount.
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -87,6 +97,12 @@ def append_receipt(ledger_path: Path, receipt: Receipt) -> None:
     ledger_path.parent.mkdir(parents=True, exist_ok=True)
     with ledger_path.open("a", encoding="utf-8") as fh:
         fh.write(receipt.to_json_line() + "\n")
+        # Flush + fsync before returning: once a receipt is written,
+        # a crash must not be able to un-spend it. (A crash mid-write
+        # can still tear this line; ledger_total_usd fails closed on
+        # it rather than guess at the amount — see module docstring.)
+        fh.flush()
+        os.fsync(fh.fileno())
 
 
 def ledger_total_usd(ledger_path: Path) -> float:

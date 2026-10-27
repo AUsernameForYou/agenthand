@@ -30,6 +30,8 @@ from __future__ import annotations
 import hashlib
 from io import BytesIO
 
+import cv2
+import numpy as np
 from PIL import Image, ImageOps
 
 from .assets import (
@@ -90,41 +92,30 @@ def _fit_plate(plate: Image.Image, size: tuple[int, int]) -> tuple[Image.Image, 
     return fitted, [f"plate_resized_and_center_cropped_to_{size[0]}x{size[1]}"]
 
 
-def _distance_to_class(alpha: bytes, width: int, height: int, target) -> list[int]:
+def _distance_to_class(
+    alpha: bytes, width: int, height: int, target
+) -> np.ndarray:
     """Manhattan distance from every pixel to the nearest target pixel.
 
-    Two-pass chamfer transform. When NO pixel matches the target (a
-    mask with no fully opaque pixel, say), distance is measured to the
-    image border instead, so callers still get a finite field.
+    Returns a (height, width) int64 array. Computed with OpenCV's L1
+    distance transform, which is exact for the Manhattan metric —
+    validated value-for-value against the two-pass chamfer loop it
+    replaced, over randomized rasters including the border cases
+    below. When NO pixel matches the target (a mask with no fully
+    opaque pixel, say), distance is measured to the image border
+    instead, so callers still get a finite field.
     """
-    total = width * height
-    if not any(target(a) for a in alpha):
-        return [
-            min(x + 1, width - x, y + 1, height - y)
-            for y in range(height)
-            for x in range(width)
-        ]
-    inf = total + 1
-    dist = [0 if target(a) else inf for a in alpha]
-    for y in range(height):
-        base = y * width
-        for x in range(width):
-            i = base + x
-            if dist[i]:
-                if x > 0 and dist[i - 1] + 1 < dist[i]:
-                    dist[i] = dist[i - 1] + 1
-                if y > 0 and dist[i - width] + 1 < dist[i]:
-                    dist[i] = dist[i - width] + 1
-    for y in range(height - 1, -1, -1):
-        base = y * width
-        for x in range(width - 1, -1, -1):
-            i = base + x
-            if dist[i]:
-                if x < width - 1 and dist[i + 1] + 1 < dist[i]:
-                    dist[i] = dist[i + 1] + 1
-                if y < height - 1 and dist[i + width] + 1 < dist[i]:
-                    dist[i] = dist[i + width] + 1
-    return dist
+    values = np.frombuffer(alpha, dtype=np.uint8).reshape(height, width)
+    mask = target(values)
+    if not mask.any():
+        xs = np.arange(width)
+        ys = np.arange(height)
+        return np.minimum(
+            np.minimum(xs + 1, width - xs)[np.newaxis, :],
+            np.minimum(ys + 1, height - ys)[:, np.newaxis],
+        )
+    src = np.where(mask, 0, 255).astype(np.uint8)
+    return cv2.distanceTransform(src, cv2.DIST_L1, 3).astype(np.int64)
 
 
 def _edge_band_max_width(alpha: bytes, width: int, height: int) -> int:
@@ -145,15 +136,14 @@ def _edge_band_max_width(alpha: bytes, width: int, height: int) -> int:
     """
     if width == 0 or height == 0:
         return 0
-    if not any(0 < a < 255 for a in alpha):
+    values = np.frombuffer(alpha, dtype=np.uint8)
+    band = (values > 0) & (values < 255)
+    if not band.any():
         return 0
     to_opaque = _distance_to_class(alpha, width, height, lambda a: a == 255)
     to_transparent = _distance_to_class(alpha, width, height, lambda a: a == 0)
-    return max(
-        to_opaque[i] + to_transparent[i] - 1
-        for i, a in enumerate(alpha)
-        if 0 < a < 255
-    )
+    crossing = (to_opaque + to_transparent - 1).ravel()
+    return int(crossing[band].max())
 
 
 def _measure(foreground: Image.Image, composite: Image.Image) -> dict:
@@ -165,20 +155,16 @@ def _measure(foreground: Image.Image, composite: Image.Image) -> dict:
     and the edge band's maximum width, so a receipt cannot quietly
     shrink the set of pixels the "0 changed" claim covers.
     """
-    fg_bytes = foreground.tobytes()
-    out_bytes = composite.tobytes()
-    alpha = foreground.getchannel("A").tobytes()
-    opaque = edge_band = transparent = changed_opaque = 0
-    for i, a in enumerate(alpha):
-        if a == OPAQUE_ALPHA_THRESHOLD:
-            opaque += 1
-            j = i * 4
-            if fg_bytes[j : j + 4] != out_bytes[j : j + 4]:
-                changed_opaque += 1
-        elif a > 0:
-            edge_band += 1
-        else:
-            transparent += 1
+    fg_pixels = np.frombuffer(foreground.tobytes(), dtype=np.uint8).reshape(-1, 4)
+    out_pixels = np.frombuffer(composite.tobytes(), dtype=np.uint8).reshape(-1, 4)
+    alpha = np.frombuffer(foreground.getchannel("A").tobytes(), dtype=np.uint8)
+    opaque_mask = alpha == OPAQUE_ALPHA_THRESHOLD
+    opaque = int(np.count_nonzero(opaque_mask))
+    edge_band = int(np.count_nonzero((alpha > 0) & ~opaque_mask))
+    transparent = int(np.count_nonzero(alpha == 0))
+    changed_opaque = int(
+        np.count_nonzero(np.any(fg_pixels != out_pixels, axis=1) & opaque_mask)
+    )
     mask_total = opaque + edge_band
     return {
         "opaque_pixels": opaque,

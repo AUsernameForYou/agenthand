@@ -30,6 +30,7 @@ import json
 import sys
 from pathlib import Path
 
+import numpy as np
 from PIL import Image
 
 from .assets import (
@@ -80,19 +81,16 @@ def verify_files(
 
     checked = changed = edge_band = outside = 0
     if not problems:
-        source_bytes = source.tobytes()
-        final_bytes = final.tobytes()
-        mask_bytes = mask.tobytes()
-        for i, m in enumerate(mask_bytes):
-            if m == 255:
-                checked += 1
-                j = i * 4
-                if source_bytes[j : j + 4] != final_bytes[j : j + 4]:
-                    changed += 1
-            elif m > 0:
-                edge_band += 1
-            else:
-                outside += 1
+        source_pixels = np.frombuffer(source.tobytes(), dtype=np.uint8).reshape(-1, 4)
+        final_pixels = np.frombuffer(final.tobytes(), dtype=np.uint8).reshape(-1, 4)
+        mask_values = np.frombuffer(mask.tobytes(), dtype=np.uint8)
+        full = mask_values == 255
+        checked = int(np.count_nonzero(full))
+        changed = int(
+            np.count_nonzero(np.any(source_pixels != final_pixels, axis=1) & full)
+        )
+        edge_band = int(np.count_nonzero((mask_values > 0) & ~full))
+        outside = int(np.count_nonzero(mask_values == 0))
         if changed:
             problems.append(
                 f"{changed} of {checked} fully-masked product pixels "

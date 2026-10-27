@@ -95,6 +95,39 @@ def test_nan_projection_refused(tmp_path):
         ledger.check_spend_cap(path, projected_usd=1.0, cap_usd=float("inf"))
 
 
+def test_append_fsyncs_before_returning(tmp_path, monkeypatch):
+    # A receipt the caller believes is recorded must survive a crash:
+    # append flushes and fsyncs the ledger file before returning.
+    fsynced = []
+    real_fsync = ledger.os.fsync
+    monkeypatch.setattr(
+        ledger.os, "fsync", lambda fd: (fsynced.append(fd), real_fsync(fd))[1]
+    )
+    path = tmp_path / "ledger.jsonl"
+    _seed_receipt(path, 1.25)
+    _seed_receipt(path, 2.50)
+    assert len(fsynced) == 2  # one fsync per append
+    assert ledger.ledger_total_usd(path) == 3.75
+
+
+def test_crash_mid_append_torn_tail_fails_closed(tmp_path):
+    # Simulate a crash in the middle of an append: one complete,
+    # fsynced receipt, then a torn final line (truncated JSON, no
+    # newline). Reads must NOT skip the torn line and carry on: its
+    # amount is unknowable, and if it was a pending reservation,
+    # skipping it would understate spend precisely when the cap is
+    # the only thing standing between us and real money. Fail closed;
+    # a human repairs the file.
+    path = tmp_path / "ledger.jsonl"
+    _seed_receipt(path, 10.00)
+    with path.open("a", encoding="utf-8") as fh:
+        fh.write('{"tool":"identify","model":"muse-spark-1.3","usd_estimate":7.')
+    with pytest.raises(ledger.SpendCapExceeded):
+        ledger.ledger_total_usd(path)
+    with pytest.raises(ledger.SpendCapExceeded):
+        ledger.check_spend_cap(path, projected_usd=0.01, cap_usd=150.00)
+
+
 def test_pending_reservation_counts_at_projection(tmp_path):
     path = tmp_path / "ledger.jsonl"
     ledger.append_receipt(

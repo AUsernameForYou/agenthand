@@ -22,9 +22,10 @@ asset store:
 
 from __future__ import annotations
 
-from collections import deque
 from dataclasses import dataclass
 
+import cv2
+import numpy as np
 from PIL import Image
 
 from . import meta_client
@@ -63,56 +64,33 @@ class MaskAssessment:
     rejection: str | None  # "empty" | "full_frame" | "fragmented" | None
 
 
-def _label_components(binary: bytes, width: int, height: int) -> tuple[int, int]:
+def _label_components(binary: np.ndarray, width: int, height: int) -> tuple[int, int]:
     """(component_count, largest_component_size) of a 0/1 raster.
 
-    4-connectivity flood fill over the set pixels. Pure Python; photo
-    rasters are a few megapixels at most after ingest caps.
+    4-connectivity labelling via OpenCV — validated count-for-count
+    against the flood fill it replaced, over randomized rasters.
+    ``binary`` is a uint8 array of any shape whose product is
+    width * height; nonzero counts as set.
     """
-    visited = bytearray(len(binary))
-    components = 0
-    largest = 0
-    for start in range(len(binary)):
-        if not binary[start] or visited[start]:
-            continue
-        components += 1
-        size = 0
-        queue = deque([start])
-        visited[start] = 1
-        while queue:
-            i = queue.popleft()
-            size += 1
-            x = i % width
-            if x > 0 and binary[i - 1] and not visited[i - 1]:
-                visited[i - 1] = 1
-                queue.append(i - 1)
-            if x < width - 1 and binary[i + 1] and not visited[i + 1]:
-                visited[i + 1] = 1
-                queue.append(i + 1)
-            if i >= width and binary[i - width] and not visited[i - width]:
-                visited[i - width] = 1
-                queue.append(i - width)
-            if (
-                i < len(binary) - width
-                and binary[i + width]
-                and not visited[i + width]
-            ):
-                visited[i + width] = 1
-                queue.append(i + width)
-        largest = max(largest, size)
-    return components, largest
+    raster = (binary.reshape(height, width) != 0).astype(np.uint8)
+    count, _labels, stats, _centroids = cv2.connectedComponentsWithStats(
+        raster, connectivity=4
+    )
+    if count <= 1:
+        return 0, 0
+    return int(count - 1), int(stats[1:, cv2.CC_STAT_AREA].max())
 
 
 def assess_mask(mask_image: Image.Image) -> MaskAssessment:
     """Quality-check one full-frame binary mask ("L", 255 = on)."""
     width, height = mask_image.size
     frame_pixels = width * height
-    binary = bytes(1 if value else 0 for value in mask_image.tobytes())
-    mask_pixels = sum(binary)
+    values = np.frombuffer(mask_image.tobytes(), dtype=np.uint8)
+    mask_pixels = int(np.count_nonzero(values))
     coverage = mask_pixels / frame_pixels if frame_pixels else 0.0
     if mask_pixels == 0:
         return MaskAssessment(0, 0.0, 0, 0.0, False, "empty")
-    components, largest = _label_components(binary, width, height)
+    components, largest = _label_components(values, width, height)
     dominant = largest / mask_pixels
     if coverage < MIN_COVERAGE:
         rejection: str | None = "empty"
@@ -154,25 +132,23 @@ def mask_overlay_image(source: Image.Image, mask_image: Image.Image) -> Image.Im
             f"Mask {mask.size} does not cover the source frame {source_rgba.size}."
         )
     width, height = mask.size
-    on = bytes(1 if value else 0 for value in mask.tobytes())
-    out = source_rgba.load()
-    for y in range(height):
-        base = y * width
-        for x in range(width):
-            i = base + x
-            if not on[i]:
-                continue
-            if (
-                x == 0
-                or not on[i - 1]
-                or x == width - 1
-                or not on[i + 1]
-                or y == 0
-                or not on[i - width]
-                or y == height - 1
-                or not on[i + width]
-            ):
-                out[x, y] = OVERLAY_OUTLINE_RGBA
+    on = (
+        np.frombuffer(mask.tobytes(), dtype=np.uint8).reshape(height, width) != 0
+    )
+    # Outline = on-pixels with a 4-neighbour off or outside the frame
+    # (the zero padding stands in for "outside").
+    padded = np.pad(on, 1, constant_values=False)
+    surrounded = (
+        padded[:-2, 1:-1]
+        & padded[2:, 1:-1]
+        & padded[1:-1, :-2]
+        & padded[1:-1, 2:]
+    )
+    outline = on & ~surrounded
+    outline_image = Image.fromarray(
+        (outline * 255).astype(np.uint8), mode="L"
+    )
+    source_rgba.paste(OVERLAY_OUTLINE_RGBA, (0, 0), outline_image)
     return source_rgba
 
 
@@ -193,16 +169,15 @@ def review_mask(mask_image: Image.Image) -> dict:
     """
     mask = mask_image.convert("L")
     width, height = mask.size
-    on = bytes(1 if value else 0 for value in mask.tobytes())
-    mask_pixels = sum(on)
+    on = np.frombuffer(mask.tobytes(), dtype=np.uint8).reshape(height, width)
+    mask_pixels = int(np.count_nonzero(on))
     warnings: list[str] = []
     bbox = None
     bbox_fill = None
     touches: list[str] = []
     if mask_pixels:
-        xs = [i % width for i, v in enumerate(on) if v]
-        ys = [i // width for i, v in enumerate(on) if v]
-        x0, x1, y0, y1 = min(xs), max(xs), min(ys), max(ys)
+        ys, xs = np.nonzero(on)
+        x0, x1, y0, y1 = int(xs.min()), int(xs.max()), int(ys.min()), int(ys.max())
         bbox = [x0, y0, x1 + 1, y1 + 1]
         bbox_fill = round(mask_pixels / ((x1 - x0 + 1) * (y1 - y0 + 1)), 6)
         if x0 == 0:
@@ -244,10 +219,10 @@ def mask_iou(a: Image.Image, b: Image.Image) -> float:
     """
     if a.size != b.size:
         raise ValueError(f"Mask sizes differ: {a.size} vs {b.size}.")
-    a_on = bytes(1 if value else 0 for value in a.convert("L").tobytes())
-    b_on = bytes(1 if value else 0 for value in b.convert("L").tobytes())
-    intersection = sum(1 for x, y in zip(a_on, b_on) if x and y)
-    union = sum(1 for x, y in zip(a_on, b_on) if x or y)
+    a_on = np.frombuffer(a.convert("L").tobytes(), dtype=np.uint8) != 0
+    b_on = np.frombuffer(b.convert("L").tobytes(), dtype=np.uint8) != 0
+    intersection = int(np.count_nonzero(a_on & b_on))
+    union = int(np.count_nonzero(a_on | b_on))
     return intersection / union if union else 1.0
 
 
