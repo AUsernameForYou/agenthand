@@ -108,6 +108,14 @@ files. The placeholder plate survives only behind an explicit dev flag
 for offline tests. Today the server runs locally over stdio; a hosted
 endpoint comes later.
 
+The server also exists as a single-binary Rust build (source in the
+`agenthand-rust` repository). It passed a parity gate against the frozen
+files of the verified run above, reproducing the run's counts and its
+output pixel hash, and a live run from the Rust binary was cross-checked
+by the Python verifier. The Python implementation remains the
+reference; the Rust build is a second implementation of the same
+server, and the two agree.
+
 ## Run it
 
 ```bash
