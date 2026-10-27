@@ -138,6 +138,55 @@
   .steps{margin:14px 0 0;padding-left:22px;font-size:16.5px}
   .steps li{margin-bottom:8px}
 
+  .proof{margin:30px 0 0}
+  .proof-title{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:14px;font-weight:700;letter-spacing:0.14em;margin:0 0 10px;
+  }
+  .stage{
+    position:relative;max-width:330px;aspect-ratio:1206/1925;
+    border:2px solid var(--ink);overflow:hidden;background:#ffffff;
+    margin:16px 0 10px;
+  }
+  .stage img{
+    position:absolute;inset:0;width:100%;height:100%;
+  }
+  .stage img.plate{object-fit:cover}
+  .stage img.fit{object-fit:fill}
+  .stage[data-scene="ink"]{background:#111111}
+  .stage[data-scene="checker"]{
+    background:repeating-conic-gradient(#e4e4e4 0% 25%, #ffffff 0% 50%) 0 0/24px 24px;
+  }
+  .scene-btns{display:flex;flex-wrap:wrap;gap:8px;margin:4px 0 8px}
+  .scene-btns button{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13px;font-weight:700;background:#fff;color:var(--ink);
+    border:2px solid var(--ink);padding:6px 12px;cursor:pointer;
+  }
+  .scene-btns button.active{background:var(--ink);color:#fff}
+  .proof-cap{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13px;color:var(--grey);max-width:560px;margin:6px 0 0;
+  }
+  .verify{
+    border:2px solid var(--ink);background:var(--panel);
+    padding:20px 24px;margin:26px 0 6px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:14.5px;line-height:1.7;overflow-wrap:anywhere;
+  }
+  .verify p{margin:0 0 10px}
+  .vcounts{display:flex;gap:36px;flex-wrap:wrap;margin:14px 0 6px}
+  .vcounts .vlab{font-size:12.5px;color:var(--grey);letter-spacing:0.08em}
+  .vcount{font-size:32px;font-weight:800;line-height:1.15;display:block}
+  .vcount.zero{background:var(--cyan);color:var(--ink);padding:0 10px}
+  .vcount.bad{background:var(--ink);color:#fff;padding:0 10px}
+  .verify-lines{margin:10px 0}
+  .verify-lines .k{color:var(--grey)}
+  .verify-lines .tick{color:var(--ink);font-weight:700}
+  .verify-lines .fail{color:var(--ink);font-weight:800;text-decoration:underline}
+  .tamper{display:block;margin:12px 0;font-size:14px;cursor:pointer}
+  .tamper input{margin-right:8px}
+
   .card-figure{margin:22px 0 10px;max-width:360px}
   .card-figure img{width:100%;height:auto;display:block;border:2px solid var(--ink)}
   .card-figure figcaption{
@@ -248,6 +297,40 @@
       <li>Every result ships with its receipt: the hashes, what was transformed, the changed-pixel count, and the cost of the calls that made it.</li>
     </ol>
     <p class="note">The claim is precise on purpose: the stored product layer reached the final image unchanged. Edge pixels that blend with the scene are counted separately in the receipt, never hidden inside the zero.</p>
+
+    <div class="proof" id="proof">
+      <p class="proof-title">THE PROOF — THE RUN'S OWN FILES</p>
+      <p class="lede">These are the byte-exact files from the verified run receipted above, not recreations. One honesty note: the "product" in this first end-to-end fixture is a chat-screen cut-out (the staged scene is a reading room). The files, hashes, and counts are the real run's; when the product-photo run lands, this fixture swaps as a data change.</p>
+      <button class="copy-btn" id="proof-load" type="button">Load the run's images (5.6 MB)</button>
+      <div class="stage" id="proof-stage" data-scene="plate" hidden>
+        <img class="plate" id="proof-plate" alt="The background scene generated for the verified run: a regal reading room">
+        <img class="fit" id="proof-source" alt="The source photo of the verified run: a phone chat screenshot" style="display:none">
+        <img class="fit" id="proof-output" alt="The final composite of the verified run: the chat cut-out staged in the reading room" style="display:none">
+        <img class="fit" id="proof-layer" alt="The product layer of the verified run: the chat cut-out on transparency">
+      </div>
+      <div class="scene-btns" role="group" aria-label="Scene behind the product layer">
+        <button type="button" data-scene="plate" aria-pressed="true">The run's scene</button>
+        <button type="button" data-scene="white" aria-pressed="false">Studio white</button>
+        <button type="button" data-scene="ink" aria-pressed="false">Studio ink</button>
+        <button type="button" data-scene="checker" aria-pressed="false">Transparency</button>
+        <button type="button" data-scene="source" aria-pressed="false">Original photo</button>
+        <button type="button" data-scene="output" aria-pressed="false">Final output</button>
+      </div>
+      <p class="proof-cap">[ byte-exact run files, shown unedited · the product layer never moves; only the scene behind it changes · the generated plate is shown centre-cropped to the frame, as the run itself cropped it · white / ink / checker are display backdrops, not run assets ]</p>
+    </div>
+
+    <div class="verify" id="verify">
+      <p class="proof-title">VERIFY IT YOURSELF</p>
+      <p>Do not take the receipt's word for it. This runs entirely in your browser: it downloads the source photo, the product layer, and the final output (3.1 MB, only when you click), hashes the files with SHA-256, checks the hashes against the receipt and the run's records, then decodes both images and counts every fully opaque product pixel against the output.</p>
+      <div class="vcounts">
+        <div><span class="vlab">PIXELS CHECKED</span><span class="vcount" id="verify-checked">0</span></div>
+        <div><span class="vlab">CHANGED</span><span class="vcount" id="verify-changed">0</span></div>
+      </div>
+      <div class="verify-lines" id="verify-lines"></div>
+      <p id="verify-status">Not run yet.</p>
+      <label class="tamper"><input type="checkbox" id="verify-tamper">Tamper test: alter one byte and one pixel of the output copy, in this browser only, and watch both checks fail</label>
+      <button class="copy-btn" id="verify-btn" type="button">Verify it yourself</button>
+    </div>
   </section>
 
   <section id="scale-card" aria-labelledby="scale-h">
@@ -323,6 +406,7 @@ python3.12 -m venv .venv
   });
 })();
 </script>
+<script src="verifier-v1.js" defer></script>
 
 </body>
 </html>
