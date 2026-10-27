@@ -8,11 +8,14 @@ Tools accept an image argument in any of three forms:
 - a base64 data URI (``data:image/png;base64,...``).
 
 Ingest enforces byte and pixel caps, then NORMALIZES: EXIF orientation is
-applied, the image is converted to 8-bit RGBA (sRGB-family) and re-encoded
-as PNG. Normalizing at the boundary means every downstream step — hashing,
-segmentation, compositing — sees one canonical pixel layout, and the
-pixel hash recorded at ingest describes the pixels tools will actually
-work with.
+applied, the image is converted to 8-bit RGBA and re-encoded as PNG. The
+source's embedded ICC colour profile is carried into the stored PNG
+unchanged — dropping it would silently re-interpret the product's
+colours (a Display P3 iPhone photo would render as if it were sRGB)
+while every pixel value stayed identical. Normalizing at the boundary
+means every downstream step — hashing, segmentation, compositing —
+sees one canonical pixel layout, and the hashes recorded at ingest
+describe the pixels and profile tools will actually work with.
 """
 
 from __future__ import annotations
@@ -52,6 +55,8 @@ def normalize_image_bytes(data: bytes) -> bytes:
     """
     from PIL import Image, ImageOps
 
+    from .assets import carry_color_profile, icc_profile_of_image
+
     try:
         with Image.open(BytesIO(data)) as img:
             img.load()
@@ -61,13 +66,22 @@ def normalize_image_bytes(data: bytes) -> bytes:
                     f"({img.width * img.height} pixels), over the "
                     f"{_max_pixels()}-pixel ingest cap."
                 )
-            normalized = ImageOps.exif_transpose(img).convert("RGBA")
+            # Captured before any transform: whatever a later Pillow
+            # operation drops from info, the profile is re-attached
+            # explicitly below and written into the stored PNG.
+            icc_profile = icc_profile_of_image(img)
+            normalized = carry_color_profile(
+                img, ImageOps.exif_transpose(img).convert("RGBA")
+            )
     except IngestError:
         raise
     except Exception as exc:
         raise IngestError(f"Input does not decode as an image: {exc}") from exc
     buffer = BytesIO()
-    normalized.save(buffer, format="PNG")
+    if icc_profile is not None:
+        normalized.save(buffer, format="PNG", icc_profile=icc_profile)
+    else:
+        normalized.save(buffer, format="PNG")
     return buffer.getvalue()
 
 

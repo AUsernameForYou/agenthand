@@ -66,6 +66,62 @@ def test_pixel_cap_rejects_huge_images(tmp_path, monkeypatch):
         ingest.ingest(_data_uri(_png_bytes(size=(6, 4))), store)  # 24 pixels
 
 
+def test_ingest_preserves_the_embedded_colour_profile(tmp_path):
+    # A camera JPEG carrying a non-sRGB profile (the Display P3 case):
+    # normalization to PNG must carry the profile through unchanged,
+    # or the product's colours silently re-interpret downstream while
+    # every pixel value stays the same.
+    import hashlib
+
+    from PIL import ImageCms
+
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("XYZ")).tobytes()
+    buffer = BytesIO()
+    img = Image.new("RGB", (6, 4), (200, 30, 30))
+    img.save(buffer, format="JPEG", icc_profile=profile)
+
+    store = AssetStore(tmp_path)
+    handle = ingest.ingest(_data_uri(buffer.getvalue(), "image/jpeg"), store)
+
+    record = store.get_record(handle)
+    assert record.color_profile_sha256 == hashlib.sha256(profile).hexdigest()
+    with Image.open(BytesIO(store.read_bytes(handle))) as stored:
+        assert stored.info.get("icc_profile") == profile
+    store.verify_integrity(handle)
+
+
+def test_ingest_without_a_profile_records_none(tmp_path):
+    store = AssetStore(tmp_path)
+    handle = ingest.ingest(_data_uri(_png_bytes()), store)
+    assert store.get_record(handle).color_profile_sha256 is None
+
+
+def test_ingest_accepts_heic_the_iphone_default(tmp_path):
+    # Fable's lane-unique catch: iPhones save HEIC by default. The
+    # fixture is a REAL HEIF file, encoded by pillow-heif itself
+    # (ftyp heic), not a renamed PNG. HEIC is lossy, so pixels are
+    # compared within codec tolerance; geometry must be exact.
+    import pillow_heif
+
+    pillow_heif.register_heif_opener()
+    buffer = BytesIO()
+    Image.new("RGB", (16, 12), (180, 40, 40)).save(buffer, format="HEIF", quality=95)
+    raw = buffer.getvalue()
+    assert raw[4:8] == b"ftyp" and b"heic" in raw[8:12]
+
+    store = AssetStore(tmp_path)
+    handle = ingest.ingest(_data_uri(raw, "image/heic"), store)
+
+    record = store.get_record(handle)
+    assert record.kind == "source_photo"
+    assert (record.width, record.height) == (16, 12)
+    decoded = Image.open(BytesIO(store.read_bytes(handle)))
+    assert decoded.mode == "RGBA"  # normalized like every other format
+    r, g, b, _a = decoded.getpixel((8, 6))
+    assert abs(r - 180) <= 8 and abs(g - 40) <= 8 and abs(b - 40) <= 8
+    store.verify_integrity(handle)
+
+
 def test_exif_orientation_is_applied_at_ingest(tmp_path):
     # A 4x2 JPEG tagged "rotate 90° CW" (EXIF orientation 6) must be
     # stored as the 2x4 image the photographer actually framed, so every

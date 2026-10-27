@@ -59,6 +59,64 @@ def _mask_image(text=GOOD_TEXT, size=(8, 6)):
     return masks[0]
 
 
+# -- mask correctness gate: overlay, review signals, golden IoU -------------
+
+
+def _left_half_mask(size=(8, 6)):
+    mask = Image.new("L", size, 0)
+    px = mask.load()
+    for y in range(size[1]):
+        for x in range(size[0] // 2):
+            px[x, y] = 255
+    return mask
+
+
+def test_mask_iou_against_a_golden_fixture():
+    golden = _left_half_mask()
+    decoded = _mask_image(GOOD_TEXT).image
+    assert segmentation.mask_iou(decoded, golden) == 1.0
+    # The wrong-object case (Fable: "the table, not the mug"): the
+    # fragmented mask overlaps the golden only at one corner block.
+    wrong = _mask_image(FRAG_TEXT).image
+    assert segmentation.mask_iou(wrong, golden) < 0.5
+
+
+def test_mask_overlay_draws_the_outline_and_nothing_else():
+    source = Image.new("RGBA", (8, 6), (200, 30, 30, 255))
+    overlay = segmentation.mask_overlay_image(source, _left_half_mask())
+    px = overlay.load()
+    outline = segmentation.OVERLAY_OUTLINE_RGBA
+    assert px[3, 3] == outline  # the mask's right boundary column
+    assert px[0, 0] == outline  # frame corner of the selection
+    assert px[1, 1] == (200, 30, 30, 255)  # interior: source untouched
+    assert px[6, 3] == (200, 30, 30, 255)  # outside: source untouched
+
+
+def test_review_mask_reports_geometry_without_warnings_for_a_clean_mask():
+    review = segmentation.review_mask(_left_half_mask())
+    assert review["mask_pixels"] == 24
+    assert review["coverage"] == 0.5
+    assert review["bbox"] == [0, 0, 4, 6]
+    assert review["bbox_fill"] == 1.0
+    assert review["touches_frame_edges"] == ["left", "top", "bottom"]
+    assert review["warnings"] == []
+
+
+def test_review_mask_flags_a_frame_shaped_selection():
+    # A border ring: touches every edge and fills a third of its box —
+    # the classic "selected the background/frame, not the product".
+    ring = Image.new("L", (20, 14), 0)
+    px = ring.load()
+    for x in range(20):
+        px[x, 0] = px[x, 13] = 255
+    for y in range(14):
+        px[0, y] = px[19, y] = 255
+    review = segmentation.review_mask(ring)
+    assert review["touches_frame_edges"] == ["left", "right", "top", "bottom"]
+    assert any("all four frame edges" in w for w in review["warnings"])
+    assert any("bounding box" in w for w in review["warnings"])
+
+
 # -- wire parsing -------------------------------------------------------------
 
 

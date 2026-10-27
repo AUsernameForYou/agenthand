@@ -20,10 +20,18 @@ FIDELITY LOCK (the core design invariant of draw):
   composites the stored product layer onto the plate, which is resized to
   the product, never the reverse. The returned fidelity receipt carries
   the source, foreground, and mask hashes plus the measured count of
-  changed opaque foreground pixels (must be 0) and the edge-band count,
-  so a caller can verify this precise claim: the stored extracted
-  foreground reached the composite unchanged. Any change to this module
-  must preserve that invariant: if a code path regenerates product pixels
+  changed opaque foreground pixels (must be 0), the edge-band count and
+  its maximum width, the mask's total footprint and opaque share, and
+  the colour-profile identity of the source photo and the composite
+  (color_profile_preserved must be true: a dropped or changed ICC
+  profile recolours the product while pixel values stay identical, so
+  it is a fidelity failure on the same footing as a changed pixel). A
+  caller can verify this precise claim: the stored extracted foreground
+  reached the composite unchanged. The receipt is not the only grader:
+  composite.verify_receipt_from_disk re-derives every number from the
+  stored files, and the standalone agenthand-verify checker verifies
+  exported files with no store at all. Any change to this module must
+  preserve that invariant: if a code path regenerates product pixels
   with a model, it is a bug, not a feature.
 
 Billing: every billable call goes through meta_client.billed_call
@@ -45,8 +53,10 @@ the real image model (muse-image-1.0) through the same choke point:
 the model generates ONLY the empty background plate (stored as a
 background_plate asset, pinned in the fidelity receipt), deterministic
 code composites the stored product layer onto it, and a measured
-changed-opaque-pixel count other than zero turns the result into a
-FIDELITY_VIOLATION error rather than a false receipt. Plate failures
+changed-opaque-pixel count other than zero — or a colour profile that
+did not survive from the source photo to the composite — turns the
+result into a FIDELITY_VIOLATION error rather than a false receipt.
+Plate failures
 return IMAGE_REFUSED / BAD_IMAGE_RESPONSE / IMAGE_CALL_FAILED with the
 reservation counted. The deterministic placeholder plate survives ONLY
 behind the explicit AGENTHAND_DRAW_PLACEHOLDER_PLATE dev flag, for
@@ -60,7 +70,13 @@ from io import BytesIO
 from mcp.server.mcpserver import Image, MCPServer
 
 from . import composite, config, ingest, meta_client, segmentation
-from .assets import HANDLE_PREFIX, KIND_FOREGROUND, KIND_MASK, AssetStore
+from .assets import (
+    HANDLE_PREFIX,
+    KIND_FOREGROUND,
+    KIND_MASK,
+    KIND_OVERLAY,
+    AssetStore,
+)
 
 # mcp Python SDK v2: the high-level server class is MCPServer
 # (renamed from FastMCP in v1).
@@ -167,17 +183,30 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     handle, receipt = composite.draw_product(
         store, asset, scene_prompt, plate_handle=plate_handle
     )
-    if receipt["changed_opaque_pixels"] != 0:
+    if receipt["changed_opaque_pixels"] != 0 or not receipt["color_profile_preserved"]:
         # The Lock is measured, not assumed: a composite that changed
-        # opaque product pixels must not ship under a fidelity receipt
-        # claiming otherwise. The composite stays stored for inspection
-        # (its handle rides in the error), but the tool reports failure.
+        # opaque product pixels — or that lost/changed the source
+        # photo's colour profile, which changes the product's displayed
+        # colours while pixel values stay identical — must not ship
+        # under a fidelity receipt claiming otherwise. The composite
+        # stays stored for inspection (its handle rides in the error),
+        # but the tool reports failure.
+        failures = []
+        if receipt["changed_opaque_pixels"] != 0:
+            failures.append(
+                "the compositor measured "
+                f"{receipt['changed_opaque_pixels']} changed opaque "
+                "foreground pixels"
+            )
+        if not receipt["color_profile_preserved"]:
+            failures.append(
+                "the composite does not carry the source photo's "
+                "colour profile unchanged"
+            )
         return _error(
             "FIDELITY_VIOLATION",
-            "The compositor measured "
-            f"{receipt['changed_opaque_pixels']} changed opaque "
-            "foreground pixels; refusing to present this composite "
-            "under the Fidelity Lock.",
+            "; ".join(failures)
+            + "; refusing to present this composite under the Fidelity Lock.",
             output_asset=handle,
             fidelity_receipt=receipt,
             cost_usd=billing["actual_usd"],
@@ -272,7 +301,11 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     phrase; every attempt is traced in the result. The foreground is
     the source pixels through the accepted mask, nothing regenerated;
     foreground and mask are stored with their hashes and lineage to the
-    source photo.
+    source photo. Because a fidelity receipt can only vouch for the
+    pixels a mask selected, the result also carries the selection's own
+    review surface: mask_overlay_asset (the source photo with the
+    mask's outline drawn on it) and mask_review (the mask's bounding
+    box, fill, frame-edge contact, and any sanity warnings).
 
     Failures return a structured error: NOT_CONFIGURED (no META_API_KEY;
     checked before billing, so no ledger write), NO_MATCH / POOR_MASK
@@ -376,6 +409,18 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     foreground_record = store.get_record(foreground_handle)
     mask_record = store.get_record(mask_handle)
 
+    # The mask-correctness gate (J2 Gauntlet item 6): a receipt can
+    # only prove the selected pixels survived, so the selection itself
+    # ships with its own review surface — an overlay asset (the source
+    # photo with the mask's outline drawn on it) and the mask's sanity
+    # signals with any warnings flagged, never silently accepted.
+    overlay_handle = store.put_image(
+        segmentation.mask_overlay_image(source_image, outcome["mask_image"]),
+        kind=KIND_OVERLAY,
+        source_asset_id=source_record.asset_id,
+    )
+    mask_review = segmentation.review_mask(outcome["mask_image"])
+
     return {
         "status": "ok",
         "tool": "cut_out",
@@ -387,6 +432,8 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         "plan_error": plan_error,
         "output_asset": foreground_handle,
         "mask_asset": mask_handle,
+        "mask_overlay_asset": overlay_handle,
+        "mask_review": mask_review,
         "hashes": {
             "source": {
                 "sha256": source_record.sha256,

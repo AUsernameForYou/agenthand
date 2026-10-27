@@ -59,6 +59,53 @@ def test_verify_integrity_passes_then_raises_on_tampering(tmp_path):
         store.verify_integrity(handle)
 
 
+def test_put_image_records_the_colour_profile(tmp_path):
+    from PIL import ImageCms
+
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("XYZ")).tobytes()
+    store = AssetStore(tmp_path)
+
+    plain = store.put_image(Image.new("RGBA", (6, 4), (1, 2, 3, 255)), kind="source_photo")
+    assert store.get_record(plain).color_profile_sha256 is None
+
+    img = Image.new("RGBA", (6, 4), (1, 2, 3, 255))
+    img.info["icc_profile"] = profile
+    tagged = store.put_image(img, kind="source_photo")
+    assert store.get_record(tagged).color_profile_sha256 == hashlib.sha256(
+        profile
+    ).hexdigest()
+    # The stored PNG itself carries the profile (not just the record).
+    with Image.open(BytesIO(store.read_bytes(tagged))) as stored:
+        assert stored.info.get("icc_profile") == profile
+
+
+def test_verify_integrity_raises_when_only_the_profile_is_stripped(tmp_path):
+    # Rewrite the stored file with identical pixels but no profile,
+    # and update the record's file hash to match (an insider-grade
+    # tamper the file hash alone cannot see). The recorded profile
+    # identity is the tripwire.
+    from PIL import ImageCms
+
+    profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("XYZ")).tobytes()
+    buffer = BytesIO()
+    img = Image.new("RGBA", (6, 4), (200, 30, 30, 255))
+    img.save(buffer, format="PNG", icc_profile=profile)
+    store = AssetStore(tmp_path)
+    handle = store.put_bytes(buffer.getvalue(), kind="source_photo", suffix=".png")
+    store.verify_integrity(handle)
+
+    path = store.resolve(handle)
+    stripped = _png_bytes(color=(200, 30, 30, 255))
+    path.write_bytes(stripped)
+    record = store.get_record(handle)
+    record.sha256 = hashlib.sha256(stripped).hexdigest()
+    record.byte_size = len(stripped)
+    store._save_record(record)
+
+    with pytest.raises(AssetIntegrityError, match="colour profile"):
+        store.verify_integrity(handle)
+
+
 def test_derived_asset_records_its_source(tmp_path):
     store = AssetStore(tmp_path)
     source = store.put_bytes(b"photo", kind="source_photo")

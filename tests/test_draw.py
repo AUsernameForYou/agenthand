@@ -296,6 +296,80 @@ def test_draw_refuses_a_non_foreground_before_any_reservation_live(monkeypatch):
     assert client.images.calls == []  # and the image model was never called
 
 
+# -- colour profile: a break in the chain is a fidelity violation --------
+
+
+def _profile_bytes() -> bytes:
+    from PIL import ImageCms
+
+    return ImageCms.ImageCmsProfile(ImageCms.createProfile("XYZ")).tobytes()
+
+
+def test_draw_live_profiled_chain_stays_ok_and_receipt_records_it(monkeypatch):
+    import hashlib
+
+    from agenthand import segmentation
+
+    _install_fake(
+        monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())])
+    )
+    store = AssetStore(config.get_data_dir())
+    profile = _profile_bytes()
+    photo_img = Image.new("RGBA", (6, 4), (90, 90, 90, 255))
+    photo_img.info["icc_profile"] = profile
+    photo = store.put_image(photo_img, kind="source_photo")
+
+    mask = Image.new("L", (6, 4), 0)
+    px = mask.load()
+    for y in range(4):
+        for x in range(3):
+            px[x, y] = 255
+    foreground = segmentation.extract_foreground(store.read_image(photo), mask)
+    fg = store.put_image(
+        foreground,
+        kind="foreground_png",
+        source_asset_id=AssetStore.parse_handle(photo),
+    )
+
+    result, _ = server.draw(fg, "a regal room")
+    assert result["status"] == "ok"
+    receipt = result["fidelity_receipt"]
+    expected = hashlib.sha256(profile).hexdigest()
+    assert receipt["color_profile_preserved"] is True
+    assert receipt["color_profile_source_sha256"] == expected
+    assert receipt["color_profile_output_sha256"] == expected
+
+
+def test_draw_live_profile_break_is_a_fidelity_violation(monkeypatch):
+    _install_fake(
+        monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())])
+    )
+    store = AssetStore(config.get_data_dir())
+    photo_img = Image.new("RGBA", (6, 4), (90, 90, 90, 255))
+    photo_img.info["icc_profile"] = _profile_bytes()
+    photo = store.put_image(photo_img, kind="source_photo")
+    # The foreground was stored WITHOUT the source's profile (an older
+    # or foreign extractor): pixel values are fine, the colours are
+    # not, and draw must refuse rather than issue a clean receipt.
+    fg_img = Image.new("RGBA", (6, 4), (0, 0, 0, 0))
+    px = fg_img.load()
+    for y in range(4):
+        for x in range(3):
+            px[x, y] = (255, 0, 0, 255)
+    fg = store.put_image(
+        fg_img,
+        kind="foreground_png",
+        source_asset_id=AssetStore.parse_handle(photo),
+    )
+
+    result = server.draw(fg, "a regal room")
+    assert isinstance(result, dict)
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "FIDELITY_VIOLATION"
+    assert "colour profile" in result["error"]["message"]
+    assert result["error"]["fidelity_receipt"]["color_profile_preserved"] is False
+
+
 # -- hermeticity ---------------------------------------------------------
 
 

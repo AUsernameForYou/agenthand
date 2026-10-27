@@ -172,6 +172,38 @@ def test_cut_out_success_with_provided_concept(monkeypatch):
     assert records[1]["call_id"] == result["call_id"]
 
 
+def test_cut_out_ships_the_mask_overlay_and_review(monkeypatch):
+    # J2 item 6: the selection itself gets a review surface — an
+    # overlay asset a human/agent can look at, plus the mask's sanity
+    # signals — because the receipt can only vouch for selected pixels.
+    _install_fake(
+        monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)])
+    )
+    result = server.cut_out(_photo_uri(), "brown leather wallet")
+    assert result["status"] == "ok"
+
+    store = AssetStore(config.get_data_dir())
+    overlay_record = store.get_record(result["mask_overlay_asset"])
+    assert overlay_record.kind == "mask_overlay"
+    assert overlay_record.source_asset_id == store.get_record(result["image"]).asset_id
+    store.verify_integrity(result["mask_overlay_asset"])
+
+    from agenthand import segmentation
+
+    overlay = store.read_image(result["mask_overlay_asset"]).load()
+    outline = segmentation.OVERLAY_OUTLINE_RGBA
+    assert overlay[3, 3] == outline  # boundary of the left-half mask
+    assert overlay[1, 1] == (200, 30, 30, 255)  # interior source pixel intact
+    assert overlay[6, 3] == (120, 120, 120, 255)  # outside: photo untouched
+
+    review = result["mask_review"]
+    assert review["bbox"] == [0, 0, 4, 6]
+    assert review["bbox_fill"] == 1.0
+    assert review["coverage"] == 0.5
+    assert review["touches_frame_edges"] == ["left", "top", "bottom"]
+    assert review["warnings"] == []
+
+
 def test_cut_out_picks_the_largest_record(monkeypatch):
     _install_fake(
         monkeypatch, _FakeClient(sam_responses=[_sam_response(TWO_RECORDS_TEXT)])

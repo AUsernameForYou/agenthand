@@ -16,6 +16,7 @@ dependencies = [
     "mcp>=2.0",
     "openai>=1.30",
     "Pillow>=10",
+    "pillow-heif>=1.8",
     "meta-sam-parser>=0.1.0",
 ]
 
@@ -26,6 +27,7 @@ dev = [
 
 [project.scripts]
 agenthand = "agenthand.server:main"
+agenthand-verify = "agenthand.verify:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/agenthand"]

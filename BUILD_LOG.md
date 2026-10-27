@@ -303,3 +303,48 @@ the hackathon credits to land.
   prints results, the fidelity receipt, and new ledger lines). NOT
   run: live verification of draw against the real API is the next
   step.
+
+## J2 Gauntlet must-fixes (2026-10-27) — GO WITH CHANGES, 3 of 3 lanes
+
+The draw-junction Gauntlet (verdict: ~/workspace/meta-hackathon/
+gauntlet-j2-draw/VERDICT.md) accepted the plate-only architecture and
+demanded the receipt stop grading itself. Landed, all server-side:
+
+- Colour profile is a fidelity property (Claude/Fable's strongest
+  attack): ingest normalization, foreground extraction, compositing,
+  and asset storage now preserve the source's embedded ICC profile end
+  to end; every asset record carries color_profile_sha256; the draw
+  receipt pins source/foreground/output profile hashes and
+  color_profile_preserved, and a profile break returns
+  FIDELITY_VIOLATION from draw like a changed pixel. verify_integrity
+  also checks the recorded profile.
+- Independent verification (Grok/Claude/Fable): the receipt's counts
+  are now measured on the delivered file decoded back from the store
+  (count_sample: decoded_delivered_file); composite.
+  verify_receipt_from_disk re-derives every number from the stored
+  files; the new standalone agenthand-verify CLI (agenthand.verify)
+  checks exported source/final/mask files with no store — exact
+  equality at fully masked pixels plus profile identity.
+- The receipt publishes the excluded set (item 3): edge-band count
+  AND maximum width (longest opaque-to-transparent path through the
+  band), mask_pixels_total, opaque_fraction, the changed predicate in
+  words, pixel_tolerance 0, colour space, and the output file's hashes.
+- Adversarial tests (item 5): hostile plate with an alpha ramp, an
+  alpha-250 ring published as excluded, the one-pixel negative control
+  (recount must return exactly 1), a 1-px checkerboard fixture,
+  feathered mask, JPEG re-encode, 1-px shift, plate-over-product swap,
+  profile strip with byte-identical pixels, EXIF rotation (existing).
+- Mask correctness gate (item 6): cut_out now stores a mask_overlay
+  asset (source photo with the mask outline in brand cyan) and returns
+  mask_review — bbox, fill, frame-edge contact, warnings (all-four-
+  edges and sparse-fill flags). segmentation.mask_iou added; golden-
+  fixture IoU tests cover the wrong-object case. identify emits no
+  spatial extent, so the runtime gate is mask-internal sanity plus the
+  overlay; IoU-vs-golden lives in the suite.
+- HEIC ingest (item 8, Fable): pillow-heif wired (declared in
+  pyproject, registered in assets) — a real encoded HEIF fixture
+  ingests and normalizes like any other photo.
+- Tests: 136 pass (was 106). Suite still fully offline.
+- Not server-side, left for their owners: item 1 (real product photo
+  runs — Daniel's fixture), item 7 (offline replay freeze —
+  production), item 9 (copy locks — site/film).

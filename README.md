@@ -33,14 +33,27 @@ through three tools, in the order a listing is produced:
    back to a source photo, and verifies the stored hashes before a single
    pixel moves.
 6. The result ships with a fidelity receipt: source, foreground, and mask
-   hashes, the transformations applied, the measured count of changed
-   opaque foreground pixels, the edge-band pixel count, the model calls
-   made, and their cost.
+   hashes, the delivered file's own hashes, the transformations applied,
+   the measured count of changed opaque foreground pixels, the model
+   calls made, and their cost. The receipt also publishes what the count
+   excluded: the edge-band pixel count and its maximum width, the opaque
+   share of the mask, the exact changed-pixel predicate with tolerance 0,
+   and the colour-profile identity of the source photo and the composite
+   (a dropped or changed ICC profile recolours the product while pixel
+   values stay identical, so it is recorded and counted as a fidelity
+   failure).
 
 The claim is precise: the stored extracted foreground reached the
 composite unchanged, and its hashes pin exactly which layer that was.
 Edge-band pixels (partially transparent) blend with the plate during
 compositing; the receipt counts them separately instead of overclaiming.
+The receipt's counts are measured on the delivered file, decoded back
+from the store, and can be re-derived independently:
+`composite.verify_receipt_from_disk` recounts from the stored files,
+and the standalone `agenthand-verify SOURCE FINAL MASK` checker
+verifies exported files with no store at all. Ingest accepts the
+formats phones produce, including HEIC, and preserves each photo's
+embedded colour profile end to end.
 
 A bounded mask-recovery loop guards `cut_out`: the mask is quality-checked,
 and on a poor mask the tool retries once with an alternate concept phrase

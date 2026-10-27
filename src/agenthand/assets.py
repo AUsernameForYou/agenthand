@@ -16,6 +16,15 @@ Two hashes are recorded per asset:
   hash's blind spots (metadata-driven decode differences), so the
   Fidelity Lock checks both.
 
+A third identity is recorded when the image carries one:
+``color_profile_sha256``, the hash of the embedded ICC colour profile.
+Pixel values alone do not determine displayed colour — a Display P3
+photo whose profile is dropped renders differently in every viewer
+while every pixel hash still matches (the J2 Gauntlet's strongest
+attack). The pipeline therefore preserves the source's profile end to
+end and records its identity on every asset, so a profile change is
+detectable and counts as a fidelity failure in the draw receipt.
+
 Lineage: each record names the asset it was derived from
 (``source_asset_id``), forming a chain back to a source photo. The draw
 tool refuses a foreground whose chain does not end at a source photo.
@@ -40,6 +49,28 @@ KIND_FOREGROUND = "foreground_png"
 KIND_MASK = "mask_png"
 KIND_PLATE = "background_plate"
 KIND_COMPOSITE = "composite"
+KIND_OVERLAY = "mask_overlay"
+
+
+def _register_image_openers() -> None:
+    """Teach Pillow the formats phones actually produce.
+
+    iPhones save HEIC by default; without pillow-heif registered,
+    Pillow cannot decode the format at all and ingest would refuse the
+    most common seller photo there is (J2 Gauntlet, Fable lane). The
+    dependency is declared in pyproject; the guard keeps a stripped
+    environment honest (HEIC input then fails as undecodable, like any
+    unsupported format) instead of crashing every import.
+    """
+    try:
+        from pillow_heif import register_heif_opener
+
+        register_heif_opener()
+    except ImportError:
+        pass
+
+
+_register_image_openers()
 
 
 class AssetIntegrityError(RuntimeError):
@@ -58,6 +89,7 @@ class AssetRecord:
     pixel_sha256: str | None = None  # hash of decoded RGBA bytes, if an image
     width: int | None = None
     height: int | None = None
+    color_profile_sha256: str | None = None  # hash of the embedded ICC profile
 
 
 def pixel_hash_of_image(image) -> str:
@@ -65,16 +97,74 @@ def pixel_hash_of_image(image) -> str:
     return hashlib.sha256(image.convert("RGBA").tobytes()).hexdigest()
 
 
-def _image_facts(data: bytes) -> tuple[str | None, int | None, int | None]:
-    """(pixel_sha256, width, height) if data decodes as an image, else Nones."""
+def icc_profile_of_image(image) -> bytes | None:
+    """The image's embedded ICC profile bytes, or None if it has none."""
+    info = getattr(image, "info", None) or {}
+    icc = info.get("icc_profile")
+    return bytes(icc) if icc else None
+
+
+def color_profile_sha256_of_image(image) -> str | None:
+    """Hash of an image's embedded ICC profile, or None if it has none."""
+    icc = icc_profile_of_image(image)
+    return hashlib.sha256(icc).hexdigest() if icc is not None else None
+
+
+def describe_color_profile(icc: bytes | None) -> str:
+    """Human-readable name for a colour profile, for receipts.
+
+    Best effort: a parseable ICC profile reports its own description;
+    anything else falls back to a generic label (the profile's hash,
+    recorded alongside, is the identity that actually gets checked).
+    """
+    if not icc:
+        return "sRGB (no embedded ICC profile)"
+    try:
+        from PIL import ImageCms
+
+        profile = ImageCms.ImageCmsProfile(BytesIO(icc))
+        description = profile.profile.profile_description
+        if description:
+            return str(description).strip()
+    except Exception:
+        pass
+    return "embedded ICC profile (description unreadable)"
+
+
+def carry_color_profile(source_image, target_image):
+    """Copy the source image's ICC profile onto the target image.
+
+    Several Pillow operations (alpha_composite, Image.composite) build
+    a fresh image and drop ``info``; every pipeline step that derives
+    pixels from a profiled image must re-attach the profile explicitly
+    or the product silently changes colour space mid-chain.
+    """
+    icc = icc_profile_of_image(source_image)
+    if icc is not None:
+        target_image.info["icc_profile"] = icc
+    return target_image
+
+
+def _image_facts(
+    data: bytes,
+) -> tuple[str | None, int | None, int | None, str | None]:
+    """(pixel_sha256, width, height, color_profile_sha256) for image bytes.
+
+    All None when the data does not decode as an image.
+    """
     try:
         from PIL import Image
 
         with Image.open(BytesIO(data)) as img:
             img.load()
-            return pixel_hash_of_image(img), img.width, img.height
+            return (
+                pixel_hash_of_image(img),
+                img.width,
+                img.height,
+                color_profile_sha256_of_image(img),
+            )
     except Exception:
-        return None, None, None
+        return None, None, None, None
 
 
 class AssetStore:
@@ -141,7 +231,7 @@ class AssetStore:
         tmp.write_bytes(data)
         os.replace(tmp, self.assets_dir / filename)
 
-        pixel_sha256, width, height = _image_facts(data)
+        pixel_sha256, width, height, color_profile_sha256 = _image_facts(data)
         record = AssetRecord(
             asset_id=asset_id,
             sha256=hashlib.sha256(data).hexdigest(),
@@ -153,6 +243,7 @@ class AssetStore:
             pixel_sha256=pixel_sha256,
             width=width,
             height=height,
+            color_profile_sha256=color_profile_sha256,
         )
         self._save_record(record)
         return HANDLE_PREFIX + asset_id
@@ -164,9 +255,20 @@ class AssetStore:
         kind: str,
         source_asset_id: str | None = None,
     ) -> str:
-        """Store a PIL Image as a PNG asset; returns its asset:// handle."""
+        """Store a PIL Image as a PNG asset; returns its asset:// handle.
+
+        The image's embedded ICC colour profile, when it has one, is
+        written into the PNG so the stored asset carries the same
+        profile as the in-memory image it was stored from.
+        """
+        icc = icc_profile_of_image(image)
+        converted = image.convert("RGBA")
         buffer = BytesIO()
-        image.convert("RGBA").save(buffer, format="PNG")
+        if icc is not None:
+            converted.info["icc_profile"] = icc
+            converted.save(buffer, format="PNG", icc_profile=icc)
+        else:
+            converted.save(buffer, format="PNG")
         return self.put_bytes(
             buffer.getvalue(), kind=kind, suffix=".png", source_asset_id=source_asset_id
         )
@@ -182,11 +284,17 @@ class AssetStore:
         return self.resolve(handle).read_bytes()
 
     def read_image(self, handle: str):
-        """Decode the asset as a PIL Image in RGBA mode."""
+        """Decode the asset as a PIL Image in RGBA mode.
+
+        The stored ICC colour profile rides along on the returned
+        image so downstream steps can carry it forward explicitly.
+        """
         from PIL import Image
 
         with Image.open(BytesIO(self.read_bytes(handle))) as img:
-            return img.convert("RGBA")
+            img.load()
+            converted = img.convert("RGBA")
+            return carry_color_profile(img, converted)
 
     def sha256_of(self, handle: str) -> str:
         return self.get_record(handle).sha256
@@ -230,11 +338,25 @@ class AssetStore:
                 f"{record.sha256}, actual {actual_file}. The stored bytes "
                 "were modified after ingest."
             )
-        if record.pixel_sha256 is not None:
-            pixel_sha256, _, _ = _image_facts(data)
-            if pixel_sha256 != record.pixel_sha256:
+        if record.pixel_sha256 is not None or record.color_profile_sha256 is not None:
+            pixel_sha256, _, _, color_profile_sha256 = _image_facts(data)
+            if (
+                record.pixel_sha256 is not None
+                and pixel_sha256 != record.pixel_sha256
+            ):
                 raise AssetIntegrityError(
                     f"Asset {handle!r} pixel hash mismatch: recorded "
                     f"{record.pixel_sha256}, actual {pixel_sha256}. The "
                     "decoded pixels differ from what was stored."
+                )
+            if (
+                record.color_profile_sha256 is not None
+                and color_profile_sha256 != record.color_profile_sha256
+            ):
+                raise AssetIntegrityError(
+                    f"Asset {handle!r} colour profile mismatch: recorded "
+                    f"{record.color_profile_sha256}, actual "
+                    f"{color_profile_sha256}. The stored image's colour "
+                    "profile was changed after ingest; identical pixel "
+                    "values would display as different colours."
                 )

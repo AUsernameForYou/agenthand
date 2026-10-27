@@ -39,10 +39,20 @@ from .assets import (
     KIND_MASK,
     KIND_PLATE,
     KIND_SOURCE,
+    AssetIntegrityError,
     AssetRecord,
     AssetStore,
+    carry_color_profile,
+    color_profile_sha256_of_image,
+    describe_color_profile,
+    icc_profile_of_image,
     pixel_hash_of_image,
 )
+
+# A foreground pixel counts as product only at exactly this alpha. The
+# threshold is named in every receipt so the claim's terms are pinned,
+# not implied.
+OPAQUE_ALPHA_THRESHOLD = 255
 
 
 class FidelityLockError(RuntimeError):
@@ -80,18 +90,87 @@ def _fit_plate(plate: Image.Image, size: tuple[int, int]) -> tuple[Image.Image, 
     return fitted, [f"plate_resized_and_center_cropped_to_{size[0]}x{size[1]}"]
 
 
-def _measure(foreground: Image.Image, composite: Image.Image) -> dict[str, int]:
+def _distance_to_class(alpha: bytes, width: int, height: int, target) -> list[int]:
+    """Manhattan distance from every pixel to the nearest target pixel.
+
+    Two-pass chamfer transform. When NO pixel matches the target (a
+    mask with no fully opaque pixel, say), distance is measured to the
+    image border instead, so callers still get a finite field.
+    """
+    total = width * height
+    if not any(target(a) for a in alpha):
+        return [
+            min(x + 1, width - x, y + 1, height - y)
+            for y in range(height)
+            for x in range(width)
+        ]
+    inf = total + 1
+    dist = [0 if target(a) else inf for a in alpha]
+    for y in range(height):
+        base = y * width
+        for x in range(width):
+            i = base + x
+            if dist[i]:
+                if x > 0 and dist[i - 1] + 1 < dist[i]:
+                    dist[i] = dist[i - 1] + 1
+                if y > 0 and dist[i - width] + 1 < dist[i]:
+                    dist[i] = dist[i - width] + 1
+    for y in range(height - 1, -1, -1):
+        base = y * width
+        for x in range(width - 1, -1, -1):
+            i = base + x
+            if dist[i]:
+                if x < width - 1 and dist[i + 1] + 1 < dist[i]:
+                    dist[i] = dist[i + 1] + 1
+                if y < height - 1 and dist[i + width] + 1 < dist[i]:
+                    dist[i] = dist[i + width] + 1
+    return dist
+
+
+def _edge_band_max_width(alpha: bytes, width: int, height: int) -> int:
+    """The edge band's maximum width in pixels.
+
+    Defined as the longest shortest path through band pixels from the
+    fully opaque region to the fully transparent region: for a
+    straight feather of thickness t, every crossing path has length t.
+    (A run-length measure would confuse the band's width with its
+    length along the product's edge; a distance-to-nearest measure
+    alone reports the band's radius, half its width.)
+
+    The edge band is where a soft mask blends the product into the
+    plate; if most of the product hid there, "0 changed" would cover a
+    shrunken pixel set (the J2 Gauntlet's soft-mask attack). The width
+    is measured and receipted so the band's size is a checkable fact,
+    not a footnote.
+    """
+    if width == 0 or height == 0:
+        return 0
+    if not any(0 < a < 255 for a in alpha):
+        return 0
+    to_opaque = _distance_to_class(alpha, width, height, lambda a: a == 255)
+    to_transparent = _distance_to_class(alpha, width, height, lambda a: a == 0)
+    return max(
+        to_opaque[i] + to_transparent[i] - 1
+        for i, a in enumerate(alpha)
+        if 0 < a < 255
+    )
+
+
+def _measure(foreground: Image.Image, composite: Image.Image) -> dict:
     """Count opaque / edge-band / transparent pixels and verify the lock.
 
     A foreground pixel with alpha 255 must appear in the composite
     byte-identical; the count of violations is measured, not assumed.
+    Also measures the mask's total footprint, the opaque share of it,
+    and the edge band's maximum width, so a receipt cannot quietly
+    shrink the set of pixels the "0 changed" claim covers.
     """
     fg_bytes = foreground.tobytes()
     out_bytes = composite.tobytes()
     alpha = foreground.getchannel("A").tobytes()
     opaque = edge_band = transparent = changed_opaque = 0
     for i, a in enumerate(alpha):
-        if a == 255:
+        if a == OPAQUE_ALPHA_THRESHOLD:
             opaque += 1
             j = i * 4
             if fg_bytes[j : j + 4] != out_bytes[j : j + 4]:
@@ -100,11 +179,17 @@ def _measure(foreground: Image.Image, composite: Image.Image) -> dict[str, int]:
             edge_band += 1
         else:
             transparent += 1
+    mask_total = opaque + edge_band
     return {
         "opaque_pixels": opaque,
         "edge_band_pixels": edge_band,
         "transparent_pixels": transparent,
         "changed_opaque_pixels": changed_opaque,
+        "mask_pixels_total": mask_total,
+        "opaque_fraction": round(opaque / mask_total, 6) if mask_total else 0.0,
+        "edge_band_max_width_px": _edge_band_max_width(
+            alpha, foreground.width, foreground.height
+        ),
     }
 
 
@@ -115,6 +200,9 @@ def composite_images(
     fg = foreground.convert("RGBA")
     fitted, transformations = _fit_plate(plate.convert("RGBA"), fg.size)
     out = Image.alpha_composite(fitted, fg)
+    # alpha_composite drops the foreground's ICC profile; the composite
+    # must carry the product's colour profile, not the plate's silence.
+    carry_color_profile(fg, out)
     return out, _measure(fg, out), transformations
 
 
@@ -205,9 +293,28 @@ def draw_product(
         plate_sha256 = None
         plate_pixel_sha256 = None
 
-    composite, counts, transformations = composite_images(foreground, plate)
+    composite, _in_memory_counts, transformations = composite_images(foreground, plate)
     composite_handle = store.put_image(
         composite, kind=KIND_COMPOSITE, source_asset_id=record.asset_id
+    )
+    composite_record = store.get_record(composite_handle)
+
+    # The receipt's counts are measured on the DELIVERED FILE, decoded
+    # back from the store — not on the in-memory buffer that produced
+    # it (the J2 Gauntlet: "the count runs on the in-memory buffer, the
+    # film shows the file"). A later re-encode or cast that changed
+    # pixels would show up here, and the independent verifier
+    # (verify_receipt_from_disk) recounts the same files the same way.
+    counts = _measure(
+        store.read_image(foreground_handle), store.read_image(composite_handle)
+    )
+
+    # Colour-profile identity, source photo vs delivered composite.
+    # Pixel hashes cannot see a profile change (identical values,
+    # different displayed colours), so the receipt pins the profile
+    # hashes and states preservation as its own checkable fact.
+    color_profile_preserved = (
+        source_record.color_profile_sha256 == composite_record.color_profile_sha256
     )
 
     receipt = {
@@ -225,6 +332,30 @@ def draw_product(
         "opaque_pixels": counts["opaque_pixels"],
         "edge_band_pixels": counts["edge_band_pixels"],
         "transparent_pixels": counts["transparent_pixels"],
+        "mask_pixels_total": counts["mask_pixels_total"],
+        "opaque_fraction": counts["opaque_fraction"],
+        "edge_band_max_width_px": counts["edge_band_max_width_px"],
+        "opaque_alpha_threshold": OPAQUE_ALPHA_THRESHOLD,
+        "changed_predicate": (
+            "a pixel counts as changed when its RGBA value in the "
+            "composite differs at all from the stored foreground at a "
+            "position where the foreground alpha equals "
+            "opaque_alpha_threshold; edge-band pixels (0 < alpha < "
+            "threshold) blend by design, are excluded from the count, "
+            "and are published above as edge_band_pixels and "
+            "edge_band_max_width_px"
+        ),
+        "pixel_tolerance": 0,
+        "count_sample": "decoded_delivered_file",
+        "output_asset": composite_handle,
+        "output_sha256": composite_record.sha256,
+        "output_pixel_sha256": composite_record.pixel_sha256,
+        "output_format": "PNG",
+        "color_space": describe_color_profile(icc_profile_of_image(composite)),
+        "color_profile_source_sha256": source_record.color_profile_sha256,
+        "color_profile_foreground_sha256": record.color_profile_sha256,
+        "color_profile_output_sha256": composite_record.color_profile_sha256,
+        "color_profile_preserved": color_profile_preserved,
         "transformations": transformations,
         "product_layer_scaled": False,
         "plate_source": plate_source,
@@ -236,7 +367,142 @@ def draw_product(
             "unchanged: every fully opaque foreground pixel in the "
             "composite is identical to the stored foreground layer "
             "(foreground hashes above pin that layer). Edge-band pixels "
-            "blend with the plate by design and are counted separately."
+            "blend with the plate by design and are counted separately. "
+            "The composite carries the source photo's colour profile "
+            "unchanged (color_profile_preserved above); a profile "
+            "change is a fidelity failure even when pixel values match."
         ),
     }
     return composite_handle, receipt
+
+
+def verify_receipt_from_disk(
+    store: AssetStore, composite_handle: str, receipt: dict
+) -> dict:
+    """Independently re-verify a draw receipt from the stored FILES.
+
+    The receipt draw returns is computed by the compositor, in memory,
+    at draw time — the J2 Gauntlet's "self-graded receipt" objection.
+    This is the independent path: it re-reads the stored source,
+    foreground, and composite files from disk, re-checks every file
+    against its recorded hashes, decodes the pixels fresh, recounts
+    the changed opaque pixels, and re-derives the colour-profile
+    identities. Nothing is taken from the receipt except the claims
+    being checked and the handles of the assets it names.
+
+    Returns a report dict: ``ok`` (True only when every check passes),
+    ``checks`` (per-check booleans), ``problems`` (human-readable
+    failures), and ``recomputed`` (the from-disk measurements). A
+    tampered stored file, a recount that disagrees with the receipt,
+    or a colour profile that differs between the source photo and the
+    delivered composite all make ``ok`` False — they never raise, so a
+    caller (the standalone verifier, the film's on-camera check) gets
+    the full list of what is wrong. KeyError propagates for an unknown
+    composite handle.
+    """
+    checks: dict[str, bool] = {}
+    problems: list[str] = []
+
+    def check(name: str, ok: bool, detail: str = "") -> None:
+        checks[name] = bool(ok)
+        if not ok:
+            problems.append(f"{name}: {detail}" if detail else name)
+
+    composite_record = store.get_record(composite_handle)
+    foreground_handle = receipt["foreground_asset"]
+    source_handle = receipt["source_asset"]
+
+    # 1. Every stored file must still match the hashes recorded for it
+    #    (file bytes, decoded pixels, colour profile). This is the
+    #    tripwire for a tampered output file.
+    for label, handle in (
+        ("source", source_handle),
+        ("foreground", foreground_handle),
+        ("composite", composite_handle),
+    ):
+        try:
+            store.verify_integrity(handle)
+            check(f"{label}_file_integrity", True)
+        except (AssetIntegrityError, KeyError) as exc:
+            check(f"{label}_file_integrity", False, str(exc))
+
+    # 2. Decode the foreground and the delivered composite fresh from
+    #    disk and recount — the receipt's numbers must reproduce.
+    foreground = store.read_image(foreground_handle)
+    composite_image = store.read_image(composite_handle)
+    check(
+        "foreground_pixel_hash",
+        pixel_hash_of_image(foreground) == receipt["foreground_pixel_sha256"],
+        "decoded foreground pixels do not match the receipt's pinned hash",
+    )
+    check(
+        "composite_pixel_hash",
+        pixel_hash_of_image(composite_image) == composite_record.pixel_sha256,
+        "decoded composite pixels do not match the stored asset record",
+    )
+    recomputed: dict = {}
+    if foreground.size != composite_image.size:
+        check(
+            "recount",
+            False,
+            f"foreground is {foreground.size}, composite is "
+            f"{composite_image.size}; sizes must match exactly",
+        )
+    else:
+        counts = _measure(foreground, composite_image)
+        recomputed.update(counts)
+        for field in (
+            "changed_opaque_pixels",
+            "opaque_pixels",
+            "edge_band_pixels",
+            "transparent_pixels",
+            "mask_pixels_total",
+            "edge_band_max_width_px",
+        ):
+            check(
+                f"recount_{field}",
+                counts[field] == receipt[field],
+                f"receipt says {receipt[field]}, recount from disk "
+                f"finds {counts[field]}",
+            )
+        check(
+            "recount_opaque_fraction",
+            abs(counts["opaque_fraction"] - receipt["opaque_fraction"]) < 1e-9,
+            f"receipt says {receipt['opaque_fraction']}, recount from "
+            f"disk finds {counts['opaque_fraction']}",
+        )
+
+    # 3. Colour-profile identity, re-derived from the files: the
+    #    profile the receipt names must be the profile in the files,
+    #    and source and output profiles must be identical.
+    source_image = store.read_image(source_handle)
+    source_profile = color_profile_sha256_of_image(source_image)
+    output_profile = color_profile_sha256_of_image(composite_image)
+    recomputed["color_profile_source_sha256"] = source_profile
+    recomputed["color_profile_output_sha256"] = output_profile
+    check(
+        "color_profile_matches_receipt",
+        source_profile == receipt["color_profile_source_sha256"]
+        and output_profile == receipt["color_profile_output_sha256"],
+        "profiles decoded from the files differ from the receipt's "
+        "recorded profile hashes",
+    )
+    preserved = source_profile == output_profile
+    recomputed["color_profile_preserved"] = preserved
+    check(
+        "color_profile_preserved",
+        preserved and receipt["color_profile_preserved"] is True,
+        "the delivered composite's colour profile differs from the "
+        "source photo's; identical pixel values would display as "
+        "different colours",
+    )
+
+    return {
+        "ok": all(checks.values()),
+        "checks": checks,
+        "problems": problems,
+        "recomputed": recomputed,
+        "composite_asset": composite_handle,
+        "foreground_asset": foreground_handle,
+        "source_asset": source_handle,
+    }
