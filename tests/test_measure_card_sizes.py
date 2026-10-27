@@ -15,9 +15,13 @@ centred on an 11x8.5 in landscape letter sheet, used whole).
 Findings this file pins down (synthetic evidence only; see
 ESTIMATOR.md "How small can the card be"):
 - Containment holds down to ~134 px across the card.
-- At 117-126 px the estimator still answers with a +/-5-6% range but
-  the centre misses by more than the range: the range stops covering
-  systematic error. That is the floor: ~150 px across to trust it.
+- At 117-126 px the pre-gate estimator answered with a +/-5-6% range
+  but the centre missed by more than the range: the range stopped
+  covering systematic error while the tick fit looked healthy — a
+  silent lying band. The estimator now refuses below
+  measure.MIN_CARD_PX (130 px) and widens its range through the
+  130-170 px caution band; the two sub-floor scenes are pinned as
+  refusal regressions.
 - A degraded AH-35 scene stays honest (range balloons to +/-55%) but
   is useless in practice.
 - AH-LTR holds +/-3.5% at 3-4x distance, degraded included.
@@ -270,10 +274,9 @@ CONTAINED_SCENES = [
     "ahltr_4x",
     "ahltr_degraded_3x",
 ]
-# Sub-floor scenes (~120 px): the estimator answers but its stated
-# range misses the truth. Pinned as the documented failure mode; if a
-# future estimator starts refusing or covering these, update the
-# floor in ESTIMATOR.md and this list together.
+# Sub-floor scenes (117-126 px): the silent lying band. The pre-gate
+# estimator answered these with ~+/-6% ranges that missed the truth;
+# the pixels-across gate must now refuse them, plainly.
 SUBFLOOR_SCENES = ["ah42_probe225", "ah35_far2x"]
 
 
@@ -293,20 +296,39 @@ def test_ah46_close_reproduces_baseline(battery):
     assert row["card_px"] == pytest.approx(413, abs=15)
     assert row["result"]["ticks_matched"] >= 18
     assert row["result"]["range_pct"] <= 3.5
+    # Comfortably large card: the gate reports its measured width
+    # (matching the renderer's independent measurement) and does not
+    # widen the range.
+    assert row["result"]["card_width_px"] == pytest.approx(row["card_px"], abs=6)
+    assert not any("small in frame" in w for w in row["result"]["warnings"])
 
 
 @pytest.mark.parametrize("scene", SUBFLOOR_SCENES)
-def test_subfloor_scenes_miss_as_documented(battery, scene):
+def test_subfloor_scenes_refuse(battery, scene):
+    # Regression for the silent lying band: these scenes rendered at
+    # 117-126 px across, where the pre-gate estimator quoted ~+/-6%
+    # and the truth landed outside the range while the tick fit
+    # looked healthy (21/24, RMS ~0.25 px). They must now refuse,
+    # with the plain reason.
     row = battery[scene]
-    assert row["card_px"] < 130
-    assert not row["refused"]
-    assert row["contained"] is False
-    # The failure is a near miss, not a wild number: the centre is
-    # within 8% of truth even though the stated range misses it.
+    assert row["card_px"] < measure.MIN_CARD_PX
+    assert row["refused"]
+    assert "too small in frame" in row["error"].lower()
+    assert "bigger card" in row["error"].lower()
+
+
+def test_caution_band_range_is_widened(battery):
+    # AH-42 at ~142 px sits in the 130-170 px caution band: the
+    # answer still contains the truth, but the quoted range must be
+    # visibly wider than the +/-6.0% the ungated estimator quoted
+    # for this scene, and the result must say why.
+    row = battery["ah42_far2x"]
     r = row["result"]
-    tw, th = row["truth"]
-    assert abs(r["width_mm"] - tw) <= 0.08 * tw
-    assert abs(r["height_mm"] - th) <= 0.08 * th
+    assert not row["refused"]
+    assert row["contained"]
+    assert r["range_pct"] >= 8.0, r
+    assert r["card_width_px"] == pytest.approx(row["card_px"], abs=6)
+    assert any("small in frame" in w for w in r["warnings"])
 
 
 def test_degraded_mini_blows_range_honestly(battery):
@@ -319,17 +341,20 @@ def test_degraded_mini_blows_range_honestly(battery):
 
 
 def test_no_wild_numbers_anywhere(battery):
-    # Every scene: honest refusal, truth inside the stated range, or
-    # one of the two pinned sub-floor misses. Nothing else may occur.
+    # Every scene: honest refusal or truth inside the stated range.
+    # Nothing else may occur — in particular, no answered scene may
+    # miss its own range (the pre-gate sub-floor failure mode).
     for name, row in battery.items():
-        ok = row["refused"] or row["contained"] or name in SUBFLOOR_SCENES
+        ok = row["refused"] or row["contained"]
         assert ok, f"{name}: uncontained answer at {row['card_px']:.0f} px"
 
 
-def test_floor_is_between_126_and_134_px(battery):
-    # The empirical bracket the ESTIMATOR.md floor (~150 px with
-    # headroom) rests on.
-    assert battery["ah42_probe225"]["card_px"] < 130
-    assert battery["ah42_probe225"]["contained"] is False
-    assert battery["ah35_probe175"]["card_px"] > 130
+def test_gate_bracket_126_refuses_134_contains(battery):
+    # The empirical bracket the gate threshold rests on: the last
+    # lying-band scene (126 px) refuses, the first honest scene
+    # (134 px) still answers and contains the truth.
+    assert battery["ah42_probe225"]["card_px"] < measure.MIN_CARD_PX
+    assert battery["ah42_probe225"]["refused"]
+    assert battery["ah35_far2x"]["refused"]
+    assert battery["ah35_probe175"]["card_px"] > measure.MIN_CARD_PX
     assert battery["ah35_probe175"]["contained"] is True

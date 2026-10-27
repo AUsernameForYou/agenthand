@@ -40,6 +40,20 @@ the synthetic scenes confirm — and is reported at ~2 sigma plus a 1%
 floor. The output always carries the range and a tilde display
 string — a bare number is never a valid output of this module.
 
+One more gate sits between the fit and the estimate: the card's
+width in image pixels. The card-size battery
+(tests/test_measure_card_sizes.py) found a silent lying band — at
+117-126 px across, the tick fit still looked healthy (21/24, RMS
+~0.25 px) and the module quoted ~+/-6%, but the true size landed
+outside the range: below ~130 px the tick cuts are under ~1.3 px
+wide and systematic error (warp resampling, quantisation) outgrows
+what the RMS-derived sigma models, while the fit reports no sign of
+it. So below MIN_CARD_PX the module refuses outright, and through
+the caution band up to COMFORT_CARD_PX it widens the range by a
+systematic term fitted to the battery's centre errors and says so
+in the warnings. A quoted range that can miss is not an acceptable
+output of this module.
+
 Limits: same plane only, flat objects only, the card must be fully
 visible and unoccluded, and the estimate is only as honest as the
 synthetic tests in tests/test_measure.py — no photo-real validation
@@ -67,6 +81,21 @@ DEFAULT_PROFILE_PATH = (
 )
 
 METHOD = "card-homography v0 (seeded tick/corner homography, prototype)"
+
+# Pixels-across gate (see the module docstring and the card-size
+# battery in tests/test_measure_card_sizes.py): containment held at
+# 134 px across the card and broke at 117-126 px, where the centre
+# error reached 5-6% while the quoted range said ~6% on the wrong
+# dimension — the misses were near, quiet, and invisible to the fit
+# statistics. MIN_CARD_PX sits inside the empirical break bracket
+# (126 missed / 134 contained). Through the caution band the range
+# gains a systematic term that peaks at _SMALL_CARD_SYS_MAX at the
+# floor and decays quadratically to zero at COMFORT_CARD_PX; the
+# battery's worst centre error inside the band is 2.2% (134 px),
+# well under the widened range.
+MIN_CARD_PX = 130.0
+COMFORT_CARD_PX = 170.0
+_SMALL_CARD_SYS_MAX = 0.055
 
 # Arm name -> (vertex key, direction in card-mm space). Ticks in the
 # profile are ordered by fraction_from_vertex ascending, which is the
@@ -913,6 +942,24 @@ def _object_extent(
     return _extent_from_points_mm(_project(H_inv, pts))
 
 
+def _card_width_px(H: np.ndarray, card: dict) -> float:
+    """The card sheet's width in image pixels under H.
+
+    Mean of the top and bottom edge lengths of the projected sheet
+    corners — the same quantity the card-size battery records as its
+    independent variable, so the gate thresholds and the battery's
+    pixel counts are directly comparable.
+    """
+    w = float(card["card_width_mm"])
+    h = float(card["card_height_mm"])
+    corners = _project(
+        H, np.array([[0, 0], [w, 0], [w, h], [0, h]], dtype=np.float64)
+    )
+    top = float(np.linalg.norm(corners[1] - corners[0]))
+    bottom = float(np.linalg.norm(corners[2] - corners[3]))
+    return (top + bottom) / 2
+
+
 # --------------------------------------------------------------------------
 # Public API
 
@@ -950,8 +997,11 @@ def estimate(
 
     Returns centre estimates (width_mm, height_mm), a single range_pct
     covering both dimensions, per-dimension ranges, a tilde display
-    string, the method string, and warnings. The display string is the
-    only user-facing form: it always carries the range.
+    string, the method string, the detected card's width in image
+    pixels (card_width_px), and warnings. The display string is the
+    only user-facing form: it always carries the range. A card that
+    spans too few pixels in frame raises MeasureError instead — see
+    MIN_CARD_PX.
     """
     card = load_card_profile(profile_path, card_id)
     image = _load_image(source)
@@ -960,6 +1010,29 @@ def estimate(
     warnings: list[str] = ["Prototype: flat object in the same plane as the card only."]
     H, matched, quad_img, rms_px = _detect_card(gray, image, card)
     n_ticks = len(matched)
+
+    # Pixels-across gate: refuse the silent lying band outright, and
+    # carry a systematic widening term through the caution band (see
+    # the constants at the top of this module). The fit statistics
+    # cannot see this failure mode — the RMS stays ~0.25 px while
+    # the centre walks off — so the gate keys on card size alone.
+    card_px = _card_width_px(H, card)
+    if card_px < MIN_CARD_PX:
+        raise MeasureError(
+            f"Card too small in frame (~{card_px:.0f} px across; the "
+            f"fit stays quiet but the range stops covering the true "
+            f"size below ~{MIN_CARD_PX:.0f} px) — move closer or use "
+            "a bigger card."
+        )
+    sys_frac = 0.0
+    if card_px < COMFORT_CARD_PX:
+        band_t = (COMFORT_CARD_PX - card_px) / (COMFORT_CARD_PX - MIN_CARD_PX)
+        sys_frac = _SMALL_CARD_SYS_MAX * band_t * band_t
+        warnings.append(
+            f"Card is small in frame (~{card_px:.0f} px across): the "
+            "range is widened for small-card systematic error — a "
+            "bigger card or a closer shot would tighten it."
+        )
     if n_ticks < 24:
         warnings.append(
             f"Only {n_ticks}/24 tick cuts matched; the range reflects "
@@ -994,7 +1067,10 @@ def estimate(
         # object 1.5 frame-diagonals away. A linear lever term
         # understates the range and the "contained" tests catch it.
         u = sigma_mm * (1.0 + lever) ** 2
-        return 2.0 * u + 0.01 * dim
+        # sys_frac is a bias, not noise, so it adds linearly rather
+        # than in quadrature; it is zero once the card is comfortably
+        # large in frame.
+        return 2.0 * u + 0.01 * dim + sys_frac * dim
 
     err_w, err_h = half_range(width_mm), half_range(height_mm)
     range_pct = max(err_w / width_mm, err_h / height_mm) * 100.0
@@ -1016,6 +1092,7 @@ def estimate(
         "method": METHOD,
         "card_id": card_id,
         "ticks_matched": n_ticks,
+        "card_width_px": round(card_px),
         "reprojection_rms_px": round(rms_px, 2),
         "warnings": warnings,
     }
