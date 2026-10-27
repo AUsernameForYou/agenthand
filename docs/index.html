@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>agenthand — listing-ready images for AI agents that help people sell</title>
+<meta name="description" content="agenthand is an MCP server that turns messy product photos into listing-ready images, for AI agents that help people sell. The seller never opens agenthand; their agent calls it.">
+<link rel="icon" type="image/png" href="logo-r-v1.png">
+
+<!-- Open Graph -->
+<meta property="og:type" content="website">
+<meta property="og:site_name" content="agenthand">
+<meta property="og:title" content="agenthand — a hand for your agent">
+<meta property="og:description" content="Turns messy product photos into listing-ready images, for AI agents that help people sell. The product in the photo is never regenerated: Fidelity Lock composites it untouched and proves it with a hash receipt.">
+<meta property="og:url" content="https://ausernameforyou.github.io/agenthand/">
+<meta property="og:image" content="https://ausernameforyou.github.io/agenthand/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="The agenthand mark: a robot hand under three cyan arcs, framed by crop corners.">
+
+<!-- Twitter -->
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="agenthand — a hand for your agent">
+<meta name="twitter:description" content="An MCP server that turns messy product photos into listing-ready images. The product is never regenerated: Fidelity Lock proves 0 changed pixels, every time.">
+<meta name="twitter:image" content="https://ausernameforyou.github.io/agenthand/og-image.png">
+<meta name="twitter:image:alt" content="The agenthand mark: a robot hand under three cyan arcs, framed by crop corners.">
+
+<style>
+  :root{
+    --ink:#111111;
+    --cyan:#00AFE1;
+    --grey:#5a5a5a;
+    --rule:#111111;
+    --panel:#fafafa;
+  }
+  *{box-sizing:border-box}
+  html{margin:0;padding:0}
+  body{
+    margin:0;
+    background:#ffffff;
+    color:var(--ink);
+    font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",Arial,sans-serif;
+    line-height:1.55;
+    -webkit-font-smoothing:antialiased;
+  }
+  .wrap{max-width:880px;margin:0 auto;padding:0 24px}
+  a{color:var(--ink);text-decoration:underline;text-decoration-color:var(--cyan);text-decoration-thickness:2px;text-underline-offset:3px}
+  a:hover{text-decoration-color:var(--ink)}
+
+  header.site{
+    border-bottom:2px solid var(--rule);
+  }
+  header.site .wrap{
+    display:flex;align-items:center;gap:14px;
+    padding-top:16px;padding-bottom:16px;
+  }
+  header.site img{width:40px;height:40px;object-fit:contain}
+  header.site .name{font-weight:800;font-size:20px;letter-spacing:-0.01em}
+  header.site nav{margin-left:auto;font-size:15px}
+  header.site nav a{margin-left:20px}
+
+  .hero{text-align:center;padding:56px 0 8px}
+  .hero-media{width:min(440px,80vw);margin:0 auto}
+  .hero-media video,.hero-media img{width:100%;height:auto;display:block}
+  .hero-static{display:none}
+  @media (prefers-reduced-motion: reduce){
+    .hero-anim{display:none}
+    .hero-static{display:block}
+  }
+  .hero h1{
+    font-size:clamp(44px,8vw,76px);
+    font-weight:800;letter-spacing:-0.03em;
+    margin:18px 0 6px;line-height:1.02;
+  }
+  .hero .one-liner{
+    font-size:clamp(20px,3.4vw,27px);
+    font-weight:600;line-height:1.35;
+    max-width:640px;margin:0 auto;
+  }
+  .hero .sub{
+    color:var(--grey);font-size:17px;
+    max-width:560px;margin:16px auto 0;
+  }
+  .hero .cta{margin-top:26px;font-size:16px}
+  .hero .cta a{
+    display:inline-block;border:2px solid var(--ink);
+    padding:10px 20px;text-decoration:none;font-weight:700;margin:0 6px;
+  }
+  .hero .cta a.primary{background:var(--ink);color:#fff}
+  .hero .cta a:hover{border-color:var(--cyan)}
+
+  section{padding:44px 0 8px}
+  .label{
+    font-size:13px;font-weight:700;letter-spacing:0.18em;
+    text-transform:uppercase;color:var(--ink);
+    display:flex;align-items:center;gap:12px;margin:0 0 8px;
+  }
+  .label::before{content:"";width:34px;height:8px;background:var(--cyan);display:inline-block}
+  section h2{
+    font-size:clamp(26px,4.4vw,36px);font-weight:800;
+    letter-spacing:-0.02em;margin:0 0 12px;line-height:1.15;
+  }
+  section p.lede{font-size:18px;max-width:680px;margin:0 0 8px}
+  hr.rule{border:none;border-top:2px solid var(--rule);margin:44px 0 0}
+
+  .tools{display:grid;grid-template-columns:1fr;gap:0;margin-top:12px}
+  @media (min-width:720px){.tools{grid-template-columns:1fr 1fr 1fr;gap:24px}}
+  .tool{border-top:6px solid var(--ink);padding-top:14px}
+  .tool .step{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:13px;color:var(--grey);letter-spacing:0.08em}
+  .tool h3{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:21px;margin:4px 0 8px}
+  .tool p{margin:0;font-size:16px}
+
+  .receipt{
+    background:var(--panel);
+    border:2px solid var(--ink);
+    padding:22px 24px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:14.5px;line-height:1.75;
+    overflow-x:auto;white-space:nowrap;
+    margin:20px 0;
+  }
+  .receipt .k{color:var(--grey)}
+  .receipt .zero{font-weight:700}
+  .receipt .tick{color:#00779e;font-weight:700}
+  .steps{margin:14px 0 0;padding-left:22px;font-size:16.5px}
+  .steps li{margin-bottom:8px}
+
+  pre.code{
+    background:#111111;color:#f2f2f2;
+    padding:20px 22px;font-size:14px;line-height:1.65;
+    overflow-x:auto;border-radius:4px;margin:14px 0;
+  }
+  pre.code .c{color:#9adcf5}
+  p.note{color:var(--grey);font-size:15.5px}
+
+  footer{
+    border-top:2px solid var(--rule);
+    margin-top:52px;padding:28px 0 44px;
+    font-size:15px;color:var(--grey);
+  }
+  footer .wrap{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
+  footer img{width:56px;height:56px}
+  footer p{margin:0 0 6px;max-width:640px}
+</style>
+</head>
+<body>
+
+<header class="site">
+  <div class="wrap">
+    <img src="logo-r-v1.png" alt="agenthand mark">
+    <span class="name">agenthand</span>
+    <nav>
+      <a href="https://github.com/AUsernameForYou/agenthand">GitHub</a>
+      <a href="#use">Use it</a>
+      <a href="#fidelity">Fidelity Lock</a>
+    </nav>
+  </div>
+</header>
+
+<main class="wrap">
+
+  <div class="hero">
+    <div class="hero-media">
+      <video class="hero-anim" autoplay muted loop playsinline poster="logo-r-v1.png" aria-label="The agenthand mark, its three cyan arcs rotating slowly">
+        <source src="logo-rotating-v1.mp4" type="video/mp4">
+        <img src="logo-rotating-v1.gif" alt="The agenthand mark, its three cyan arcs rotating slowly">
+      </video>
+      <img class="hero-static" src="logo-r-v1.png" alt="The agenthand mark: a robot hand under three cyan arcs, framed by crop corners">
+    </div>
+    <h1>agenthand</h1>
+    <p class="one-liner">agenthand turns messy product photos into listing-ready images, for AI agents that help people sell.</p>
+    <p class="sub">The seller never opens agenthand. Their agent calls it, the way a hand is called: quietly, in the middle of other work.</p>
+    <p class="cta">
+      <a class="primary" href="https://github.com/AUsernameForYou/agenthand">Get it on GitHub</a>
+      <a href="#fidelity">The Fidelity Lock</a>
+    </p>
+  </div>
+
+  <hr class="rule">
+
+  <section aria-labelledby="tools-h">
+    <p class="label">What it does</p>
+    <h2 id="tools-h">Three tools, one listing</h2>
+    <p class="lede">A seller hands their agent a photo from the kitchen table: bad light, busy background, the item half in shadow. Three calls later it is a listing.</p>
+    <div class="tools">
+      <div class="tool">
+        <p class="step">STEP 1</p>
+        <h3>identify</h3>
+        <p>Reads the photo and plans the job. What the item is, what a buyer would call it, the words for the listing, and exactly which pixels are the product.</p>
+      </div>
+      <div class="tool">
+        <p class="step">STEP 2</p>
+        <h3>cut_out</h3>
+        <p>Lifts the product out of its photo, pixel for pixel, and hands back a clean cut-out on transparency. Nothing is redrawn; the real product is the layer.</p>
+      </div>
+      <div class="tool">
+        <p class="step">STEP 3</p>
+        <h3>draw</h3>
+        <p>Stages the scene around it: a regal reading room, a clean studio sweep, a table set for the season. The setting is generated. The product is not.</p>
+      </div>
+    </div>
+  </section>
+
+  <hr class="rule">
+
+  <section id="fidelity" aria-labelledby="fidelity-h">
+    <p class="label">Fidelity Lock</p>
+    <h2 id="fidelity-h">The product is never regenerated</h2>
+    <p class="lede">Generated staging has a trust problem: buyers cannot tell whether the item in the pretty picture is the item that ships. Fidelity Lock answers it with proof instead of promises.</p>
+    <p class="lede">The image model paints only the empty scene. The real product layer is placed into it by plain, deterministic code, untouched. Then agenthand counts: across the whole product, the number of changed pixels is zero, and it prints the receipt to show it.</p>
+
+    <div class="receipt" role="img" aria-label="A sample fidelity receipt: source and foreground hashes recorded, changed opaque pixels zero, the product layer never scaled.">
+      <div><span class="k">FIDELITY RECEIPT</span></div>
+      <div><span class="k">source photo&nbsp;&nbsp;&nbsp;</span> sha256 f3dc3c11&hellip;aa78b</div>
+      <div><span class="k">product layer&nbsp;&nbsp;</span> sha256 99e8890f&hellip;74100</div>
+      <div><span class="k">mask&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;</span> sha256 e4f189b4&hellip;55e87</div>
+      <div><span class="k">product scaled&nbsp;</span> no</div>
+      <div><span class="k">product sent to image model&nbsp;</span> no</div>
+      <div><span class="k">changed opaque pixels&nbsp;</span> <span class="zero">0</span> <span class="tick">&#10003;</span></div>
+    </div>
+
+    <ol class="steps">
+      <li>The product is cut out of the seller's photo and stored untouched, with hashes of the source, the layer, and the mask.</li>
+      <li>The image model generates the background scene only. It never receives the product's pixels.</li>
+      <li>Deterministic code composites the stored layer onto the scene. Before anything moves, the stored hashes are verified.</li>
+      <li>Every result ships with its receipt: the hashes, what was transformed, the changed-pixel count, and the cost of the calls that made it.</li>
+    </ol>
+    <p class="note">The claim is precise on purpose: the stored product layer reached the final image unchanged. Edge pixels that blend with the scene are counted separately in the receipt, never hidden inside the zero.</p>
+  </section>
+
+  <hr class="rule">
+
+  <section id="use" aria-labelledby="use-h">
+    <p class="label">Use it</p>
+    <h2 id="use-h">An MCP server, over stdio today</h2>
+    <p class="lede">agenthand speaks the Model Context Protocol. Run it locally and point any MCP client at it; a hosted endpoint is the scale story from here.</p>
+    <pre class="code">git clone https://github.com/AUsernameForYou/agenthand
+cd agenthand
+python3.12 -m venv .venv
+.venv/bin/pip install -e ".[dev]"
+.venv/bin/agenthand          <span class="c"># stdio transport</span></pre>
+    <p>Then register it with your MCP client:</p>
+    <pre class="code">{
+  "mcpServers": {
+    "agenthand": {
+      "command": "/path/to/agenthand/.venv/bin/agenthand",
+      "env": { "META_API_KEY": "&hellip;" }
+    }
+  }
+}</pre>
+    <p class="note">Images travel as <span style="font-family:ui-monospace,Menlo,Consolas,monospace">asset://</span> handles, not bytes, so tools chain: identify plans, cut_out returns a handle, draw consumes it. Every billable call passes one spend cap with reserve-then-settle receipts, and the server refuses to spend when the ledger cannot be trusted.</p>
+  </section>
+
+  <hr class="rule">
+
+  <section aria-labelledby="status-h">
+    <p class="label">Status</p>
+    <h2 id="status-h">Built in the open, during the hackathon</h2>
+    <p class="lede">agenthand was designed and built during the Meta Global AI Developer Hackathon, October 26 to November 4, 2026. The full chain runs end to end today: identify, cut_out, and draw, live on the Meta Model API, with Fidelity Lock receipts on every staged image. A demo video is on its way.</p>
+    <p class="lede">
+      <a href="https://github.com/AUsernameForYou/agenthand">The code and the build log</a> &middot;
+      <a href="https://cerebralvalley.ai/e/meta-ai-developer-hackathon/details">The hackathon</a>
+    </p>
+  </section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <img src="logo-rotating-symbol-v1.gif" alt="The agenthand symbol: a robot hand under three rotating cyan arcs">
+    <div>
+      <p><strong style="color:var(--ink)">agenthand</strong> — a hand for your agent. An MCP server by Daniel Wagner, built for the Meta Global AI Developer Hackathon.</p>
+      <p>The rotating arcs are the three tools, turning as one. The hand underneath is the promise: the real product, handled carefully, never redrawn.</p>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>
