@@ -240,6 +240,16 @@ def test_verify_receipt_from_disk_passes_on_a_clean_run(tmp_path):
     assert all(report["checks"].values())
 
 
+def test_verify_receipt_from_disk_loads_the_persisted_receipt(tmp_path):
+    # draw_product persists the receipt beside the composite, so the
+    # verifier can be handed nothing but the composite handle.
+    store, handle, receipt = _store_run(tmp_path)
+    assert store.load_receipt(handle) == receipt
+    report = composite.verify_receipt_from_disk(store, handle)
+    assert report["ok"] is True, report["problems"]
+    assert report["recomputed"]["changed_opaque_pixels"] == 0
+
+
 def test_verify_receipt_from_disk_fails_on_a_tampered_output_file(tmp_path):
     store, handle, receipt = _store_run(tmp_path)
     # One pixel changed in the DELIVERED file, after the receipt was

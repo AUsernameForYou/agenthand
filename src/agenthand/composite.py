@@ -373,11 +373,19 @@ def draw_product(
             "change is a fidelity failure even when pixel values match."
         ),
     }
+    # Persist the receipt beside the composite (architecture Gauntlet,
+    # Fable + GPT "adopt now, as a file"): a receipt that exists only
+    # in the tool's return value is gone if the client drops it, and
+    # the verify-from-disk story is stronger when the claims being
+    # re-graded live with the files they describe. The server enriches
+    # this same file with the billed call's cost and attribution once
+    # billing settles (see server.draw).
+    store.save_receipt(composite_handle, receipt)
     return composite_handle, receipt
 
 
 def verify_receipt_from_disk(
-    store: AssetStore, composite_handle: str, receipt: dict
+    store: AssetStore, composite_handle: str, receipt: dict | None = None
 ) -> dict:
     """Independently re-verify a draw receipt from the stored FILES.
 
@@ -390,6 +398,15 @@ def verify_receipt_from_disk(
     identities. Nothing is taken from the receipt except the claims
     being checked and the handles of the assets it names.
 
+    The receipt may be omitted: draw persists it beside the composite
+    (``<asset_id>.receipt.json`` in the asset store) and it is loaded
+    from there, so a composite found in the store carries the claims
+    to check with it. A receipt supplied by the caller takes
+    precedence over the persisted one. Receipts persisted by the
+    server carry extra billing fields (cost, call attribution); only
+    the fidelity fields are read here. ValueError is raised when no
+    receipt is supplied and none is persisted for the composite.
+
     Returns a report dict: ``ok`` (True only when every check passes),
     ``checks`` (per-check booleans), ``problems`` (human-readable
     failures), and ``recomputed`` (the from-disk measurements). A
@@ -400,6 +417,13 @@ def verify_receipt_from_disk(
     the full list of what is wrong. KeyError propagates for an unknown
     composite handle.
     """
+    if receipt is None:
+        receipt = store.load_receipt(composite_handle)
+        if receipt is None:
+            raise ValueError(
+                f"No receipt supplied and none persisted beside "
+                f"{composite_handle!r}; there are no claims to verify."
+            )
     checks: dict[str, bool] = {}
     problems: list[str] = []
 

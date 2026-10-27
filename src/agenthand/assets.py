@@ -204,6 +204,43 @@ class AssetStore:
         )
         os.replace(tmp, sidecar)
 
+    def _receipt_path(self, asset_id: str) -> Path:
+        return self.assets_dir / f"{asset_id}.receipt.json"
+
+    def receipt_path(self, handle: str) -> Path:
+        """Where an asset's persisted fidelity receipt lives, if any.
+
+        The receipt sits beside the asset's data file and its record
+        sidecar, named ``<asset_id>.receipt.json`` so each composite
+        keeps its own (a single shared receipt.json would be
+        overwritten by the next draw).
+        """
+        return self._receipt_path(self.parse_handle(handle))
+
+    def save_receipt(self, handle: str, receipt: dict) -> Path:
+        """Persist a fidelity receipt beside its asset; returns its path.
+
+        Written via temp file + os.replace, the same convention as the
+        record sidecars, so a crash mid-write cannot leave a torn
+        receipt behind: readers see the old file or the new one, never
+        half of either.
+        """
+        self.assets_dir.mkdir(parents=True, exist_ok=True)
+        path = self.receipt_path(handle)
+        tmp = path.with_suffix(f".json.tmp-{uuid.uuid4().hex}")
+        tmp.write_text(
+            json.dumps(receipt, indent=2, sort_keys=True), encoding="utf-8"
+        )
+        os.replace(tmp, path)
+        return path
+
+    def load_receipt(self, handle: str) -> dict | None:
+        """The asset's persisted fidelity receipt, or None if none exists."""
+        path = self.receipt_path(handle)
+        if not path.exists():
+            return None
+        return json.loads(path.read_text(encoding="utf-8"))
+
     # -- public API ---------------------------------------------------------
 
     @staticmethod

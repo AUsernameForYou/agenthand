@@ -82,6 +82,38 @@ from .assets import (
 # (renamed from FastMCP in v1).
 mcp = MCPServer("agenthand")
 
+
+def _persist_full_receipt(
+    store: AssetStore,
+    handle: str,
+    receipt: dict,
+    billing: dict,
+    scene_prompt: str,
+) -> dict:
+    """Enrich the persisted fidelity receipt with run attribution.
+
+    composite.draw_product persists the receipt it computes (hashes,
+    counts, the published excluded set, colour-profile fields) beside
+    the composite as ``<asset_id>.receipt.json``. Billing settles in
+    this layer, so the cost and call attribution only exist here:
+    they are merged into that same file, leaving every fidelity field
+    exactly as the compositor wrote it. Returns the full persisted
+    receipt dict.
+    """
+    full = dict(receipt)
+    full.update(
+        {
+            "tool": "draw",
+            "model": DRAW_BACKGROUND_MODEL,
+            "scene_prompt": scene_prompt,
+            "cost_usd": billing["actual_usd"],
+            "usage": billing.get("usage"),
+            "call_id": billing.get("call_id"),
+        }
+    )
+    store.save_receipt(handle, full)
+    return full
+
 # Model assignments (priced in pricing.py). identify starts on Spark; a
 # Spark-vs-Wonder A/B during the build decides whether it stays there.
 IDENTIFY_MODEL = "muse-spark-1.3"
@@ -125,7 +157,11 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     or "improved" by a model, and it is never sent to the image model.
     Returns the composite's asset handle, its fidelity receipt (source /
     foreground / mask / plate hashes, transformations, the measured
-    changed-opaque-pixel count), and an image preview. If the compositor
+    changed-opaque-pixel count), and an image preview. The receipt is
+    also persisted beside the composite in the asset store as
+    <asset_id>.receipt.json, enriched with the billed cost and call
+    attribution, so it survives a client dropping the return value
+    and verify_receipt_from_disk can pick it up from the store alone. If the compositor
     ever measured changed opaque pixels, the tool returns a
     FIDELITY_VIOLATION error instead of presenting the composite under a
     false receipt.
@@ -183,6 +219,10 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     handle, receipt = composite.draw_product(
         store, asset, scene_prompt, plate_handle=plate_handle
     )
+    # The receipt is persisted (with cost and call attribution) even
+    # when the composite fails the Lock checks below: a violation's
+    # receipt is exactly the evidence an inspector needs.
+    _persist_full_receipt(store, handle, receipt, billing, scene_prompt)
     if receipt["changed_opaque_pixels"] != 0 or not receipt["color_profile_preserved"]:
         # The Lock is measured, not assumed: a composite that changed
         # opaque product pixels — or that lost/changed the source
@@ -259,6 +299,9 @@ def _draw_with_placeholder_plate(store: AssetStore, asset: str, scene_prompt: st
         _run_composite,
         status="stub",
         note="Local placeholder plate (dev flag AGENTHAND_DRAW_PLACEHOLDER_PLATE); no API call.",
+    )
+    _persist_full_receipt(
+        store, outcome["handle"], outcome["receipt"], billing, scene_prompt
     )
     result = {
         "status": "ok",

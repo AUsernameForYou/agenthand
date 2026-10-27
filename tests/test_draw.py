@@ -370,6 +370,53 @@ def test_draw_live_profile_break_is_a_fidelity_violation(monkeypatch):
     assert result["error"]["fidelity_receipt"]["color_profile_preserved"] is False
 
 
+# -- the receipt is persisted beside the composite -----------------------
+
+
+def test_draw_persists_the_full_receipt_beside_the_composite(monkeypatch):
+    _install_fake(
+        monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())])
+    )
+    store = AssetStore(config.get_data_dir())
+    fg = _seed_foreground(store)
+
+    result, _ = server.draw(fg, "a regal, warmly lit reading room")
+    assert result["status"] == "ok"
+
+    # Beside the composite: same directory as the composite's data
+    # file, named after it like the record sidecars are.
+    receipt_path = store.receipt_path(result["output_asset"])
+    assert receipt_path.name == (
+        f"{AssetStore.parse_handle(result['output_asset'])}.receipt.json"
+    )
+    assert receipt_path.parent == store.resolve(result["output_asset"]).parent
+    assert receipt_path.exists()
+
+    persisted = json.loads(receipt_path.read_text(encoding="utf-8"))
+
+    # Every field of the returned receipt is in the file, unchanged:
+    # hashes, counts, the published excluded set, the profile fields.
+    returned = result["fidelity_receipt"]
+    for key, value in returned.items():
+        assert persisted[key] == value, key
+    assert persisted["changed_opaque_pixels"] == 0
+    assert persisted["edge_band_pixels"] == returned["edge_band_pixels"]
+    assert persisted["color_profile_preserved"] is True
+
+    # Plus the run attribution only the server knows: the billed cost
+    # and the ledger call that paid for the plate.
+    assert persisted["cost_usd"] == result["cost_usd"] == 0.01
+    assert persisted["call_id"] == result["call_id"]
+    assert persisted["tool"] == "draw"
+    assert persisted["model"] == "muse-image-1.0"
+    assert persisted["scene_prompt"] == "a regal, warmly lit reading room"
+
+    # The independent verifier picks the persisted receipt up from the
+    # store on its own: no receipt argument handed to it.
+    report = composite.verify_receipt_from_disk(store, result["output_asset"])
+    assert report["ok"] is True, report["problems"]
+
+
 # -- hermeticity ---------------------------------------------------------
 
 
