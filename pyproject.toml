@@ -18,6 +18,9 @@ dependencies = [
     "Pillow>=10",
     "pillow-heif>=1.8",
     "meta-sam-parser>=0.1.0",
+    # measure.py (prototype estimator): classical CV + array math.
+    "numpy>=1.26",
+    "opencv-python-headless>=4.8",
 ]
 
 [project.optional-dependencies]
