@@ -217,6 +217,8 @@
   .verify-lines .fail{color:var(--ink);font-weight:800;text-decoration:underline}
   .tamper{display:block;margin:12px 0;font-size:14px;cursor:pointer}
   .tamper input{margin-right:8px}
+  .opencode{margin:24px 0 0}
+  .opencode .proof-cap{max-width:640px}
 
   .card-figure{margin:22px 0 10px;max-width:360px}
   .card-figure img{width:100%;height:auto;display:block;border:2px solid var(--ink)}
@@ -394,6 +396,55 @@
       <p id="verify-status" role="status" aria-live="polite">Not run yet.</p>
       <label class="tamper"><input type="checkbox" id="verify-tamper">Tamper test: alter one byte and one pixel of the output copy, in this browser only, and watch both checks fail</label>
       <button class="copy-btn" id="verify-btn" type="button">Verify it yourself</button>
+    </div>
+
+    <div class="opencode">
+      <p class="proof-title">THE CHECK, IN THE OPEN</p>
+      <p class="proof-cap">This is the counting code itself — the same function the button above runs, copied verbatim from <a href="verifier-v3.js">verifier-v3.js</a>.</p>
+      <pre class="code"><span class="c">/* Replicates composite.py's _measure for the claim that matters:
+ * a foreground pixel with alpha 255 must appear in the composite
+ * byte-identical. fgData / outData are RGBA byte arrays (ImageData.data).
+ * Chunked so the caller can animate the "checked" counter; resolves to
+ * {checked, changed}. */</span>
+function countChanged(fgData, outData, width, height, opts) {
+  opts = opts || {};
+  var chunkRows = opts.chunkRows || 64;
+  var onProgress = opts.onProgress || function () {};
+  var schedule = opts.schedule || function (fn) { setTimeout(fn, 0); };
+  var checked = 0;
+  var changed = 0;
+  var row = 0;
+  return new Promise(function (resolve) {
+    function step() {
+      var endRow = Math.min(row + chunkRows, height);
+      for (var y = row; y &lt; endRow; y++) {
+        var rowStart = y * width * 4;
+        for (var x = 0; x &lt; width; x++) {
+          var j = rowStart + x * 4;
+          if (fgData[j + 3] === 255) {
+            checked++;
+            if (
+              fgData[j] !== outData[j] ||
+              fgData[j + 1] !== outData[j + 1] ||
+              fgData[j + 2] !== outData[j + 2] ||
+              fgData[j + 3] !== outData[j + 3]
+            ) {
+              changed++;
+            }
+          }
+        }
+      }
+      row = endRow;
+      onProgress(checked, changed);
+      if (row &lt; height) {
+        schedule(step);
+      } else {
+        resolve({ checked: checked, changed: changed });
+      }
+    }
+    step();
+  });
+}</pre>
     </div>
 
     <p class="stamp">[ provenance — run: 2026-10-26, produced by agenthand <a href="https://github.com/AUsernameForYou/agenthand/tree/401f1136af5a36ca814207ae8ce8b5435bd1722e">commit 401f113</a> · fixture: the run's own files, a chat-screen cut-out (see the note above) · the checker on this page is <a href="verifier-v3.js">verifier-v3.js</a>, 16.6 KB — read it ]</p>
