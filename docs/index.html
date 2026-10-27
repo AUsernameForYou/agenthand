@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>agenthand — any photo becomes a working asset</title>
 <meta name="description" content="agenthand is an MCP server for AI agents that help people sell. It turns any photo into a working asset: the item is understood, lifted out untouched, and staged into any scene — listings, ads, social posts, catalogs — with a hash receipt anyone can check. The seller never opens agenthand; their agent calls it.">
-<link rel="icon" type="image/png" href="logo-r-v1.png">
+<link rel="icon" type="image/png" href="favicon-v1.png">
 
 <!-- Open Graph -->
 <meta property="og:type" content="website">
@@ -13,17 +13,17 @@
 <meta property="og:title" content="agenthand — a hand for your agent">
 <meta property="og:description" content="Any photo becomes a working asset: understood, lifted out untouched, and staged into any scene. The product is never regenerated: Fidelity Lock composites it untouched and proves it with a hash receipt anyone can check.">
 <meta property="og:url" content="https://ausernameforyou.github.io/agenthand/">
-<meta property="og:image" content="https://ausernameforyou.github.io/agenthand/og-image.png">
+<meta property="og:image" content="https://ausernameforyou.github.io/agenthand/og-image-v2.png">
 <meta property="og:image:width" content="1200">
 <meta property="og:image:height" content="630">
-<meta property="og:image:alt" content="The agenthand mark: a robot hand under three cyan arcs, framed by crop corners.">
+<meta property="og:image:alt" content="The agenthand mark: a robot hand under three cyan arcs, framed by crop corners. Beside it: any photo becomes a working asset; 580,613 pixels checked, 0 changed.">
 
 <!-- Twitter -->
 <meta name="twitter:card" content="summary_large_image">
 <meta name="twitter:title" content="agenthand — a hand for your agent">
-<meta name="twitter:description" content="An MCP server that turns any photo into a working asset: understood, lifted out untouched, staged into any scene. The product is never regenerated: Fidelity Lock proves 0 changed pixels, every time.">
-<meta name="twitter:image" content="https://ausernameforyou.github.io/agenthand/og-image.png">
-<meta name="twitter:image:alt" content="The agenthand mark: a robot hand under three cyan arcs, framed by crop corners.">
+<meta name="twitter:description" content="An MCP server that turns any photo into a working asset: understood, lifted out untouched, staged into any scene. The product is never regenerated. On the verified run receipted on this page, Fidelity Lock counted 0 changed pixels — and the check itself runs in your browser.">
+<meta name="twitter:image" content="https://ausernameforyou.github.io/agenthand/og-image-v2.png">
+<meta name="twitter:image:alt" content="The agenthand mark: a robot hand under three cyan arcs, framed by crop corners. Beside it: any photo becomes a working asset; 580,613 pixels checked, 0 changed.">
 
 <style>
   :root{
@@ -59,8 +59,8 @@
   header.site nav{margin-left:auto;font-size:15px}
   header.site nav a{margin-left:20px}
 
-  .hero{text-align:center;padding:56px 0 8px}
-  .hero-media{width:min(440px,80vw);margin:0 auto}
+  .hero{text-align:center;padding:40px 0 8px}
+  .hero-media{width:min(264px,58vw);margin:0 auto}
   .hero-media video,.hero-media img{width:100%;height:auto;display:block}
   .hero-media img.hero-static{display:none}
   @media (prefers-reduced-motion: reduce){
@@ -70,16 +70,36 @@
   .hero h1{
     font-size:clamp(44px,8vw,76px);
     font-weight:800;letter-spacing:-0.03em;
-    margin:18px 0 6px;line-height:1.02;
+    margin:14px 0 6px;line-height:1.02;
   }
   .hero .one-liner{
     font-size:clamp(20px,3.4vw,27px);
     font-weight:600;line-height:1.35;
     max-width:640px;margin:0 auto;
   }
+  .hero .identity{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13.5px;letter-spacing:0.06em;color:var(--grey);
+    margin:14px auto 0;
+  }
+  .proofline{
+    border-top:2px solid var(--ink);border-bottom:2px solid var(--ink);
+    max-width:640px;margin:22px auto 0;padding:14px 10px 16px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  .proofline .pl-label{font-size:12.5px;letter-spacing:0.1em;color:var(--grey);margin:0}
+  .proofline .pl-count{font-size:clamp(21px,4.6vw,30px);font-weight:800;margin:6px 0 4px;line-height:1.2}
+  .proofline .pl-count .zero{background:var(--cyan);color:var(--ink);padding:0 10px}
+  .proofline .pl-method{font-size:13.5px;color:var(--grey);line-height:1.5;margin:6px auto 12px;max-width:560px}
+  .proofline a.pl-verify{
+    display:inline-block;border:2px solid var(--ink);background:var(--ink);color:#fff;
+    padding:8px 18px;text-decoration:none;font-weight:700;font-size:14.5px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+  }
+  .proofline a.pl-verify:hover{border-color:var(--grey)}
   .hero .sub{
     color:var(--grey);font-size:17px;
-    max-width:560px;margin:16px auto 0;
+    max-width:560px;margin:18px auto 0;
   }
   .hero .cta{margin-top:26px;font-size:16px}
   .hero .cta a{
@@ -96,7 +116,7 @@
     text-transform:uppercase;color:var(--ink);
     border-top:6px solid var(--ink);
     padding-top:14px;margin:0 0 14px;
-    display:flex;align-items:baseline;gap:16px;
+    display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;
   }
   .chapter .ch-no{font-size:20px;letter-spacing:0.04em}
   section h2{
@@ -138,7 +158,12 @@
   .steps{margin:14px 0 0;padding-left:22px;font-size:16.5px}
   .steps li{margin-bottom:8px}
 
-  .proof{margin:30px 0 0}
+  .run-block{
+    border:2px solid var(--ink);
+    padding:4px 24px 22px;
+    margin:30px 0 0;
+  }
+  .proof{margin:22px 0 0}
   .proof-title{
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     font-size:14px;font-weight:700;letter-spacing:0.14em;margin:0 0 10px;
@@ -168,13 +193,19 @@
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     font-size:13px;color:var(--grey);max-width:560px;margin:6px 0 0;
   }
+  .stamp{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13px;color:var(--grey);max-width:640px;margin:18px 0 0;line-height:1.7;
+    overflow-wrap:anywhere;
+  }
   .verify{
-    border:2px solid var(--ink);background:var(--panel);
+    background:var(--panel);
     padding:20px 24px;margin:26px 0 6px;
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     font-size:14.5px;line-height:1.7;overflow-wrap:anywhere;
   }
   .verify p{margin:0 0 10px}
+  #verify-progress{color:var(--grey);min-height:1.7em}
   .vcounts{display:flex;gap:36px;flex-wrap:wrap;margin:14px 0 6px}
   .vcounts .vlab{font-size:12.5px;color:var(--grey);letter-spacing:0.08em}
   .vcount{font-size:32px;font-weight:800;line-height:1.15;display:block}
@@ -206,13 +237,25 @@
   pre.code .c{color:#a8a8a8}
   p.note{color:var(--grey);font-size:15.5px}
 
+  .closing{
+    border-top:6px solid var(--ink);
+    margin-top:44px;padding-top:22px;text-align:center;
+  }
+  .closing p{font-size:17px;margin:0 0 16px}
+  .closing a{
+    display:inline-block;border:2px solid var(--ink);
+    padding:10px 20px;text-decoration:none;font-weight:700;margin:0 6px 8px;font-size:16px;
+  }
+  .closing a.primary{background:var(--ink);color:#fff}
+  .closing a:hover{border-color:var(--grey)}
+
   footer{
     border-top:2px solid var(--rule);
     margin-top:52px;padding:28px 0 44px;
     font-size:15px;color:var(--grey);
   }
   footer .wrap{display:flex;gap:18px;align-items:flex-start;flex-wrap:wrap}
-  footer img{width:56px;height:56px}
+  footer img{width:56px;height:56px;object-fit:contain}
   footer p{margin:0 0 6px;max-width:640px}
 </style>
 </head>
@@ -220,12 +263,13 @@
 
 <header class="site">
   <div class="wrap">
-    <img src="logo-r-v1.png" alt="agenthand mark">
+    <img src="logo-symbol-256-v1.png" width="256" height="173" alt="agenthand mark">
     <span class="name">agenthand</span>
     <nav>
-      <a href="https://github.com/AUsernameForYou/agenthand">GitHub</a>
+      <a href="#proof">See the run</a>
+      <a href="#verify">Verify</a>
       <a href="#use">Use it</a>
-      <a href="#fidelity">Fidelity Lock</a>
+      <a href="https://github.com/AUsernameForYou/agenthand">GitHub</a>
     </nav>
   </div>
 </header>
@@ -234,18 +278,25 @@
 
   <div class="hero">
     <div class="hero-media">
-      <video class="hero-anim" autoplay muted loop playsinline poster="logo-r-v1.png" aria-label="The agenthand mark, its three cyan arcs rotating slowly">
-        <source src="logo-rotating-v2.mp4" type="video/mp4">
-        <img src="logo-rotating-v2.gif" alt="The agenthand mark, its three cyan arcs rotating slowly">
+      <video class="hero-anim" autoplay muted loop playsinline width="880" height="646" poster="hero-lockup-880-v1.png" aria-label="The agenthand mark, its three cyan arcs rotating slowly">
+        <source src="logo-rotating-v3.mp4" type="video/mp4">
+        <img src="logo-rotating-v3.gif" width="880" height="646" alt="The agenthand mark, its three cyan arcs rotating slowly">
       </video>
-      <img class="hero-static" src="logo-r-v1.png" alt="The agenthand mark: a robot hand under three cyan arcs, framed by crop corners">
+      <img class="hero-static" src="hero-lockup-880-v1.png" width="880" height="645" alt="The agenthand mark: a robot hand under three cyan arcs, framed by crop corners">
     </div>
     <h1>agenthand</h1>
     <p class="one-liner">agenthand turns any photo into a working asset, for AI agents that help people sell.</p>
+    <p class="identity">MCP SERVER &middot; META GLOBAL AI DEVELOPER HACKATHON &middot; OCT 26 &ndash; NOV 4, 2026</p>
+    <div class="proofline">
+      <p class="pl-label">FROM THE VERIFIED RUN &middot; 2026-10-26 &middot; RECEIPT IN CHAPTER 02</p>
+      <p class="pl-count"><span id="hero-checked">580,613</span> pixels checked &middot; <span class="zero">0</span> changed</p>
+      <p class="pl-method">How it is counted: every fully opaque pixel of the stored product layer, compared byte for byte against the final image. The numbers are that run's own, and the same check runs in your browser.</p>
+      <a class="pl-verify" href="#verify">Verify it yourself</a>
+    </div>
     <p class="sub">The seller never opens agenthand. Their agent calls it, the way a hand is called: quietly, in the middle of other work.</p>
     <p class="cta">
-      <a class="primary" href="https://github.com/AUsernameForYou/agenthand">Get it on GitHub</a>
-      <a href="#fidelity">The Fidelity Lock</a>
+      <a class="primary" href="#fidelity">The Fidelity Lock</a>
+      <a href="https://github.com/AUsernameForYou/agenthand">Get it on GitHub</a>
     </p>
   </div>
 
@@ -270,6 +321,17 @@
         <p>Stages the scene around it: a regal reading room, a clean studio sweep, a table set for the season. The setting is generated. The product is not.</p>
       </div>
     </div>
+    <pre class="code" id="transcript"><span class="c"># THE CHAIN, AS RECORDED — the verified run, 2026-10-26</span>
+&rarr; cut_out   asset://e3f0428f&hellip;   <span class="c">no concept given; the planning step runs inside</span>
+  &#8627; identify   muse-spark-1.3 &middot; 3,159 in / 1,638 out tokens   $0.007544
+  &larr; asset://b8663615&hellip;   <span class="c">the product layer, untouched</span>   $0.0025
+     <span class="c">mask asset://7dc19362&hellip; &middot; sam-3.1 &middot; 1 image</span>
+&rarr; draw      asset://b8663615&hellip; + a scene prompt   <span class="c">muse-image-1.0</span>
+  &larr; asset://45deaf1a&hellip;   <span class="c">the staged composite + fidelity receipt</span>   $0.01
+     <span class="c">plate asset://4f1740f4&hellip; &middot; the product never sent to the image model</span>
+<span class="c"># receipt: 580,613 opaque pixels checked &middot; changed 0 &middot; total $0.020044
+# photo to receipt in 36.5 s, by the asset records' timestamps</span></pre>
+    <p class="note">Assembled from the run's own records: the spend ledger's settled lines and the asset sidecars. Nothing here is retyped from memory; the full hashes are in the receipt below.</p>
   </section>
 
   <section id="fidelity" aria-labelledby="fidelity-h">
@@ -288,7 +350,7 @@
       <div><span class="k">changed opaque pixels&nbsp;</span> <span class="zero">0</span> <span class="tick">&#10003;</span></div>
       <div><span class="k">cost of the calls&nbsp;</span> identify $0.007544 &middot; cut_out $0.0025 &middot; draw $0.01 &middot; total $0.020044</div>
     </div>
-    <button class="copy-btn" id="copy-receipt" type="button">Copy receipt</button>
+    <button class="copy-btn" type="button" data-copy="receipt">Copy receipt</button>
 
     <ol class="steps">
       <li>The product is cut out of the seller's photo and stored untouched, with hashes of the source, the layer, and the mask.</li>
@@ -298,15 +360,16 @@
     </ol>
     <p class="note">The claim is precise on purpose: the stored product layer reached the final image unchanged. Edge pixels that blend with the scene are counted separately in the receipt, never hidden inside the zero.</p>
 
+    <div class="run-block">
     <div class="proof" id="proof">
       <p class="proof-title">THE PROOF — THE RUN'S OWN FILES</p>
       <p class="lede">These are the byte-exact files from the verified run receipted above, not recreations. One honesty note: the "product" in this first end-to-end fixture is a chat-screen cut-out (the staged scene is a reading room). The files, hashes, and counts are the real run's; when the product-photo run lands, this fixture swaps as a data change.</p>
       <button class="copy-btn" id="proof-load" type="button">Load the run's images (5.6 MB)</button>
       <div class="stage" id="proof-stage" data-scene="plate" hidden>
-        <img class="plate" id="proof-plate" alt="The background scene generated for the verified run: a regal reading room">
-        <img class="fit" id="proof-source" alt="The source photo of the verified run: a phone chat screenshot" style="display:none">
-        <img class="fit" id="proof-output" alt="The final composite of the verified run: the chat cut-out staged in the reading room" style="display:none">
-        <img class="fit" id="proof-layer" alt="The product layer of the verified run: the chat cut-out on transparency">
+        <img class="plate" id="proof-plate" width="1280" height="1920" alt="The background scene generated for the verified run: a regal reading room">
+        <img class="fit" id="proof-source" width="1206" height="1925" alt="The source photo of the verified run: a phone chat screenshot" style="display:none">
+        <img class="fit" id="proof-output" width="1206" height="1925" alt="The final composite of the verified run: the chat cut-out staged in the reading room" style="display:none">
+        <img class="fit" id="proof-layer" width="1206" height="1925" alt="The product layer of the verified run: the chat cut-out on transparency">
       </div>
       <div class="scene-btns" role="group" aria-label="Scene behind the product layer">
         <button type="button" data-scene="plate" aria-pressed="true">The run's scene</button>
@@ -323,39 +386,32 @@
       <p class="proof-title">VERIFY IT YOURSELF</p>
       <p>Do not take the receipt's word for it. This runs entirely in your browser: it downloads the source photo, the product layer, and the final output (3.1 MB, only when you click), hashes the files with SHA-256, checks the hashes against the receipt and the run's records, then decodes both images and counts every fully opaque product pixel against the output.</p>
       <div class="vcounts">
-        <div><span class="vlab">PIXELS CHECKED</span><span class="vcount" id="verify-checked">0</span></div>
-        <div><span class="vlab">CHANGED</span><span class="vcount" id="verify-changed">0</span></div>
+        <div><span class="vlab">PIXELS CHECKED</span><span class="vcount" id="verify-checked">&mdash;</span></div>
+        <div><span class="vlab">CHANGED</span><span class="vcount" id="verify-changed">&mdash;</span></div>
       </div>
       <div class="verify-lines" id="verify-lines"></div>
-      <p id="verify-status">Not run yet.</p>
+      <p id="verify-progress"></p>
+      <p id="verify-status" role="status" aria-live="polite">Not run yet.</p>
       <label class="tamper"><input type="checkbox" id="verify-tamper">Tamper test: alter one byte and one pixel of the output copy, in this browser only, and watch both checks fail</label>
       <button class="copy-btn" id="verify-btn" type="button">Verify it yourself</button>
     </div>
-  </section>
 
-  <section id="scale-card" aria-labelledby="scale-h">
-    <p class="chapter"><span class="ch-no">03</span><span>The scale card</span></p>
-    <h2 id="scale-h">A known size, laid in the photo</h2>
-    <p class="lede">The agenthand scale card is a printed, laminated card that goes in the photo, next to the thing being sold. Its face is the agenthand mark itself: the robot hand, the three arcs, and the black corner brackets that frame them. The only added furniture is a set of white ticks cut into those bracket arms at exact, known positions. Nothing else is printed on it: no numbers, no rulers, no labels. The geometry the pipeline needs lives in a layout profile on the machine side, where every bracket corner and tick sits at known coordinates. It comes in two sizes: 5&times;7&nbsp;in beside a product, and a 6&times;4&nbsp;in postcard for scenes, printed two to a letter sheet and cut down.</p>
-    <figure class="card-figure">
-      <img src="scale-card-v2.png" alt="The agenthand scale card: the agenthand mark on a white card, its black corner brackets carrying small white ticks cut into the bracket arms">
-      <figcaption>The AH-57 card, 5&times;7&nbsp;in. [ design locked &middot; print files ready ]</figcaption>
-    </figure>
-    <p><span class="rm-tag">[ roadmap ]</span></p>
-    <p class="lede">A known shape in the frame is a foothold. With one, agenthand could be built to read the bracket corners and ticks against their known geometry, fit the photo's perspective, and estimate the item's size, its distance from the camera, an area of floor or wall, and a rough volume for simple shapes. Estimates would come back as approximations, tilde and range included, never dressed up as exact figures. More cards placed at more depths would tighten the estimate. Paced or measured distances between cards would tighten it again. The design is locked and the print files are ready; measuring is not built.</p>
+    <p class="stamp">[ provenance — run: 2026-10-26, produced by agenthand <a href="https://github.com/AUsernameForYou/agenthand/tree/401f1136af5a36ca814207ae8ce8b5435bd1722e">commit 401f113</a> · fixture: the run's own files, a chat-screen cut-out (see the note above) · the checker on this page is <a href="verifier-v3.js">verifier-v3.js</a>, 16.6 KB — read it ]</p>
+    </div>
   </section>
 
   <section id="use" aria-labelledby="use-h">
-    <p class="chapter"><span class="ch-no">04</span><span>Use it</span></p>
+    <p class="chapter"><span class="ch-no">03</span><span>Use it</span></p>
     <h2 id="use-h">An MCP server, over stdio today</h2>
     <p class="lede">agenthand speaks the Model Context Protocol. Run it locally and point any MCP client at it; a hosted endpoint comes later.</p>
-    <pre class="code">git clone https://github.com/AUsernameForYou/agenthand
+    <pre class="code" id="install-code">git clone https://github.com/AUsernameForYou/agenthand
 cd agenthand
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 .venv/bin/agenthand          <span class="c"># stdio transport</span></pre>
+    <button class="copy-btn" type="button" data-copy="install-code">Copy install</button>
     <p>Then register it with your MCP client:</p>
-    <pre class="code">{
+    <pre class="code" id="config-code">{
   "mcpServers": {
     "agenthand": {
       "command": "/path/to/agenthand/.venv/bin/agenthand",
@@ -363,7 +419,19 @@ python3.12 -m venv .venv
     }
   }
 }</pre>
+    <button class="copy-btn" type="button" data-copy="config-code">Copy config</button>
     <p class="note">Images travel as <span style="font-family:ui-monospace,Menlo,Consolas,monospace">asset://</span> handles, not bytes, so tools chain: identify plans, cut_out returns a handle, draw consumes it. Every billable call passes one spend cap with reserve-then-settle receipts, and the server refuses to spend when the ledger cannot be trusted.</p>
+  </section>
+
+  <section id="scale-card" aria-labelledby="scale-h">
+    <p class="chapter"><span class="ch-no">04</span><span>The scale card</span><span class="rm-tag">[ roadmap ]</span></p>
+    <h2 id="scale-h">A known size, laid in the photo</h2>
+    <p class="lede">The agenthand scale card is a printed, laminated card that goes in the photo, next to the thing being sold. Its face is the agenthand mark itself: the robot hand, the three arcs, and the black corner brackets that frame them. The only added furniture is a set of white ticks cut into those bracket arms at exact, known positions. Nothing else is printed on it: no numbers, no rulers, no labels. The geometry the pipeline needs lives in a layout profile on the machine side, where every bracket corner and tick sits at known coordinates. It comes in two sizes: 5&times;7&nbsp;in beside a product, and a 6&times;4&nbsp;in postcard for scenes, printed two to a letter sheet and cut down.</p>
+    <figure class="card-figure">
+      <img src="scale-card-v3.png" width="720" height="528" loading="lazy" decoding="async" alt="The agenthand scale card: the agenthand mark on a white card, its black corner brackets carrying small white ticks cut into the bracket arms">
+      <figcaption>The AH-57 card, 5&times;7&nbsp;in. [ design locked &middot; print files ready ]</figcaption>
+    </figure>
+    <p class="lede">A known shape in the frame is a foothold. With one, agenthand could be built to read the bracket corners and ticks against their known geometry, fit the photo's perspective, and estimate the item's size, its distance from the camera, an area of floor or wall, and a rough volume for simple shapes. Estimates would come back as approximations, tilde and range included, never dressed up as exact figures. More cards placed at more depths would tighten the estimate. Paced or measured distances between cards would tighten it again. The design is locked and the print files are ready; measuring is not built.</p>
   </section>
 
   <section aria-labelledby="status-h">
@@ -376,11 +444,18 @@ python3.12 -m venv .venv
     </p>
   </section>
 
+  <div class="closing">
+    <p>Do not take this page's word for any of it.</p>
+    <a class="primary" href="#verify">Verify the run</a>
+    <a href="#proof">See the run</a>
+    <a href="https://github.com/AUsernameForYou/agenthand">Get the code</a>
+  </div>
+
 </main>
 
 <footer>
   <div class="wrap">
-    <img src="logo-symbol-v1.png" alt="The agenthand symbol: a robot hand under three cyan arcs">
+    <img src="logo-symbol-256-v1.png" width="256" height="173" loading="lazy" alt="The agenthand symbol: a robot hand under three cyan arcs">
     <div>
       <p><strong style="color:var(--ink)">agenthand</strong> — a hand for your agent. An MCP server by Daniel Wagner, built for the Meta Global AI Developer Hackathon.</p>
       <p>The rotating arcs are the three tools, turning as one. The hand underneath is the promise: the real product, handled carefully, never redrawn.</p>
@@ -390,23 +465,66 @@ python3.12 -m venv .venv
 
 <script>
 (function(){
-  var btn=document.getElementById('copy-receipt');
-  var receipt=document.getElementById('receipt');
-  if(!btn||!receipt)return;
-  btn.addEventListener('click',function(){
-    function done(){
-      btn.textContent='Copied';
-      setTimeout(function(){btn.textContent='Copy receipt'},1600);
-    }
-    if(navigator.clipboard&&navigator.clipboard.writeText){
-      navigator.clipboard.writeText(receipt.innerText).then(done,done);
-    }else{
-      done();
-    }
-  });
+  // Truthful copy buttons: "Copied" appears only when the text actually
+  // reached the clipboard. Rejection, a missing clipboard API, and a
+  // failed fallback all say so instead.
+  function restore(btn,label){ setTimeout(function(){ btn.textContent=label; },2000); }
+  function mark(btn,ok,label){
+    btn.textContent = ok ? 'Copied' : 'Copy failed — select the text and copy it manually';
+    restore(btn,label);
+  }
+  function fallbackCopy(text,btn,label){
+    try{
+      var ta=document.createElement('textarea');
+      ta.value=text; ta.style.position='fixed'; ta.style.opacity='0';
+      document.body.appendChild(ta); ta.select();
+      var ok=document.execCommand('copy');
+      document.body.removeChild(ta);
+      mark(btn,!!ok,label);
+    }catch(e){ mark(btn,false,label); }
+  }
+  var btns=document.querySelectorAll('[data-copy]');
+  for(var i=0;i<btns.length;i++){
+    (function(btn){
+      btn.addEventListener('click',function(){
+        var target=document.getElementById(btn.getAttribute('data-copy'));
+        if(!target){ mark(btn,false,btn.textContent); return; }
+        var label=btn.textContent;
+        var text=target.innerText;
+        if(navigator.clipboard&&navigator.clipboard.writeText){
+          navigator.clipboard.writeText(text).then(
+            function(){ mark(btn,true,label); },
+            function(){ fallbackCopy(text,btn,label); }
+          );
+        }else{
+          fallbackCopy(text,btn,label);
+        }
+      });
+    })(btns[i]);
+  }
 })();
 </script>
-<script src="verifier-v2.js" defer></script>
+<script>
+(function(){
+  // Hero proof line: count up to the verified run's real checked total.
+  // The final value is already in the HTML; reduced motion (or no JS)
+  // simply leaves it standing.
+  var el=document.getElementById('hero-checked');
+  if(!el) return;
+  if(window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
+  var target=580613, t0=null, dur=1500;
+  function fmt(n){ return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,','); }
+  function step(ts){
+    if(!t0) t0=ts;
+    var p=Math.min((ts-t0)/dur,1);
+    var eased=1-Math.pow(1-p,3);
+    el.textContent=fmt(Math.round(target*eased));
+    if(p<1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
+})();
+</script>
+<script src="verifier-v3.js" defer></script>
 
 </body>
 </html>

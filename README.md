@@ -95,14 +95,18 @@ state means no spend.
 
 ## Status
 
-Hackathon build in progress (Meta Global AI Developer Hackathon, Oct 26 -
-Nov 4, 2026). `draw`'s Fidelity Lock pipeline (lineage checks, integrity
-verification, deterministic compositing, fidelity receipt) runs locally
-end to end with a deterministic placeholder background plate; its
-background model is not wired yet. `identify` is wired to the real vision
-model (muse-spark-1.3) and `cut_out` to the real segmentation model
-(sam-3.1), both through the spend-cap billing choke point; cut_out's live
-verification is still pending.
+Hackathon build (Meta Global AI Developer Hackathon, Oct 26 - Nov 4,
+2026). All three tools are wired to the real Meta Model API through the
+spend-cap billing choke point — `identify` to muse-spark-1.3, `cut_out`
+to sam-3.1, `draw` to muse-image-1.0 — and the full chain has run live
+end to end. The verified run of 2026-10-26 (identify $0.007544,
+cut_out $0.0025, draw $0.01; 580,613 opaque pixels checked, 0 changed)
+is published with its fidelity receipt on the
+[project site](https://ausernameforyou.github.io/agenthand/#fidelity),
+where the same check can be re-run in the browser against the run's own
+files. The placeholder plate survives only behind an explicit dev flag
+for offline tests. Today the server runs locally over stdio; a hosted
+endpoint comes later.
 
 ## Run it
 
