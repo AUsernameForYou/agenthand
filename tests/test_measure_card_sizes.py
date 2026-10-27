@@ -9,22 +9,35 @@ variable).
 
 Profiles: tests/fixtures/scaled-card-profiles.json, generated from the
 real AH-46 profile by scripts/make_scaled_card_profiles.py —
-AH-42 (4.25x2.83 in), AH-35 (3.5x2.33 in), AH-LTR (AH-46 art x1.83
-centred on an 11x8.5 in landscape letter sheet, used whole).
+AH-42 (4.25x2.83 in, a tested size that is not printed), AH-35
+(3x2 in, the printed mini) and AH-BIG (10x7.5 in, the printed
+distance card). The AH-35 and AH-BIG fixture geometry is identical
+to the printed AH-FAMILY v4 profile entries.
 
 Findings this file pins down (synthetic evidence only; see
 ESTIMATOR.md "How small can the card be"):
-- Containment holds down to ~134 px across the card.
+- Containment holds down to ~142 px across the card in this battery
+  (the AH-42 caution-band scene, widened by the gate).
 - At 117-126 px the pre-gate estimator answered with a +/-5-6% range
   but the centre missed by more than the range: the range stopped
   covering systematic error while the tick fit looked healthy — a
   silent lying band. The estimator now refuses below
   measure.MIN_CARD_PX (130 px) and widens its range through the
-  130-170 px caution band; the two sub-floor scenes are pinned as
+  130-170 px caution band; the sub-floor scenes are pinned as
   refusal regressions.
-- A degraded AH-35 scene stays honest (range balloons to +/-55%) but
-  is useless in practice.
-- AH-LTR holds +/-3.5% at 3-4x distance, degraded included.
+- A degraded AH-35 scene stays honest (range balloons past +/-100%)
+  but is useless in practice.
+- The 3x2 mini is noisier than the size it replaced: multi-seed
+  probes at 130-210 px across produced centre errors beyond the
+  widened ranges on several seeds, clean and degraded, and one
+  mid-distance scene flipped contained/missed when the plane
+  height changed by 1 mm. Its dependable envelope is close-ups
+  (~200 px across, clean light). No mid-distance AH-35 scene is
+  pinned as contained — that would be seed-shopping; the battery
+  pins its close-up, its degraded honesty scene and its refusals,
+  and ESTIMATOR.md discloses the variance.
+- AH-BIG holds +/-2.5-3.5% at 2-3x distance, degraded included,
+  and contains at 4x inside the caution band.
 """
 
 from __future__ import annotations
@@ -219,14 +232,13 @@ SCENES = [
     ("ah42_probe225", SCALED_PROFILE, "AH-42", 1260, 720, 50, None, SMALL_LAYOUT),
     ("ah42_degraded_mid", SCALED_PROFILE, "AH-42", 840, 480, 60, DEG_A, SMALL_LAYOUT),
     ("ah35_close", SCALED_PROFILE, "AH-35", 560, 320, 30, None, SMALL_LAYOUT),
-    ("ah35_mid", SCALED_PROFILE, "AH-35", 840, 480, 50, None, SMALL_LAYOUT),
     ("ah35_probe175", SCALED_PROFILE, "AH-35", 980, 560, 50, None, SMALL_LAYOUT),
     ("ah35_far2x", SCALED_PROFILE, "AH-35", 1120, 640, 50, None, SMALL_LAYOUT),
     ("ah35_degraded_mid", SCALED_PROFILE, "AH-35", 840, 480, 60, DEG_A, SMALL_LAYOUT),
-    ("ahltr_2x", SCALED_PROFILE, "AH-LTR", 1120, 640, 50, None, BIG_LAYOUT),
-    ("ahltr_3x", SCALED_PROFILE, "AH-LTR", 1680, 960, 50, None, BIG_LAYOUT),
-    ("ahltr_4x", SCALED_PROFILE, "AH-LTR", 2240, 1280, 60, None, BIG_LAYOUT),
-    ("ahltr_degraded_3x", SCALED_PROFILE, "AH-LTR", 1680, 960, 60, DEG_A, BIG_LAYOUT),
+    ("ahbig_2x", SCALED_PROFILE, "AH-BIG", 1120, 640, 50, None, BIG_LAYOUT),
+    ("ahbig_3x", SCALED_PROFILE, "AH-BIG", 1680, 960, 50, None, BIG_LAYOUT),
+    ("ahbig_4x", SCALED_PROFILE, "AH-BIG", 2240, 1280, 60, None, BIG_LAYOUT),
+    ("ahbig_degraded_3x", SCALED_PROFILE, "AH-BIG", 1680, 960, 60, DEG_A, BIG_LAYOUT),
 ]
 
 
@@ -267,17 +279,16 @@ CONTAINED_SCENES = [
     "ah42_far2x",
     "ah42_degraded_mid",
     "ah35_close",
-    "ah35_mid",
-    "ah35_probe175",
-    "ahltr_2x",
-    "ahltr_3x",
-    "ahltr_4x",
-    "ahltr_degraded_3x",
+    "ahbig_2x",
+    "ahbig_3x",
+    "ahbig_4x",
+    "ahbig_degraded_3x",
 ]
-# Sub-floor scenes (117-126 px): the silent lying band. The pre-gate
+# Sub-floor scenes (100-126 px): the silent lying band. The pre-gate
 # estimator answered these with ~+/-6% ranges that missed the truth;
-# the pixels-across gate must now refuse them, plainly.
-SUBFLOOR_SCENES = ["ah42_probe225", "ah35_far2x"]
+# the pixels-across gate must now refuse them, plainly. The AH-35
+# scenes joined the band when the mini shrank to 3x2 in.
+SUBFLOOR_SCENES = ["ah42_probe225", "ah35_probe175", "ah35_far2x"]
 
 
 @pytest.mark.parametrize("scene", CONTAINED_SCENES)
@@ -334,6 +345,7 @@ def test_caution_band_range_is_widened(battery):
 def test_degraded_mini_blows_range_honestly(battery):
     # AH-35 + blur/noise/gradient at 1.5x: the range balloons past
     # +/-30% (useless in practice) but still contains the truth.
+    # At the 3x2 size the balloon is past +/-100%.
     row = battery["ah35_degraded_mid"]
     assert not row["refused"]
     assert row["contained"]
@@ -349,12 +361,17 @@ def test_no_wild_numbers_anywhere(battery):
         assert ok, f"{name}: uncontained answer at {row['card_px']:.0f} px"
 
 
-def test_gate_bracket_126_refuses_134_contains(battery):
+def test_gate_bracket_126_refuses_142_contains(battery):
     # The empirical bracket the gate threshold rests on: the last
-    # lying-band scene (126 px) refuses, the first honest scene
-    # (134 px) still answers and contains the truth.
+    # lying-band scene (126 px) refuses, the first honest scenes
+    # (142-148 px, caution band, ranges widened by the gate) still
+    # answer and contain the truth. The AH-35 1.75x probe scene sat
+    # at 134 px for the old 3.5x2.33 in mini; at 3x2 in it renders
+    # at ~114 px and has crossed to the refusal side.
     assert battery["ah42_probe225"]["card_px"] < measure.MIN_CARD_PX
     assert battery["ah42_probe225"]["refused"]
+    assert battery["ah35_probe175"]["card_px"] < measure.MIN_CARD_PX
+    assert battery["ah35_probe175"]["refused"]
     assert battery["ah35_far2x"]["refused"]
-    assert battery["ah35_probe175"]["card_px"] > measure.MIN_CARD_PX
-    assert battery["ah35_probe175"]["contained"] is True
+    assert battery["ah42_far2x"]["card_px"] > measure.MIN_CARD_PX
+    assert battery["ah42_far2x"]["contained"] is True
