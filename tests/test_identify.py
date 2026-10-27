@@ -317,3 +317,147 @@ def test_get_meta_api_key_loads_dotenv_without_overriding_env(tmp_path, monkeypa
         assert config.get_meta_api_key() == "from-env"
     finally:
         os.environ.pop("META_API_KEY", None)
+
+
+# -- segmentation-phrase hygiene: no whole-frame phrases ----------------------
+#
+# Regression for the dry-run gate failure (2026-10-27): identify emitted
+# "phone screen" / "smartphone display" / "smartphone screenshot" for a
+# photo that IS a screenshot. SAM can never segment the medium itself, so
+# cut_out burned its bounded retries and failed stochastically. The plan
+# is now constrained deterministically, whatever the model returns.
+
+
+def test_frame_phrase_detection_names_the_medium_not_the_object():
+    for phrase in (
+        "phone screen",
+        "smartphone display",
+        "smartphone screenshot",
+        "the whole scene",
+        "computer monitor",
+        "photo",
+        "screens",
+    ):
+        assert meta_client._is_frame_phrase(phrase), phrase
+    for phrase in (
+        "brown leather wallet",
+        "leather bifold wallet",
+        "framed print",
+        "smartphone",
+        "cell phone",
+        "wallet on a wooden table",
+    ):
+        assert not meta_client._is_frame_phrase(phrase), phrase
+
+
+def test_frame_phrase_rewrite_drops_the_frame_head_noun():
+    assert meta_client._rewrite_frame_phrase("phone screen") == "phone"
+    assert meta_client._rewrite_frame_phrase("smartphone display") == "smartphone"
+    assert meta_client._rewrite_frame_phrase("smartphone screenshot") == "smartphone"
+    assert meta_client._rewrite_frame_phrase("the phone screen") == "phone"
+    assert meta_client._rewrite_frame_phrase("screen") is None
+    assert meta_client._rewrite_frame_phrase("screenshot") is None
+
+
+def test_phrase_from_description_takes_the_opening_object_phrase():
+    assert (
+        meta_client._phrase_from_description(
+            "A brown leather wallet on a wooden table."
+        )
+        == "brown leather wallet"
+    )
+    assert meta_client._phrase_from_description("Screenshot of a chat.") is None
+
+
+@pytest.mark.parametrize(
+    "bad_concept",
+    ["phone screen", "smartphone display", "smartphone screenshot"],
+)
+def test_parse_replaces_frame_concept_with_object_alternate(bad_concept):
+    payload = dict(GOOD_PAYLOAD)
+    payload["concept"] = bad_concept
+    payload["alternates"] = ["smartphone", "cell phone", "mobile phone"]
+    plan = meta_client._parse_identify_payload(json.dumps(payload))
+    # The frame concept is gone; the first object alternate is promoted
+    # and no frame phrase survives anywhere in the plan. (For
+    # "phone screen" the rewritten salvage "phone" may trail the
+    # alternates; for the other two it rewrites to "smartphone" and
+    # dedups against the promoted concept.)
+    assert plan["concept"] == "smartphone"
+    assert plan["alternates"][:2] == ["cell phone", "mobile phone"]
+    assert all(not meta_client._is_frame_phrase(p) for p in [plan["concept"], *plan["alternates"]])
+
+
+def test_parse_frame_concept_whose_rewrite_collides_is_a_repairable_shortfall():
+    # "smartphone display" rewrites to "smartphone" — already the
+    # promoted alternate — so only one distinct alternate survives and
+    # the plan lands in the repairable shortfall, not in cut_out.
+    payload = dict(GOOD_PAYLOAD)
+    payload["concept"] = "smartphone display"
+    payload["alternates"] = ["smartphone", "cell phone"]
+    with pytest.raises(meta_client.IdentifyResultError) as excinfo:
+        meta_client._parse_identify_payload(json.dumps(payload))
+    assert str(excinfo.value).startswith("ALTERNATES_SHORTFALL")
+
+
+def test_parse_all_frame_phrases_fall_back_to_rewrites():
+    payload = dict(GOOD_PAYLOAD)
+    payload["concept"] = "smartphone display"
+    payload["alternates"] = ["smartphone screenshot", "mobile phone", "cellular phone"]
+    plan = meta_client._parse_identify_payload(json.dumps(payload))
+    assert plan["concept"] == "mobile phone"
+    assert plan["alternates"] == ["cellular phone", "smartphone"]
+
+
+def test_parse_object_phrases_pass_through_untouched():
+    plan = meta_client._parse_identify_payload(_good_content())
+    assert plan["concept"] == GOOD_PAYLOAD["concept"]
+    assert plan["alternates"] == GOOD_PAYLOAD["alternates"]
+
+
+def test_sanitize_falls_back_to_the_description_when_nothing_survives():
+    concept, alternates = meta_client._sanitize_plan_phrases(
+        "screen", ["display"], "A brown leather wallet on a wooden table."
+    )
+    assert concept == "brown leather wallet"
+    assert alternates == []
+
+
+def test_identify_frame_concept_is_promoted_over_without_a_repair_call(monkeypatch):
+    client = _install_fake(
+        monkeypatch,
+        [
+            _response(
+                _good_content(
+                    concept="phone screen",
+                    alternates=["smartphone", "cell phone"],
+                )
+            )
+        ],
+    )
+    result = server.identify(_data_uri())
+    assert result["status"] == "ok"
+    assert result["concept"] == "smartphone"
+    assert result["alternates"] == ["cell phone", "phone"]
+    # No repair call was needed: the plan was fixed deterministically.
+    assert len(client.completions.calls) == 1
+
+
+def test_identify_all_frame_plan_is_rescued_by_the_repair_call(monkeypatch):
+    first = _response(
+        _good_content(
+            concept="smartphone screenshot",
+            alternates=["smartphone display", "phone screen"],
+        )
+    )
+    repair = _response(json.dumps({"alternates": ["smartphone", "mobile phone"]}))
+    client = _install_fake(monkeypatch, [first, repair])
+    result = server.identify(_data_uri())
+    assert result["status"] == "ok"
+    assert len(client.completions.calls) == 2
+    assert result["concept"] == "smartphone"
+    assert "mobile phone" in result["alternates"]
+    assert all(
+        not meta_client._is_frame_phrase(p)
+        for p in [result["concept"], *result["alternates"]]
+    )

@@ -33,6 +33,7 @@ import base64
 import fcntl
 import json
 import math
+import re
 import uuid
 from collections.abc import Callable
 from contextvars import ContextVar
@@ -268,6 +269,15 @@ def project_identify_cost_usd(
     return round(2 * one_call, 6)
 
 
+# NOTE: keep this schema and _IDENTIFY_INSTRUCTIONS close to the
+# shape that works. A 2026-10-27 change that lengthened the
+# instructions (and added per-property "description" keys here) made
+# the Meta API answer HTTP 200 with an EMPTY completion, every time;
+# bisection pinned the lengthened instructions as sufficient to
+# reproduce it (the schema keys were removed in the same pass and
+# never re-tested alone). A one-sentence guidance clause in the
+# instructions is verified safe; anything more needs a live probe.
+# The real enforcement is deterministic anyway: _sanitize_plan_phrases.
 _IDENTIFY_SCHEMA: dict = {
     "name": "identify_result",
     "strict": True,
@@ -309,13 +319,16 @@ _IDENTIFY_INSTRUCTIONS = (
     "factual description of the product, at most 40 words. concept: ONE "
     "short noun phrase naming the product, suitable for text-prompted "
     "image segmentation (e.g. 'brown leather wallet') — the product "
-    "only, no background, no adjectives about the scene. alternates: at "
-    "least 2 different fallback noun phrases for the same product, for "
-    "use if the first phrase segments poorly. suggested_title: a "
-    "marketplace listing title. listing_bullets: 3 to 5 short selling "
-    "points a buyer can verify from the photo, each at most 12 words. "
-    "condition_notes: visible wear, damage, or defects, in at most 25 "
-    "words; say so plainly, or state that none are visible."
+    "only, no background, no adjectives about the scene. Name the "
+    "physical object itself, never the screen, photo, or frame it "
+    "appears in. alternates: at least 2 different fallback noun "
+    "phrases for the same product, for use if the first phrase "
+    "segments poorly. suggested_title: a "
+    "marketplace listing title. listing_bullets: 3 "
+    "to 5 short selling points a buyer can verify from the photo, each "
+    "at most 12 words. condition_notes: visible wear, damage, or "
+    "defects, in at most 25 words; say so plainly, or state that none "
+    "are visible."
 )
 
 
@@ -345,14 +358,163 @@ def _merge_usage(a: UsageDict, b: UsageDict) -> UsageDict:
     return {key: int(a.get(key, 0)) + int(b.get(key, 0)) for key in _USAGE_KEYS}
 
 
+# ---------------------------------------------------------------------------
+# Segmentation-phrase hygiene: the plan's phrases must name a segmentable
+# physical object, never the frame or the medium.
+#
+# The dry-run gate (2026-10-27) caught identify emitting whole-frame
+# phrases — "phone screen", "smartphone display", "smartphone
+# screenshot" — for a photo that IS a screenshot. SAM can never segment
+# the medium itself, so cut_out burned its bounded retries on phrases
+# that cannot match and the chain failed stochastically. The prompt now
+# forbids these, and this deterministic layer enforces it regardless of
+# what the model returns.
+# ---------------------------------------------------------------------------
+
+# Head nouns that name the frame / medium rather than an object in it.
+_FRAME_HEAD_NOUNS = frozenset(
+    {
+        "screen",
+        "display",
+        "monitor",
+        "photo",
+        "photograph",
+        "image",
+        "picture",
+        "background",
+        "scene",
+        "frame",
+        "screenshot",
+    }
+)
+
+_PHRASE_TOKEN_RE = re.compile(r"[a-z0-9]+(?:'[a-z]+)?")
+
+
+def _phrase_tokens(phrase: str) -> list[str]:
+    return _PHRASE_TOKEN_RE.findall(phrase.lower())
+
+
+def _is_frame_phrase(phrase: str) -> bool:
+    """True when a phrase names the frame/medium instead of an object.
+
+    The head noun of an English noun phrase is its last token, so
+    "phone screen" and "smartphone display" are frame phrases while
+    "leather wallet" is not. "picture frame" is rejected too: frame is
+    a medium noun under the plan contract even when a physical frame
+    is the product (the model can name it differently, e.g. "framed
+    print"). An empty/unparseable phrase counts as unusable too.
+    """
+    tokens = _phrase_tokens(phrase)
+    if not tokens:
+        return True
+    head = tokens[-1]
+    if head.endswith("s") and head[:-1] in _FRAME_HEAD_NOUNS:
+        head = head[:-1]
+    return head in _FRAME_HEAD_NOUNS
+
+
+def _rewrite_frame_phrase(phrase: str) -> str | None:
+    """Salvage a frame phrase by dropping its frame head noun.
+
+    "smartphone display" -> "smartphone"; "phone screen" -> "phone".
+    Returns None when nothing but the frame noun (and articles) is
+    left — there is no object noun to segment.
+    """
+    tokens = _phrase_tokens(phrase)
+    while tokens and _is_frame_phrase(" ".join(tokens)):
+        tokens.pop()
+    while tokens and tokens[0] in ("the", "a", "an"):
+        tokens.pop(0)
+    if not tokens:
+        return None
+    return " ".join(tokens)
+
+
+# Tokens that end the opening noun phrase of a description: the object
+# has been named once one of these shows up.
+_DESCRIPTION_CUT_TOKENS = frozenset(
+    {
+        "on", "in", "against", "with", "beside", "near", "showing",
+        "displaying", "featuring", "sits", "sitting", "placed", "lying",
+        "standing", "resting", "of",
+    }
+)
+
+
+def _phrase_from_description(description: str) -> str | None:
+    """Last-resort object phrase from identify's own description.
+
+    Takes the description's opening noun phrase (up to the first
+    preposition/verb token or clause break), drops articles and any
+    frame nouns, and returns what is left. Deterministic and
+    conservative: returns None rather than inventing an object.
+    """
+    head_text = re.split(r"[.,;:]", description, maxsplit=1)[0]
+    tokens = _phrase_tokens(head_text)
+    while tokens and tokens[0] in ("the", "a", "an"):
+        tokens.pop(0)
+    kept: list[str] = []
+    for token in tokens:
+        if token in _DESCRIPTION_CUT_TOKENS:
+            break
+        if token in _FRAME_HEAD_NOUNS or (
+            token.endswith("s") and token[:-1] in _FRAME_HEAD_NOUNS
+        ):
+            continue
+        kept.append(token)
+    if not kept or _is_frame_phrase(" ".join(kept)):
+        return None
+    return " ".join(kept)
+
+
+def _sanitize_plan_phrases(
+    concept: str, alternates: list[str], description: str
+) -> tuple[str | None, list[str]]:
+    """Constrain a plan's phrases to segmentable object phrases.
+
+    Order of rescue, all deterministic:
+    1. Phrases that already name an object pass through untouched
+       (concept first, then alternates in the model's order).
+    2. Frame phrases are rewritten by dropping the frame head noun
+       ("smartphone display" -> "smartphone") and join the pool.
+    3. If the pool is still empty, an object phrase is derived from
+       identify's own description of the product.
+
+    Returns (concept, alternates); concept is None when no usable
+    phrase survives, which the caller treats as the repairable
+    alternates-shortfall defect.
+    """
+    pool: list[str] = []
+
+    def _add(phrase: str | None) -> None:
+        if phrase and phrase.lower() not in {p.lower() for p in pool}:
+            pool.append(phrase)
+
+    for phrase in (concept, *alternates):
+        if not _is_frame_phrase(phrase):
+            _add(phrase.strip())
+    for phrase in (concept, *alternates):
+        if _is_frame_phrase(phrase):
+            _add(_rewrite_frame_phrase(phrase))
+    if not pool:
+        _add(_phrase_from_description(description))
+    if not pool:
+        return None, []
+    return pool[0], pool[1:]
+
+
 def _parse_identify_payload(content: str) -> dict:
     """Parse and contract-check one identify response body.
 
     Raises IdentifyResultError on malformed JSON or any field that
     violates the contract (types, listing_bullets 3-5, alternates >= 2
-    after cleaning). The alternates shortfall is the one defect the
-    caller may repair with a follow-up call, so it is raised with a
-    distinguishable message prefix.
+    after cleaning). Cleaning includes the segmentation-phrase hygiene
+    pass: concept/alternates must name a segmentable physical object,
+    never the frame or the medium (see _sanitize_plan_phrases). The
+    alternates shortfall — which a frame-phrase-only plan also lands
+    in — is the one defect the caller may repair with a follow-up
+    call, so it is raised with a distinguishable message prefix.
     """
     try:
         payload = json.loads(content)
@@ -387,12 +549,27 @@ def _parse_identify_payload(content: str) -> dict:
         raise IdentifyResultError(
             "ALTERNATES_SHORTFALL: 'alternates' is not a list."
         )
-    alternates: list[str] = []
+    cleaned: list[str] = []
     for item in raw_alternates:
         if isinstance(item, str):
             phrase = item.strip()
-            if phrase and phrase.lower() != concept.lower() and phrase not in alternates:
-                alternates.append(phrase)
+            if phrase and phrase.lower() != concept.lower() and phrase not in cleaned:
+                cleaned.append(phrase)
+    # Deterministic phrase hygiene: whatever the model returned, the
+    # plan that reaches cut_out names segmentable physical objects
+    # only — whole-frame phrases are promoted over, rewritten, or
+    # replaced from the description (see _sanitize_plan_phrases). A
+    # plan left with no concept, or fewer than 2 alternates, is the
+    # repairable shortfall defect, same as before.
+    concept_out, alternates = _sanitize_plan_phrases(
+        concept, cleaned, payload["description"]
+    )
+    if concept_out is None:
+        raise IdentifyResultError(
+            "ALTERNATES_SHORTFALL: no segmentable object phrase in the "
+            "plan — concept and alternates all name the frame or the "
+            f"medium (concept was {concept!r})."
+        )
     if len(alternates) < 2:
         raise IdentifyResultError(
             "ALTERNATES_SHORTFALL: fewer than 2 usable alternates after "
@@ -401,7 +578,7 @@ def _parse_identify_payload(content: str) -> dict:
 
     return {
         "description": payload["description"].strip(),
-        "concept": concept,
+        "concept": concept_out,
         "alternates": alternates,
         "suggested_title": payload["suggested_title"].strip(),
         "listing_bullets": [b.strip() for b in bullets],
@@ -519,7 +696,9 @@ def vision_identify(
                     "A segmentation plan for a product photo uses the "
                     f"noun phrase {concept!r}. Give at least 2 different "
                     "fallback noun phrases for the same product, each "
-                    "short and naming the product only."
+                    "short and naming the concrete physical object "
+                    "itself — never the screen, display, photo, image, "
+                    "screenshot, background, scene, or frame."
                 ),
             }
         ],
