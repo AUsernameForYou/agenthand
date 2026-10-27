@@ -138,6 +138,17 @@
   .steps{margin:14px 0 0;padding-left:22px;font-size:16.5px}
   .steps li{margin-bottom:8px}
 
+  .card-figure{margin:22px 0 10px;max-width:360px}
+  .card-figure img{width:100%;height:auto;display:block;border:2px solid var(--ink)}
+  .card-figure figcaption{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13px;color:var(--grey);margin-top:8px;
+  }
+  .rm-tag{
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:13.5px;font-weight:700;letter-spacing:0.08em;
+  }
+
   pre.code{
     background:#111111;color:#f2f2f2;
     padding:20px 22px;font-size:14px;line-height:1.65;
@@ -239,8 +250,20 @@
     <p class="note">The claim is precise on purpose: the stored product layer reached the final image unchanged. Edge pixels that blend with the scene are counted separately in the receipt, never hidden inside the zero.</p>
   </section>
 
+  <section id="scale-card" aria-labelledby="scale-h">
+    <p class="chapter"><span class="ch-no">03</span><span>The scale card</span></p>
+    <h2 id="scale-h">A known size, laid in the photo</h2>
+    <p class="lede">The agenthand scale card is a printed, laminated card that goes in the photo, next to the thing being sold. True-size rulers run along its edges, and an exact 50.0&nbsp;mm calibration square sits on its face. Corner registration marks anchor the outline. The logo lockup in the middle carries bracket corners that are a second set of marks at known geometry, and small joint marks at the midpoints of the edges back them up. It comes in two sizes: 5&times;7&nbsp;in beside a product, 8.5&times;11&nbsp;in in a scene.</p>
+    <figure class="card-figure">
+      <img src="scale-card-v1.png" alt="The agenthand scale card design: true-size rulers along the edges, a 50.0 mm calibration square, corner registration marks, midpoint joint marks, and the agenthand lockup in the middle">
+      <figcaption>The AH-57 card, 5&times;7&nbsp;in. [ design locked &middot; print files pending ]</figcaption>
+    </figure>
+    <p><span class="rm-tag">[ roadmap ]</span></p>
+    <p class="lede">A known size in the frame is a foothold. With one, agenthand could be built to fit the photo's perspective and estimate the item's dimensions, its distance from the camera, an area of floor or wall, and a rough volume for simple shapes, each with its error range stated. More cards placed at more depths would tighten the estimate. Paced or measured distances between cards would tighten it again. The design is locked; measuring is not built.</p>
+  </section>
+
   <section id="use" aria-labelledby="use-h">
-    <p class="chapter"><span class="ch-no">03</span><span>Use it</span></p>
+    <p class="chapter"><span class="ch-no">04</span><span>Use it</span></p>
     <h2 id="use-h">An MCP server, over stdio today</h2>
     <p class="lede">agenthand speaks the Model Context Protocol. Run it locally and point any MCP client at it; a hosted endpoint comes later.</p>
     <pre class="code">git clone https://github.com/AUsernameForYou/agenthand
@@ -261,7 +284,7 @@ python3.12 -m venv .venv
   </section>
 
   <section aria-labelledby="status-h">
-    <p class="chapter"><span class="ch-no">04</span><span>Status</span></p>
+    <p class="chapter"><span class="ch-no">05</span><span>Status</span></p>
     <h2 id="status-h">Built in the open, during the hackathon</h2>
     <p class="lede">agenthand was designed and built during the Meta Global AI Developer Hackathon, October 26 to November 4, 2026. The full chain runs end to end today: identify, cut_out, and draw, live on the Meta Model API, with Fidelity Lock receipts on every staged image. A demo video is on its way.</p>
     <p class="lede">
