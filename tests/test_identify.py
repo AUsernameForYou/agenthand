@@ -173,18 +173,22 @@ def test_cut_out_plans_internally_with_the_real_identify(monkeypatch):
 
 
 def test_identify_malformed_response_fails_closed_and_reservation_counts(monkeypatch):
-    _install_fake(monkeypatch, [_response("this is not json at all")])
+    # A malformed body is a body-parse failure, so the bounded retry
+    # burns all IDENTIFY_MAX_ATTEMPTS attempts before failing closed.
+    _install_fake(monkeypatch, [_response("this is not json at all")] * 3)
     result = server.identify(_data_uri())
 
     assert result["status"] == "error"
     assert result["error"]["code"] == "BAD_MODEL_RESPONSE"
-    # The billed reservation stays counted as spend; nothing settled.
+    # Every attempt's billed reservation stays counted; nothing settled.
     records = _records()
-    assert [r["phase"] for r in records] == ["pending"]
+    assert [r["phase"] for r in records] == ["pending"] * 3
     projected = meta_client.project_identify_cost_usd("muse-spark-1.3", 6, 4)
-    assert records[0]["usd_estimate"] == projected
-    assert ledger.ledger_total_usd(config.get_ledger_path()) == projected
-    assert result["error"]["cost_counted_usd"] == projected
+    assert all(r["usd_estimate"] == projected for r in records)
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == pytest.approx(
+        projected * 3
+    )
+    assert result["error"]["cost_counted_usd"] == projected * 3
 
 
 def test_identify_truncated_response_saves_raw_to_debug_file(monkeypatch):
@@ -193,31 +197,124 @@ def test_identify_truncated_response_saves_raw_to_debug_file(monkeypatch):
     full = _good_content()
     truncated = full[: len(full) // 2]
     assert truncated != full
-    _install_fake(monkeypatch, [_response(truncated)])
+    # Truncation is a body-parse failure: all 3 bounded attempts run.
+    _install_fake(monkeypatch, [_response(truncated)] * 3)
     result = server.identify(_data_uri())
 
     assert result["status"] == "error"
     assert result["error"]["code"] == "BAD_MODEL_RESPONSE"
 
-    # The full raw body was saved under data/debug/, named for the
-    # ledger call, and the error result points at it.
+    # Each attempt's full raw body was saved under data/debug/, named
+    # for its own ledger call; the error result points at the last one.
     records = _records()
-    assert [r["phase"] for r in records] == ["pending"]
+    assert [r["phase"] for r in records] == ["pending"] * 3
     debug_path = result["error"].get("debug_path")
     assert debug_path
     path = Path(debug_path)
     assert path.parent == config.get_data_dir() / "debug"
-    assert path.name == f"identify-{records[0]['call_id']}.txt"
+    assert path.name == f"identify-{records[-1]['call_id']}.txt"
     assert path.read_text(encoding="utf-8") == truncated
+    for record in records:
+        attempt_file = path.parent / f"identify-{record['call_id']}.txt"
+        assert attempt_file.read_text(encoding="utf-8") == truncated
 
     # The raw model text never lands in the ledger...
     assert truncated not in config.get_ledger_path().read_text(encoding="utf-8")
-    # ...and the reservation is counted exactly once: not dropped,
-    # not double-counted.
+    # ...and each attempt's reservation is counted exactly once: not
+    # dropped, not double-counted.
+    projected = meta_client.project_identify_cost_usd("muse-spark-1.3", 6, 4)
+    assert all(r["usd_estimate"] == projected for r in records)
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == pytest.approx(
+        projected * 3
+    )
+    assert result["error"]["cost_counted_usd"] == projected * 3
+
+
+# -- the bounded retry on empty / truncated bodies ---------------------------
+#
+# Live flake (dry-run gate, 2026-10-27): muse-spark-1.3 intermittently
+# answers HTTP 200 with an empty body or a body cut mid-JSON. A body
+# failure is re-rolled as a fresh billed_call, at most
+# IDENTIFY_MAX_ATTEMPTS attempts; the ledger must show every attempt.
+
+
+def test_identify_truncated_then_valid_succeeds_and_bills_each_attempt(monkeypatch):
+    full = _good_content()
+    truncated = full[: len(full) // 2]
+    good = _response(
+        full, prompt_tokens=1500, completion_tokens=220, cached_tokens=300
+    )
+    client = _install_fake(monkeypatch, [_response(truncated), good])
+    result = server.identify(_data_uri())
+
+    assert result["status"] == "ok"
+    assert result["concept"] == GOOD_PAYLOAD["concept"]
+    assert result["usage"]["input_tokens"] == 1500
+    assert len(client.completions.calls) == 2
+
+    # Attempt 1: reserved, raised, left counted (no settle). Attempt 2:
+    # reserved + settled under its own call_id. No free retries.
+    records = _records()
+    assert [r["phase"] for r in records] == ["pending", "pending", "settled"]
+    assert records[0]["call_id"] != records[1]["call_id"]
+    assert records[2]["call_id"] == records[1]["call_id"] == result["call_id"]
     projected = meta_client.project_identify_cost_usd("muse-spark-1.3", 6, 4)
     assert records[0]["usd_estimate"] == projected
-    assert ledger.ledger_total_usd(config.get_ledger_path()) == projected
-    assert result["error"]["cost_counted_usd"] == projected
+    expected_actual = pricing.estimate_cost_usd(
+        "muse-spark-1.3",
+        input_tokens=1500,
+        output_tokens=220,
+        cached_input_tokens=300,
+    )
+    assert records[2]["usd_estimate"] == expected_actual
+    # The reported cost counts the failed attempt's reservation too,
+    # and matches the ledger total (per call, a settled receipt
+    # supersedes its own reservation; the failed attempt's stands).
+    assert result["cost_usd"] == projected + expected_actual
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == (
+        projected + expected_actual
+    )
+
+
+def test_identify_empty_body_then_valid_succeeds_and_bills_each_attempt(monkeypatch):
+    client = _install_fake(monkeypatch, [_response(""), _response(_good_content())])
+    result = server.identify(_data_uri())
+
+    assert result["status"] == "ok"
+    assert len(client.completions.calls) == 2
+    records = _records()
+    assert [r["phase"] for r in records] == ["pending", "pending", "settled"]
+    # Even the empty body was captured to a debug file for attempt 1.
+    debug_file = (
+        config.get_data_dir() / "debug" / f"identify-{records[0]['call_id']}.txt"
+    )
+    assert debug_file.read_text(encoding="utf-8") == ""
+
+
+def test_identify_all_attempts_bad_fails_closed_and_counts_every_attempt(monkeypatch):
+    full = _good_content()
+    truncated = full[: len(full) // 2]
+    client = _install_fake(
+        monkeypatch,
+        [_response(truncated), _response(""), _response("this is not json at all")],
+    )
+    result = server.identify(_data_uri())
+
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "BAD_MODEL_RESPONSE"
+    # The bound held: exactly IDENTIFY_MAX_ATTEMPTS transport calls,
+    # each with its own ledger reservation, nothing settled.
+    assert meta_client.IDENTIFY_MAX_ATTEMPTS == 3
+    assert len(client.completions.calls) == 3
+    records = _records()
+    assert [r["phase"] for r in records] == ["pending"] * 3
+    assert len({r["call_id"] for r in records}) == 3
+    projected = meta_client.project_identify_cost_usd("muse-spark-1.3", 6, 4)
+    assert all(r["usd_estimate"] == projected for r in records)
+    assert result["error"]["cost_counted_usd"] == projected * 3
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == pytest.approx(
+        projected * 3
+    )
 
 
 def test_identify_missing_field_fails_closed_without_repair(monkeypatch):

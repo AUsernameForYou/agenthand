@@ -460,17 +460,29 @@ def _run_identify(store: AssetStore, handle: str) -> dict:
     """Run the real identify planning step for a stored photo.
 
     On success returns the plan (description, concept, alternates,
-    listing fields) plus cost_usd, usage, and call_id from the settled
-    receipt. Expected failures return {"error": {...}} instead of
-    raising:
+    listing fields) plus cost_usd, usage, call_id, and attempts.
+    cost_usd is the total counted across every attempt: failed
+    attempts at their reserved projection, the successful one at its
+    settled actual. Expected failures return {"error": {...}} instead
+    of raising:
 
     - NOT_CONFIGURED: no META_API_KEY. Checked before billed_call runs,
       so nothing is written to the ledger for a setup problem.
-    - BAD_MODEL_RESPONSE: the model's response was unusable. The call
-      went through the choke point and its reservation stays counted as
-      spend; cost_counted_usd reports the reserved amount. When the body
-      was unparseable, its full raw text was saved under data/debug/
-      and debug_path points at that file.
+    - BAD_MODEL_RESPONSE: the model's response was unusable. Every
+      attempt went through the choke point and its reservation stays
+      counted as spend; cost_counted_usd reports the reserved total
+      across the failed attempts. When a body was unparseable, its
+      full raw text was saved under data/debug/ and debug_path points
+      at the last attempt's file.
+
+    Retry: muse-spark-1.3 intermittently returns HTTP 200 with an
+    empty or mid-JSON-truncated body, so a body-parse failure is
+    re-rolled as a fresh billed_call, up to
+    meta_client.IDENTIFY_MAX_ATTEMPTS attempts in total. No free
+    retries: every attempt is reserved and counted exactly like a
+    normal call, and the ledger shows each one. A plan that parsed
+    but broke the contract is NOT retried — vision_identify already
+    handles those deterministically (sanitize, one repair call).
 
     SpendCapExceeded propagates: an exhausted budget refuses loudly
     rather than degrading into an empty plan.
@@ -486,32 +498,46 @@ def _run_identify(store: AssetStore, handle: str) -> dict:
     projected = meta_client.project_identify_cost_usd(
         IDENTIFY_MODEL, record.width, record.height
     )
-    outcome: dict = {}
 
-    def _call() -> dict:
-        plan, usage = meta_client.vision_identify(png_bytes, model=IDENTIFY_MODEL)
-        outcome["plan"] = plan
-        return usage
+    failed_attempts = 0
+    last_error: meta_client.IdentifyResultError | None = None
+    while failed_attempts < meta_client.IDENTIFY_MAX_ATTEMPTS:
+        outcome: dict = {}
 
-    try:
-        billing = meta_client.billed_call(
-            "identify", IDENTIFY_MODEL, projected, _call
-        )
-    except meta_client.IdentifyResultError as exc:
-        error = {
-            "code": "BAD_MODEL_RESPONSE",
-            "message": str(exc),
-            "cost_counted_usd": projected,
-        }
-        if getattr(exc, "debug_path", None):
-            error["debug_path"] = exc.debug_path
-        return {"error": error}
-    plan = dict(outcome["plan"])
-    plan["model"] = IDENTIFY_MODEL
-    plan["cost_usd"] = billing["actual_usd"]
-    plan["usage"] = billing["usage"]
-    plan["call_id"] = billing["call_id"]
-    return plan
+        def _call() -> dict:
+            plan, usage = meta_client.vision_identify(
+                png_bytes, model=IDENTIFY_MODEL
+            )
+            outcome["plan"] = plan
+            return usage
+
+        try:
+            billing = meta_client.billed_call(
+                "identify", IDENTIFY_MODEL, projected, _call
+            )
+        except meta_client.IdentifyResultError as exc:
+            failed_attempts += 1
+            last_error = exc
+            if not meta_client.is_identify_body_failure(exc):
+                break
+            continue
+        plan = dict(outcome["plan"])
+        plan["model"] = IDENTIFY_MODEL
+        plan["cost_usd"] = projected * failed_attempts + billing["actual_usd"]
+        plan["usage"] = billing["usage"]
+        plan["call_id"] = billing["call_id"]
+        plan["attempts"] = failed_attempts + 1
+        return plan
+
+    assert last_error is not None  # the loop runs at least once
+    error = {
+        "code": "BAD_MODEL_RESPONSE",
+        "message": str(last_error),
+        "cost_counted_usd": projected * failed_attempts,
+    }
+    if getattr(last_error, "debug_path", None):
+        error["debug_path"] = last_error.debug_path
+    return {"error": error}
 
 
 def _plan_cut(store: AssetStore, handle: str) -> dict:

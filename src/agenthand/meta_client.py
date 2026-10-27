@@ -175,6 +175,15 @@ META_BASE_URL = "https://api.meta.ai/v1"
 # came back truncated mid-string at the 1024 bound, unparseable.
 IDENTIFY_MAX_TOKENS = 2048
 
+# Bounded retry for a known live flake: muse-spark-1.3 intermittently
+# answers HTTP 200 with an empty body or a body cut mid-JSON (~2 of 3
+# dry-run gate attempts, 2026-10-27). The retry loop lives in
+# server._run_identify, NOT here: each attempt must be its own
+# billed_call so the ledger shows (and charges) every attempt — a
+# retry hidden inside one billed_call's fn would spend uncounted.
+# Only body-parse failures retry (see is_identify_body_failure).
+IDENTIFY_MAX_ATTEMPTS = 3
+
 # Allowance for the text side of the identify request (instructions plus
 # schema overhead) when projecting the worst-case input size.
 _IDENTIFY_PROMPT_TOKENS = 300
@@ -210,6 +219,21 @@ class IdentifyResultError(RuntimeError):
         super().__init__(message)
         self.raw_response = raw_response
         self.debug_path: str | None = None
+
+
+def is_identify_body_failure(exc: IdentifyResultError) -> bool:
+    """True when the identify failure was an unparseable response body.
+
+    The parse paths attach the raw body to the error (raw_response);
+    contract violations on a body that DID parse leave it None. An
+    empty body lands here too: the content falls back to "" and
+    json.loads("") fails, so raw_response is "". Only body failures
+    are worth re-rolling against a fresh completion — a parsed plan
+    that breaks the contract has deterministic handling instead
+    (phrase sanitize, then the one alternates-repair call), and
+    retrying it would just spend.
+    """
+    return exc.raw_response is not None
 
 
 def require_meta_api_key() -> str:
@@ -631,6 +655,13 @@ def vision_identify(
     settled (or left counted) afterwards. `client` is injectable for
     offline tests; when omitted, the real client is built (which raises
     NotConfiguredError if no key is configured).
+
+    One invocation is one attempt: when the body comes back empty or
+    truncated, the IdentifyResultError raised here is a body failure
+    (is_identify_body_failure) and the caller — server._run_identify —
+    may re-roll it as a FRESH billed_call, up to IDENTIFY_MAX_ATTEMPTS
+    attempts in total. The retry never happens inside this function,
+    where it would spend behind the gate's back.
     """
     if client is None:
         client = build_client()

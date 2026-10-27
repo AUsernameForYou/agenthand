@@ -5,8 +5,14 @@
                                    [--scene "..."] [--ceiling-usd 1.00]
 
 Runs the full chain — identify -> cut_out -> draw — N times against one
-photo (default: the screenshot fixture already in the repo's data dir,
-the same photo as the verified 2026-10-26 run). identify runs as its
+photo (default: tests/fixtures/chair_photo.jpg, a generated photo of a
+wooden chair in a cluttered garage; see
+scripts/generate_chair_fixture.py). The previous default, the verified
+run's screenshot, failed on the fixture rather than the chain: a
+full-bleed screenshot holds no physical object, so SAM returned
+NO_MATCH for every phrase ("smartphone" / "mobile phone" included).
+Pass --photo data/assets/e3f0428fbc5e43c7826959a9eecbda50.png to
+reproduce that. identify runs as its
 own call and is checked; cut_out then runs WITHOUT a passed concept,
 so its internal planning step supplies the concept AND the alternates
 the bounded mask-recovery loop retries with. (First version of this
@@ -61,7 +67,7 @@ os.environ["AGENTHAND_DATA_DIR"] = str(_GATE_DIR)
 from agenthand import composite, config, server  # noqa: E402
 from agenthand.assets import AssetStore  # noqa: E402
 
-DEFAULT_PHOTO = REPO / "data" / "assets" / "e3f0428fbc5e43c7826959a9eecbda50.png"
+DEFAULT_PHOTO = REPO / "tests" / "fixtures" / "chair_photo.jpg"
 DEFAULT_SCENE = "a regal, warmly lit reading room"
 PER_RUN_PROJECTION_USD = 0.0246 * 2 + 0.0050 + 0.0100  # 2x identify + SAM + draw
 
