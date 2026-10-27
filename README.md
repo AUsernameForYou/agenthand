@@ -1,5 +1,9 @@
 # agenthand
 
+<p align="center">
+  <img src="assets/logo-rotating.gif" alt="agenthand logo: a robot hand presenting three rotating arcs, framed by registration brackets" width="420">
+</p>
+
 An MCP server for AI agents that help people sell things.
 
 The seller never opens agenthand. Their agent calls it. A seller hands their
