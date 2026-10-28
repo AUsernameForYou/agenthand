@@ -96,6 +96,47 @@ def test_draw_product_uses_mask_asset_when_chained(tmp_path):
     assert receipt["mask_asset"] is not None
 
 
+def test_draw_rejects_foreground_chained_through_a_composite(tmp_path):
+    # The architecture Gauntlet's reproduced attack: draw a product
+    # into a scene, then cut a "foreground" out of the GENERATED
+    # composite and draw that. The second receipt would name the
+    # original photo as source while protecting generated plate
+    # pixels. Any generated asset anywhere in the ancestry refuses.
+    store, photo, fg = _store_with_foreground(tmp_path)
+    composite_handle, _ = composite.draw_product(store, fg, "a regal room")
+    fg2 = store.put_image(
+        _foreground(),
+        kind="foreground_png",
+        source_asset_id=AssetStore.parse_handle(composite_handle),
+    )
+    with pytest.raises(composite.FidelityLockError):
+        composite.draw_product(store, fg2, "another room")
+
+
+def test_draw_rejects_foreground_with_an_overlay_in_its_chain(tmp_path):
+    store = AssetStore(tmp_path)
+    photo = store.put_image(_photo(), kind="source_photo")
+    overlay = store.put_image(
+        _photo(),
+        kind="mask_overlay",
+        source_asset_id=AssetStore.parse_handle(photo),
+    )
+    fg = store.put_image(
+        _foreground(),
+        kind="foreground_png",
+        source_asset_id=AssetStore.parse_handle(overlay),
+    )
+    with pytest.raises(composite.FidelityLockError):
+        composite.draw_product(store, fg, "a regal room")
+
+
+def test_draw_rejects_a_foreground_with_no_parent(tmp_path):
+    store = AssetStore(tmp_path)
+    fg = store.put_image(_foreground(), kind="foreground_png")
+    with pytest.raises(composite.FidelityLockError):
+        composite.draw_product(store, fg, "a regal room")
+
+
 def test_draw_rejects_a_non_foreground_asset(tmp_path):
     store, photo, fg = _store_with_foreground(tmp_path)
     with pytest.raises(composite.FidelityLockError):

@@ -196,8 +196,17 @@ def validate_foreground(store: AssetStore, foreground_handle: str) -> list[Asset
     """Check an asset may be composited; returns its lineage chain.
 
     Raises FidelityLockError (or KeyError for an unknown handle) unless
-    the asset is a foreground_png whose lineage ends at a source_photo
+    the asset is a foreground_png whose ancestry is exactly
+    foreground -> source_photo, or foreground -> mask -> source_photo,
     and the stored bytes of both match their recorded hashes.
+
+    The chain SHAPE is the admission rule, not just its root: a
+    foreground cut out of a generated composite still traces back to
+    the original photo, but the pixels the receipt would protect are
+    partly model output. Any generated asset (composite, plate,
+    overlay) — or any extra link at all — anywhere in the ancestry
+    therefore refuses. (Architecture Gauntlet: GPT and Claude both
+    reproduced draw -> cut_out(composite) -> draw returning ok.)
     """
     record = store.get_record(foreground_handle)
     if record.kind != KIND_FOREGROUND:
@@ -207,13 +216,18 @@ def validate_foreground(store: AssetStore, foreground_handle: str) -> list[Asset
             "Compositing anything else would break the Fidelity Lock."
         )
     chain = store.lineage(foreground_handle)
-    source_record = chain[-1]
-    if source_record.kind != KIND_SOURCE:
+    ancestry = chain[1:]
+    if ancestry and ancestry[0].kind == KIND_MASK:
+        ancestry = ancestry[1:]
+    if len(ancestry) != 1 or ancestry[0].kind != KIND_SOURCE:
+        kinds = " -> ".join(r.kind for r in chain)
         raise FidelityLockError(
-            f"Foreground {foreground_handle!r} traces back to kind "
-            f"{source_record.kind!r}, not a {KIND_SOURCE}. Its provenance "
-            "cannot be verified, so it cannot be composited."
+            f"Foreground {foreground_handle!r} has ancestry {kinds}; "
+            "draw only accepts a foreground cut directly from a "
+            f"{KIND_SOURCE} (through its stored {KIND_MASK} when one "
+            "exists). Generated pixels cannot enter the protected layer."
         )
+    source_record = chain[-1]
     # The stored bytes must be exactly what was recorded. Raises on mismatch.
     store.verify_integrity(foreground_handle)
     if source_record.asset_id != record.asset_id:

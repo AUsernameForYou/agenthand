@@ -348,3 +348,24 @@ demanded the receipt stop grading itself. Landed, all server-side:
 - Not server-side, left for their owners: item 1 (real product photo
   runs — Daniel's fixture), item 7 (offline replay freeze —
   production), item 9 (copy locks — site/film).
+
+## Architecture review Gauntlet fixes (2026-10-27)
+
+The four-lane architecture review (verdict in
+~/workspace/meta-hackathon/gauntlet-archreview/VERDICT.md) came back
+3 NOT CLEAN / 1 CLEAN WITH NOTES; the fixes land stage by stage.
+
+- Fix 1 — fidelity admission + mask pin. draw now admits only the
+  chain shapes foreground -> source_photo and foreground -> mask ->
+  source_photo: GPT and Claude both reproduced draw ->
+  cut_out(composite) -> draw returning ok with generated plate
+  pixels inside the protected layer and the receipt naming the
+  original photo. cut_out refuses any non-source input up front
+  (NOT_A_SOURCE_PHOTO, before planning and billing), and storage is
+  now a chain — mask parented to the source, foreground parented to
+  the mask — so the draw receipt pins the real mask asset (production
+  receipts previously said mask_asset: null because mask and
+  foreground were siblings). New tests: the production chain through
+  the real server tools (receipt mask hashes == stored mask record),
+  the composite-handle refusal, and chain-shape refusals in
+  composite. Suite: 188 pass.

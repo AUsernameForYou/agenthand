@@ -145,8 +145,11 @@ def test_cut_out_success_with_provided_concept(monkeypatch):
     mask = store.get_record(result["mask_asset"])
     assert foreground.kind == "foreground_png"
     assert mask.kind == "mask_png"
-    assert foreground.source_asset_id == source.asset_id
+    # The lineage is a chain, not siblings: the mask hangs off the
+    # source photo and the foreground hangs off the mask, so draw's
+    # receipt can pin the exact mask asset this cut used.
     assert mask.source_asset_id == source.asset_id
+    assert foreground.source_asset_id == mask.asset_id
     assert result["hashes"]["source"]["sha256"] == source.sha256
     assert result["hashes"]["foreground"]["sha256"] == foreground.sha256
     assert result["hashes"]["foreground"]["pixel_sha256"] == foreground.pixel_sha256
@@ -325,6 +328,64 @@ def test_cut_out_without_concept_or_key_reports_the_plan_failure(monkeypatch):
     assert result["error"]["code"] == "NOT_CONFIGURED"
     assert result["plan_error"]["code"] == "NOT_CONFIGURED"
     assert _records() == []
+
+
+# -- the production chain, end to end (architecture Gauntlet fix 1) -------
+
+
+def test_production_chain_draw_receipt_pins_the_stored_mask(monkeypatch):
+    # The real server tools, in the order a listing is produced:
+    # cut_out (fake SAM) then draw (placeholder plate, the explicit
+    # offline flag). The draw receipt must pin the SAME mask asset
+    # cut_out stored — production receipts said mask_asset: null
+    # before this fix because mask and foreground were siblings.
+    from agenthand import composite
+
+    monkeypatch.setenv("AGENTHAND_DRAW_PLACEHOLDER_PLATE", "1")
+    _install_fake(
+        monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)])
+    )
+    cut = server.cut_out(_photo_uri(), "brown leather wallet")
+    assert cut["status"] == "ok"
+
+    out = server.draw(cut["output_asset"], "a regal, warmly lit reading room")
+    result, _preview = out
+    assert result["status"] == "ok"
+    receipt = result["fidelity_receipt"]
+
+    store = AssetStore(config.get_data_dir())
+    mask_record = store.get_record(cut["mask_asset"])
+    assert receipt["mask_source"] == "asset"
+    assert receipt["mask_asset"] == cut["mask_asset"]
+    assert receipt["mask_sha256"] == mask_record.sha256
+    assert receipt["mask_pixel_sha256"] == mask_record.pixel_sha256
+    assert receipt["source_asset"] == cut["image"]
+    assert receipt["changed_opaque_pixels"] == 0
+
+    report = composite.verify_receipt_from_disk(store, result["output_asset"])
+    assert report["ok"] is True, report["problems"]
+
+
+def test_cut_out_refuses_a_composite_handle(monkeypatch):
+    # draw -> cut_out(composite) must refuse before any billing: the
+    # composite's pixels are partly generated, and cutting them out
+    # would launder them into a "foreground" chained to the photo.
+    monkeypatch.setenv("AGENTHAND_DRAW_PLACEHOLDER_PLATE", "1")
+    client = _install_fake(
+        monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)])
+    )
+    cut = server.cut_out(_photo_uri(), "brown leather wallet")
+    assert cut["status"] == "ok"
+    drawn, _preview = server.draw(cut["output_asset"], "a regal room")
+    composite_handle = drawn["output_asset"]
+
+    result = server.cut_out(composite_handle, "brown leather wallet")
+    assert result["status"] == "error"
+    assert result["error"]["code"] == "NOT_A_SOURCE_PHOTO"
+    assert result["output_asset"] is None
+    # No second SAM call, no second cut_out reservation.
+    assert len(client.responses.calls) == 1
+    assert [r["phase"] for r in _records("cut_out")] == ["pending", "settled"]
 
 
 def test_cut_out_refuses_over_cap_before_any_api_call(monkeypatch):

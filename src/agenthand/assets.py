@@ -27,7 +27,10 @@ detectable and counts as a fidelity failure in the draw receipt.
 
 Lineage: each record names the asset it was derived from
 (``source_asset_id``), forming a chain back to a source photo. The draw
-tool refuses a foreground whose chain does not end at a source photo.
+tool refuses a foreground whose chain is anything other than
+foreground -> source_photo or foreground -> mask -> source_photo: a
+generated asset anywhere in the ancestry would put model pixels
+inside the layer the Fidelity Lock protects.
 """
 
 from __future__ import annotations

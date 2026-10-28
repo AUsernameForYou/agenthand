@@ -75,6 +75,7 @@ from .assets import (
     KIND_FOREGROUND,
     KIND_MASK,
     KIND_OVERLAY,
+    KIND_SOURCE,
     AssetStore,
 )
 
@@ -342,9 +343,14 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     frame) and dominated by one connected region — and on a zero-match
     or a poor mask the loop retries ONCE with the first alternate
     phrase; every attempt is traced in the result. The foreground is
-    the source pixels through the accepted mask, nothing regenerated;
-    foreground and mask are stored with their hashes and lineage to the
-    source photo. Because a fidelity receipt can only vouch for the
+    the source pixels through the accepted mask, nothing regenerated.
+    Storage is a lineage chain — mask parented to the source photo,
+    foreground parented to the mask — so draw's fidelity receipt pins
+    the exact mask asset the cut used. The input must be a source
+    photo: handing cut_out a generated asset (a composite, a plate)
+    is refused with NOT_A_SOURCE_PHOTO before any billing, because
+    cutting generated pixels out would launder them into a protected
+    foreground. Because a fidelity receipt can only vouch for the
     pixels a mask selected, the result also carries the selection's own
     review surface: mask_overlay_asset (the source photo with the
     mask's outline drawn on it) and mask_review (the mask's bounding
@@ -361,6 +367,36 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     store = _store()
     handle = ingest.ingest(image, store)
     source_record = store.get_record(handle)
+    if source_record.kind != KIND_SOURCE:
+        # Fidelity admission (architecture Gauntlet fix 1): ingest
+        # passes an existing handle through unchanged, whatever its
+        # kind — so without this check a caller could hand cut_out a
+        # generated composite and get its plate pixels back as a
+        # "foreground" chained to the original photo, ready for draw
+        # to protect them. A cut-out is only meaningful from a real
+        # source photo. Refused before planning and before billing.
+        return {
+            "status": "error",
+            "tool": "cut_out",
+            "image": handle,
+            "concept": concept,
+            "concept_source": "provided"
+            if concept is not None
+            else "identify_internal",
+            "alternates": [],
+            "plan_error": None,
+            "output_asset": None,
+            "mask_asset": None,
+            "model": CUT_OUT_MODEL,
+            "error": {
+                "code": "NOT_A_SOURCE_PHOTO",
+                "message": (
+                    f"cut_out needs a source photo; this asset is a "
+                    f"{source_record.kind}. Generated images cannot be "
+                    "cut out as though they were photos of the product."
+                ),
+            },
+        }
     store.verify_integrity(handle)
     source_image = store.read_image(handle)
 
@@ -444,13 +480,19 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         source_asset_id=source_record.asset_id,
     )
     foreground = segmentation.extract_foreground(source_image, outcome["mask_image"])
+    # The lineage is a chain: mask parented to the source photo,
+    # foreground parented to the mask. draw walks the foreground's
+    # ancestry for the mask, so this shape is what lets the fidelity
+    # receipt pin the exact mask asset this cut used (before the
+    # architecture Gauntlet fix, mask and foreground were siblings
+    # and every production receipt said mask_asset: null).
+    mask_record = store.get_record(mask_handle)
     foreground_handle = store.put_image(
         foreground,
         kind=KIND_FOREGROUND,
-        source_asset_id=source_record.asset_id,
+        source_asset_id=mask_record.asset_id,
     )
     foreground_record = store.get_record(foreground_handle)
-    mask_record = store.get_record(mask_handle)
 
     # The mask-correctness gate (J2 Gauntlet item 6): a receipt can
     # only prove the selected pixels survived, so the selection itself
@@ -589,9 +631,8 @@ def _plan_cut(store: AssetStore, handle: str) -> dict:
     cut_out calls this when no concept is supplied, so the plan is
     produced inside the chain instead of by a separate tool call. An
     expected identify failure (not configured, unusable response)
-    degrades to an empty plan with the error attached: cut_out's own
-    segmentation step is still stubbed, so the chain reports the
-    planning gap in its result instead of crashing.
+    degrades to an empty plan with the error attached, so the chain
+    reports the planning gap in its result instead of crashing.
     """
     result = _run_identify(store, handle)
     if "error" in result:
