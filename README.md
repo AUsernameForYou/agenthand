@@ -1,5 +1,7 @@
 # agenthand
 
+<!-- mcp-name: io.github.AUsernameForYou/agenthand -->
+
 <p align="center">
   <img src="assets/logo-rotating-v2.gif" alt="agenthand logo: a robot hand presenting three rotating arcs, framed by registration brackets" width="420">
 </p>

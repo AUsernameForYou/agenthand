@@ -5,4 +5,4 @@ asset handles (asset://<id>) instead of image bytes, every call writes a
 cost receipt, and billable spend is fail-closed behind a hard cap.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
