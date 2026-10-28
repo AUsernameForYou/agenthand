@@ -28,6 +28,7 @@ offline with zero API calls.
 from __future__ import annotations
 
 import hashlib
+import re
 from io import BytesIO
 
 import cv2
@@ -55,6 +56,21 @@ from .assets import (
 # threshold is named in every receipt so the claim's terms are pinned,
 # not implied.
 OPAQUE_ALPHA_THRESHOLD = 255
+
+# The receipt contract (badass Gauntlet, converged item 1): the only
+# terms under which a fidelity receipt is measured and graded. A
+# receipt that states looser terms (a lower alpha threshold, a
+# nonzero pixel tolerance, an invented count sample) is not a receipt
+# for a weaker claim — it is an invalid receipt, and verification
+# fails on its terms before any pixel is recounted.
+PIXEL_TOLERANCE = 0
+COUNT_SAMPLE = "decoded_delivered_file"
+
+# Receipt schema marker, stamped by draw_product. Receipts without it
+# are the historical v1 shape (the frozen 2026-10-26 replay package
+# is the live example) and are graded under the compatibility policy
+# documented in _validate_receipt.
+RECEIPT_SCHEMA_VERSION = 2
 
 
 class FidelityLockError(RuntimeError):
@@ -294,6 +310,19 @@ def draw_product(
         plate_pixel_sha256 = None
 
     composite, _in_memory_counts, transformations = composite_images(foreground, plate)
+    if _in_memory_counts["opaque_pixels"] == 0:
+        # Draw and verify share one contract (badass Gauntlet defect
+        # 4): the verifier refuses a receipt covering zero opaque
+        # pixels, so draw must refuse too — a "successful" draw whose
+        # receipt cannot pass verification is a contradiction, and
+        # the place to stop it is here, before anything is stored.
+        raise FidelityLockError(
+            "the foreground has no fully opaque pixels (alpha "
+            f"{OPAQUE_ALPHA_THRESHOLD}); a Fidelity Lock receipt "
+            "would cover zero product pixels and the verifier "
+            "refuses such receipts. Draw refuses under the same "
+            "contract instead of issuing a receipt that cannot pass."
+        )
     composite_handle = store.put_image(
         composite, kind=KIND_COMPOSITE, source_asset_id=record.asset_id
     )
@@ -318,6 +347,7 @@ def draw_product(
     )
 
     receipt = {
+        "receipt_schema": RECEIPT_SCHEMA_VERSION,
         "source_asset": HANDLE_PREFIX + source_record.asset_id,
         "source_sha256": source_record.sha256,
         "source_pixel_sha256": source_record.pixel_sha256,
@@ -345,8 +375,8 @@ def draw_product(
             "and are published above as edge_band_pixels and "
             "edge_band_max_width_px"
         ),
-        "pixel_tolerance": 0,
-        "count_sample": "decoded_delivered_file",
+        "pixel_tolerance": PIXEL_TOLERANCE,
+        "count_sample": COUNT_SAMPLE,
         "output_asset": composite_handle,
         "output_sha256": composite_record.sha256,
         "output_pixel_sha256": composite_record.pixel_sha256,
@@ -382,6 +412,205 @@ def draw_product(
     # billing settles (see server.draw).
     store.save_receipt(composite_handle, receipt)
     return composite_handle, receipt
+
+
+_HEX64_RE = re.compile(r"[0-9a-f]{64}")
+
+
+def _is_hex64(value: object) -> bool:
+    return isinstance(value, str) and _HEX64_RE.fullmatch(value) is not None
+
+
+def _is_handle(value: object) -> bool:
+    return isinstance(value, str) and value.startswith(HANDLE_PREFIX)
+
+
+def _is_int(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_count(value: object) -> bool:
+    return _is_int(value) and value >= 0
+
+
+def _is_fraction(value: object) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and 0.0 <= float(value) <= 1.0
+    )
+
+
+def _is_hash_or_none(value: object) -> bool:
+    return value is None or _is_hex64(value)
+
+
+# Fields every receipt must carry, whatever its schema version: the
+# grader reads exactly these, so each one is shape-checked before
+# use. Extra fields (billing, attribution) are ignored, never read.
+_RECEIPT_FIELDS_ANY_SCHEMA = {
+    "source_asset": _is_handle,
+    "foreground_asset": _is_handle,
+    "output_asset": _is_handle,
+    "source_sha256": _is_hex64,
+    "source_pixel_sha256": _is_hex64,
+    "foreground_sha256": _is_hex64,
+    "foreground_pixel_sha256": _is_hex64,
+    "output_sha256": _is_hex64,
+    "output_pixel_sha256": _is_hex64,
+    "changed_opaque_pixels": _is_count,
+    "opaque_pixels": _is_count,
+    "edge_band_pixels": _is_count,
+    "transparent_pixels": _is_count,
+    "mask_pixels_total": _is_count,
+    "edge_band_max_width_px": _is_count,
+    "opaque_fraction": _is_fraction,
+    "color_profile_source_sha256": _is_hash_or_none,
+    "color_profile_output_sha256": _is_hash_or_none,
+    "color_profile_preserved": lambda v: isinstance(v, bool),
+}
+
+# Additional fields the current schema requires. v1 receipts predate
+# them; see the compatibility policy in _validate_receipt.
+_RECEIPT_FIELDS_V2 = {
+    "color_profile_foreground_sha256": _is_hash_or_none,
+    "mask_asset": lambda v: v is None or _is_handle(v),
+    "mask_sha256": _is_hex64,
+    "mask_pixel_sha256": _is_hex64,
+    "mask_source": lambda v: v in ("asset", "foreground_alpha"),
+    "opaque_alpha_threshold": _is_int,
+    "pixel_tolerance": _is_int,
+    "count_sample": lambda v: isinstance(v, str),
+    # Claim invariants, not decoration: the product layer is never
+    # scaled and the delivered file is a PNG. A receipt stating
+    # otherwise is not a receipt draw could have issued.
+    "product_layer_scaled": lambda v: v is False,
+    "output_format": lambda v: v == "PNG",
+}
+
+# Fields that exist only in the current schema (used by the
+# downgrade guard in _validate_receipt). mask_asset is excluded: v1
+# receipts name the mask asset too, they just do not pin its hashes.
+_V2_ONLY_FIELDS = frozenset(_RECEIPT_FIELDS_V2) - {"mask_asset"}
+
+# The contract terms, by field: a receipt is graded ONLY under these.
+_RECEIPT_TERMS = {
+    "opaque_alpha_threshold": OPAQUE_ALPHA_THRESHOLD,
+    "pixel_tolerance": PIXEL_TOLERANCE,
+    "count_sample": COUNT_SAMPLE,
+}
+
+
+def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
+    """Shape and terms validation for a fidelity receipt.
+
+    Returns (shape_problems, term_problems); both empty means the
+    receipt is well-formed and states the contract terms. This is
+    the fail-closed front door of verify_receipt_from_disk: a
+    truncated, nulled, or retyped receipt is an INVALID receipt (a
+    structured failure), never an exception, and never an excuse to
+    grade under weaker rules. (The badass Gauntlet reproduced the
+    pre-hardening behaviour three times over: dropping any of
+    several fields raised KeyError, a nulled opaque_fraction raised
+    TypeError, and loosened term fields were accepted as
+    decoration.)
+
+    Compatibility policy for historical receipts: a receipt stamped
+    with the current schema version must carry every contract field.
+    A receipt with NO schema marker is the v1 shape issued before
+    the contract fields existed (the frozen 2026-10-26 replay
+    receipt is the live example): it is graded on the fields it
+    carries, which the grader recounts from disk under the contract
+    terms regardless. A v1 receipt that DOES state term fields is
+    held to them exactly — the policy covers silence, never a
+    loosened statement. Any other schema marker fails closed.
+    """
+    shape: list[str] = []
+    terms: list[str] = []
+    if not isinstance(receipt, dict):
+        return (
+            [f"receipt is a {type(receipt).__name__}, not a JSON object"],
+            terms,
+        )
+    schema = receipt.get("receipt_schema")
+    strict = type(schema) is int and schema == RECEIPT_SCHEMA_VERSION
+    if schema is not None and not strict:
+        shape.append(
+            f"unsupported receipt_schema {schema!r}; this verifier "
+            f"grades schema {RECEIPT_SCHEMA_VERSION} receipts and "
+            "unmarked v1 receipts"
+        )
+    if not strict and any(name in receipt for name in _V2_ONLY_FIELDS):
+        # Downgrade guard: dropping or nulling the schema marker of
+        # a current receipt must not buy it the legacy policy. A
+        # genuine v1 receipt carries none of the v2-only fields
+        # (mask_asset is NOT one of them: v1 receipts name the mask
+        # asset, they just do not pin its hashes).
+        shape.append(
+            "receipt carries current-schema fields but no valid "
+            "receipt_schema marker; refusing to grade it under the "
+            "legacy v1 policy"
+        )
+    fields = dict(_RECEIPT_FIELDS_ANY_SCHEMA)
+    if strict:
+        fields.update(_RECEIPT_FIELDS_V2)
+    for name, valid in fields.items():
+        if name not in receipt:
+            shape.append(f"missing field: {name}")
+        elif not valid(receipt[name]):
+            shape.append(
+                f"field {name} has the wrong type or shape: "
+                f"{receipt[name]!r}"
+            )
+    if shape:
+        return shape, terms
+    # Internal consistency of the stated counts: a receipt whose own
+    # numbers disagree with each other is forged or torn, whatever
+    # the files say.
+    if (
+        receipt["mask_pixels_total"]
+        != receipt["opaque_pixels"] + receipt["edge_band_pixels"]
+    ):
+        shape.append(
+            "mask_pixels_total != opaque_pixels + edge_band_pixels"
+        )
+    if receipt["changed_opaque_pixels"] > receipt["opaque_pixels"]:
+        shape.append("changed_opaque_pixels exceeds opaque_pixels")
+    total = receipt["mask_pixels_total"]
+    if total:
+        expected_fraction = round(receipt["opaque_pixels"] / total, 6)
+        if abs(float(receipt["opaque_fraction"]) - expected_fraction) > 1e-9:
+            shape.append(
+                "opaque_fraction disagrees with opaque_pixels / "
+                "mask_pixels_total"
+            )
+    elif float(receipt["opaque_fraction"]) != 0.0:
+        shape.append(
+            "opaque_fraction is nonzero while mask_pixels_total is 0"
+        )
+    if strict:
+        if receipt["mask_source"] == "asset" and receipt["mask_asset"] is None:
+            shape.append("mask_source is 'asset' but mask_asset is null")
+        if (
+            receipt["mask_source"] == "foreground_alpha"
+            and receipt["mask_asset"] is not None
+        ):
+            shape.append(
+                "mask_source is 'foreground_alpha' but mask_asset is set"
+            )
+    # Stated terms are law in every schema: present term fields must
+    # equal the contract exactly; the current schema must state them.
+    for name, expected in _RECEIPT_TERMS.items():
+        if name in receipt:
+            if receipt[name] != expected or isinstance(receipt[name], bool):
+                terms.append(
+                    f"{name} is {receipt[name]!r}; the contract term "
+                    f"is {expected!r} and receipts are graded only "
+                    "under it"
+                )
+        elif strict:
+            terms.append(f"missing term field: {name}")
+    return shape, terms
 
 
 def verify_receipt_from_disk(
@@ -423,6 +652,16 @@ def verify_receipt_from_disk(
     opaque pixels (a receipt honestly reporting a change must fail),
     and positive opaque coverage (a receipt covering no product
     pixels vouches for nothing). Architecture Gauntlet fix 2.
+
+    The receipt itself is never trusted and never crashes the check
+    (badass Gauntlet, converged item 1): its shape and stated terms
+    are validated first (_validate_receipt), the mask FILE is
+    re-hashed against its record like every other file, and every
+    failure the receipt's content can cause — missing, nulled, or
+    retyped fields, loosened terms, handles naming assets that do
+    not exist, undecodable files — returns as a failed check in the
+    report. Only the caller's own composite handle may raise
+    KeyError, as documented above.
     """
     if receipt is None:
         receipt = store.load_receipt(composite_handle)
@@ -433,28 +672,76 @@ def verify_receipt_from_disk(
             )
     checks: dict[str, bool] = {}
     problems: list[str] = []
+    recomputed: dict = {}
 
     def check(name: str, ok: bool, detail: str = "") -> None:
         checks[name] = bool(ok)
         if not ok:
             problems.append(f"{name}: {detail}" if detail else name)
 
+    def report() -> dict:
+        return {
+            "ok": all(checks.values()),
+            "checks": checks,
+            "problems": problems,
+            "recomputed": recomputed,
+            "composite_asset": composite_handle,
+            "foreground_asset": (
+                receipt.get("foreground_asset")
+                if isinstance(receipt, dict)
+                else None
+            ),
+            "source_asset": (
+                receipt.get("source_asset") if isinstance(receipt, dict) else None
+            ),
+        }
+
+    # 0. The receipt's shape and terms, before anything is read from
+    #    it: malformed content fails here, structurally.
+    shape_problems, term_problems = _validate_receipt(receipt)
+    check("receipt_shape", not shape_problems, "; ".join(shape_problems))
+    check("receipt_terms", not term_problems, "; ".join(term_problems))
+    if shape_problems or term_problems:
+        return report()
+
     composite_record = store.get_record(composite_handle)
     foreground_handle = receipt["foreground_asset"]
     source_handle = receipt["source_asset"]
 
-    # 1. Every stored file must still match the hashes recorded for it
-    #    (file bytes, decoded pixels, colour profile). This is the
-    #    tripwire for a tampered output file.
+    # The assets the RECEIPT names must exist: a receipt pointing at
+    # nothing is a failed receipt, not an exception.
+    records: dict[str, AssetRecord] = {}
     for label, handle in (
         ("source", source_handle),
         ("foreground", foreground_handle),
-        ("composite", composite_handle),
     ):
+        try:
+            records[label] = store.get_record(handle)
+            check(f"{label}_asset_resolves", True)
+        except (KeyError, ValueError) as exc:
+            check(f"{label}_asset_resolves", False, str(exc))
+    if len(records) != 2:
+        return report()
+    source_record = records["source"]
+    foreground_record = records["foreground"]
+
+    # 1. Every stored file must still match the hashes recorded for it
+    #    (file bytes, decoded pixels, colour profile) — the mask file
+    #    included. Before this pass the mask's pinned hashes were
+    #    compared against the mask's RECORD only, so a swapped mask
+    #    file still verified (badass Gauntlet defect 2, GPT).
+    integrity_targets = [
+        ("source", source_handle),
+        ("foreground", foreground_handle),
+        ("composite", composite_handle),
+    ]
+    if receipt.get("mask_asset"):
+        integrity_targets.append(("mask", receipt["mask_asset"]))
+    for label, handle in integrity_targets:
         try:
             store.verify_integrity(handle)
             check(f"{label}_file_integrity", True)
-        except (AssetIntegrityError, KeyError) as exc:
+        except (AssetIntegrityError, KeyError, ValueError) as exc:
             check(f"{label}_file_integrity", False, str(exc))
 
     # 1b. The receipt's own hashes must name THESE files. Step 1 only
@@ -463,8 +750,6 @@ def verify_receipt_from_disk(
     #     whenever the numbers happen to reproduce, and a receipt
     #     whose output hash was edited still passes (architecture
     #     Gauntlet: Claude, GPT, Fable each reproduced a variant).
-    source_record = store.get_record(source_handle)
-    foreground_record = store.get_record(foreground_handle)
     check(
         "source_hash_matches_receipt",
         receipt.get("source_sha256") == source_record.sha256
@@ -480,6 +765,16 @@ def verify_receipt_from_disk(
         "the receipt's foreground hashes do not match the foreground "
         "asset's recorded hashes",
     )
+    if "color_profile_foreground_sha256" in receipt:
+        # The receipt pins the foreground's colour profile too (v2);
+        # grade the pin, do not just carry it. Absent in v1 receipts.
+        check(
+            "foreground_profile_matches_receipt",
+            receipt.get("color_profile_foreground_sha256")
+            == foreground_record.color_profile_sha256,
+            "the receipt's foreground profile hash does not match "
+            "the foreground asset's recorded profile",
+        )
     check(
         "output_hash_matches_receipt",
         receipt.get("output_asset") == composite_handle
@@ -510,114 +805,126 @@ def verify_receipt_from_disk(
             # package's receipt is the live example; its manifest pins
             # every file's bytes instead). The strongest check
             # available is the mask file's integrity against its own
-            # asset record. Receipts draw issues today always pin the
-            # mask hashes and take the strict branch above.
-            try:
-                store.verify_integrity(receipt["mask_asset"])
-                check("mask_asset_integrity", True)
-            except (AssetIntegrityError, KeyError) as exc:
-                check("mask_asset_integrity", False, str(exc))
-
-    # 2. Decode the foreground and the delivered composite fresh from
-    #    disk and recount — the receipt's numbers must reproduce.
-    foreground = store.read_image(foreground_handle)
-    composite_image = store.read_image(composite_handle)
-    check(
-        "foreground_pixel_hash",
-        pixel_hash_of_image(foreground) == receipt["foreground_pixel_sha256"],
-        "decoded foreground pixels do not match the receipt's pinned hash",
-    )
-    check(
-        "composite_pixel_hash",
-        pixel_hash_of_image(composite_image) == composite_record.pixel_sha256,
-        "decoded composite pixels do not match the stored asset record",
-    )
-    recomputed: dict = {}
-    if foreground.size != composite_image.size:
-        check(
-            "recount",
-            False,
-            f"foreground is {foreground.size}, composite is "
-            f"{composite_image.size}; sizes must match exactly",
-        )
-    else:
-        counts = _measure(foreground, composite_image)
-        recomputed.update(counts)
-        for field in (
-            "changed_opaque_pixels",
-            "opaque_pixels",
-            "edge_band_pixels",
-            "transparent_pixels",
-            "mask_pixels_total",
-            "edge_band_max_width_px",
-        ):
+            # asset record — already run as mask_file_integrity in
+            # step 1 — so this check mirrors that verdict. Receipts
+            # draw issues today always pin the mask hashes and take
+            # the strict branch above.
             check(
-                f"recount_{field}",
-                counts[field] == receipt[field],
-                f"receipt says {receipt[field]}, recount from disk "
-                f"finds {counts[field]}",
+                "mask_asset_integrity",
+                checks.get("mask_file_integrity", False),
+                "the mask file does not match its asset record",
             )
+
+    # 2. Decode the stored files fresh from disk and recount — the
+    #    receipt's numbers must reproduce. A file that cannot be
+    #    decoded is a failed verification, not a crash: the integrity
+    #    checks above have usually already named the cause.
+    decoded: tuple[Image.Image, Image.Image, Image.Image] | None = None
+    try:
+        decoded = (
+            store.read_image(foreground_handle),
+            store.read_image(composite_handle),
+            store.read_image(source_handle),
+        )
+        check("files_decodable", True)
+    except Exception as exc:  # noqa: BLE001 - a verifier boundary:
+        # any decode failure (corrupt bytes, missing file, unsupported
+        # encoding) is evidence against the receipt, reported as such.
+        check("files_decodable", False, f"{type(exc).__name__}: {exc}")
+    if decoded is not None:
+        foreground, composite_image, source_image = decoded
         check(
-            "recount_opaque_fraction",
-            abs(counts["opaque_fraction"] - receipt["opaque_fraction"]) < 1e-9,
-            f"receipt says {receipt['opaque_fraction']}, recount from "
-            f"disk finds {counts['opaque_fraction']}",
+            "foreground_pixel_hash",
+            pixel_hash_of_image(foreground)
+            == receipt["foreground_pixel_sha256"],
+            "decoded foreground pixels do not match the receipt's "
+            "pinned hash",
+        )
+        check(
+            "composite_pixel_hash",
+            pixel_hash_of_image(composite_image)
+            == composite_record.pixel_sha256,
+            "decoded composite pixels do not match the stored asset "
+            "record",
+        )
+        if foreground.size != composite_image.size:
+            check(
+                "recount",
+                False,
+                f"foreground is {foreground.size}, composite is "
+                f"{composite_image.size}; sizes must match exactly",
+            )
+        else:
+            counts = _measure(foreground, composite_image)
+            recomputed.update(counts)
+            for field in (
+                "changed_opaque_pixels",
+                "opaque_pixels",
+                "edge_band_pixels",
+                "transparent_pixels",
+                "mask_pixels_total",
+                "edge_band_max_width_px",
+            ):
+                check(
+                    f"recount_{field}",
+                    counts[field] == receipt[field],
+                    f"receipt says {receipt[field]}, recount from disk "
+                    f"finds {counts[field]}",
+                )
+            check(
+                "recount_opaque_fraction",
+                abs(counts["opaque_fraction"] - receipt["opaque_fraction"])
+                < 1e-9,
+                f"receipt says {receipt['opaque_fraction']}, recount "
+                f"from disk finds {counts['opaque_fraction']}",
+            )
+
+        # 2b. The verdict itself, stated as checks rather than
+        #     implied by agreement: a pass requires ZERO changed
+        #     pixels — an honest receipt reporting a real change
+        #     reproduces perfectly under the recount checks above and
+        #     must still fail — and POSITIVE coverage, because a
+        #     receipt covering no opaque pixels vouches for nothing
+        #     (architecture Gauntlet, GPT + Claude).
+        check(
+            "zero_changed_pixels",
+            recomputed.get("changed_opaque_pixels") == 0
+            and receipt.get("changed_opaque_pixels") == 0,
+            f"changed opaque pixels: receipt says "
+            f"{receipt.get('changed_opaque_pixels')}, recount from "
+            f"disk finds {recomputed.get('changed_opaque_pixels')}; "
+            "the Fidelity Lock claim requires exactly 0",
+        )
+        check(
+            "positive_coverage",
+            (recomputed.get("opaque_pixels") or 0) > 0
+            and (receipt.get("opaque_pixels") or 0) > 0,
+            "the receipt covers 0 fully opaque foreground pixels; "
+            "there is no product evidence to verify",
         )
 
-    # 2b. The verdict itself, stated as checks rather than implied by
-    #     agreement: a pass requires ZERO changed pixels — an honest
-    #     receipt reporting a real change reproduces perfectly under
-    #     the recount checks above and must still fail — and POSITIVE
-    #     coverage, because a receipt covering no opaque pixels
-    #     vouches for nothing (architecture Gauntlet, GPT + Claude).
-    check(
-        "zero_changed_pixels",
-        recomputed.get("changed_opaque_pixels") == 0
-        and receipt.get("changed_opaque_pixels") == 0,
-        f"changed opaque pixels: receipt says "
-        f"{receipt.get('changed_opaque_pixels')}, recount from disk "
-        f"finds {recomputed.get('changed_opaque_pixels')}; the "
-        "Fidelity Lock claim requires exactly 0",
-    )
-    check(
-        "positive_coverage",
-        (recomputed.get("opaque_pixels") or 0) > 0
-        and (receipt.get("opaque_pixels") or 0) > 0,
-        "the receipt covers 0 fully opaque foreground pixels; there "
-        "is no product evidence to verify",
-    )
+        # 3. Colour-profile identity, re-derived from the files: the
+        #    profile the receipt names must be the profile in the
+        #    files, and source and output profiles must be identical.
+        source_profile = color_profile_sha256_of_image(source_image)
+        output_profile = color_profile_sha256_of_image(composite_image)
+        recomputed["color_profile_source_sha256"] = source_profile
+        recomputed["color_profile_output_sha256"] = output_profile
+        check(
+            "color_profile_matches_receipt",
+            source_profile == receipt["color_profile_source_sha256"]
+            and output_profile == receipt["color_profile_output_sha256"],
+            "profiles decoded from the files differ from the "
+            "receipt's recorded profile hashes",
+        )
+        preserved = source_profile == output_profile
+        recomputed["color_profile_preserved"] = preserved
+        check(
+            "color_profile_preserved",
+            preserved and receipt["color_profile_preserved"] is True,
+            "the delivered composite's colour profile differs from "
+            "the source photo's; identical pixel values would "
+            "display as different colours",
+        )
 
-    # 3. Colour-profile identity, re-derived from the files: the
-    #    profile the receipt names must be the profile in the files,
-    #    and source and output profiles must be identical.
-    source_image = store.read_image(source_handle)
-    source_profile = color_profile_sha256_of_image(source_image)
-    output_profile = color_profile_sha256_of_image(composite_image)
-    recomputed["color_profile_source_sha256"] = source_profile
-    recomputed["color_profile_output_sha256"] = output_profile
-    check(
-        "color_profile_matches_receipt",
-        source_profile == receipt["color_profile_source_sha256"]
-        and output_profile == receipt["color_profile_output_sha256"],
-        "profiles decoded from the files differ from the receipt's "
-        "recorded profile hashes",
-    )
-    preserved = source_profile == output_profile
-    recomputed["color_profile_preserved"] = preserved
-    check(
-        "color_profile_preserved",
-        preserved and receipt["color_profile_preserved"] is True,
-        "the delivered composite's colour profile differs from the "
-        "source photo's; identical pixel values would display as "
-        "different colours",
-    )
-
-    return {
-        "ok": all(checks.values()),
-        "checks": checks,
-        "problems": problems,
-        "recomputed": recomputed,
-        "composite_asset": composite_handle,
-        "foreground_asset": foreground_handle,
-        "source_asset": source_handle,
-    }
+    return report()

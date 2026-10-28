@@ -17,6 +17,7 @@ byte-identical (the profile attack: values match, colours change).
 import hashlib
 from io import BytesIO
 
+import pytest
 from PIL import Image, ImageCms
 
 from agenthand import composite, segmentation, verify
@@ -400,9 +401,12 @@ def test_verify_receipt_from_disk_fails_on_an_edited_mask_hash(tmp_path):
     assert report["ok"] is False
 
 
-def test_verify_receipt_from_disk_fails_with_zero_opaque_coverage(tmp_path):
-    # A fully transparent foreground: nothing is covered, nothing can
-    # change, and a "pass" would vouch for zero product pixels.
+def test_draw_refuses_a_zero_opaque_foreground(tmp_path):
+    # Draw and verify share one contract (badass Gauntlet defect 4):
+    # a fully transparent foreground covers zero product pixels, the
+    # verifier refuses such receipts — so draw must refuse to issue
+    # one. Before the alignment, draw returned a success receipt for
+    # exactly this input and the verifier then rejected it.
     store = AssetStore(tmp_path)
     photo_handle = store.put_image(_pattern_photo(), kind="source_photo")
     empty_fg = Image.new("RGBA", (8, 6), (0, 0, 0, 0))
@@ -411,10 +415,35 @@ def test_verify_receipt_from_disk_fails_with_zero_opaque_coverage(tmp_path):
         kind="foreground_png",
         source_asset_id=AssetStore.parse_handle(photo_handle),
     )
-    handle, receipt = composite.draw_product(store, fg_handle, "a regal room")
-    assert receipt["opaque_pixels"] == 0
+    with pytest.raises(composite.FidelityLockError):
+        composite.draw_product(store, fg_handle, "a regal room")
 
-    report = composite.verify_receipt_from_disk(store, handle, receipt)
+
+def test_verify_receipt_from_disk_fails_with_zero_opaque_coverage(tmp_path):
+    # The verifier-side half of the same contract: a hand-forged
+    # zero-coverage receipt (draw will no longer issue one) whose
+    # counts honestly match the files must still fail, on the
+    # coverage check alone.
+    store, handle, receipt = _store_run(tmp_path)
+    empty_fg = Image.new("RGBA", (8, 6), (0, 0, 0, 0))
+    plate = Image.new("RGBA", (8, 6), (0, 0, 255, 255))
+    forged_final, counts, _t = composite.composite_images(empty_fg, plate)
+    assert counts["opaque_pixels"] == 0
+    bad_handle = store.put_image(
+        forged_final,
+        kind="composite",
+        source_asset_id=AssetStore.parse_handle(receipt["foreground_asset"]),
+    )
+    bad_record = store.get_record(bad_handle)
+    forged = dict(receipt)
+    forged.update(counts)
+    forged["output_asset"] = bad_handle
+    forged["output_sha256"] = bad_record.sha256
+    forged["output_pixel_sha256"] = bad_record.pixel_sha256
+    forged["color_profile_output_sha256"] = bad_record.color_profile_sha256
+    store.save_receipt(bad_handle, forged)
+
+    report = composite.verify_receipt_from_disk(store, bad_handle, forged)
     assert report["checks"]["positive_coverage"] is False
     assert report["ok"] is False
 
@@ -439,3 +468,146 @@ def test_verify_receipt_from_disk_fails_on_a_stripped_output_profile(tmp_path):
     assert report["ok"] is False
     assert report["checks"]["color_profile_preserved"] is False
     assert report["recomputed"]["color_profile_preserved"] is False
+
+
+# -- verify_receipt_from_disk: the badass Gauntlet contract defects -----
+# Reproduced by three lanes against the pre-hardening verifier:
+# malformed receipts raised KeyError/TypeError instead of failing,
+# a swapped mask FILE still verified (the pin was compared against
+# the mask's record, never the file), and loosened receipt terms
+# (threshold 254, tolerance 99, an invented count_sample) passed as
+# decoration. Each is now a structured failure.
+
+
+def _masked_store_run(tmp_path, *, profiled=False):
+    """A draw chained through its stored mask asset (production shape)."""
+    store = AssetStore(tmp_path)
+    photo = _pattern_photo()
+    if profiled:
+        photo.info["icc_profile"] = _profile_bytes()
+    photo_handle = store.put_image(photo, kind="source_photo")
+    mask_handle = store.put_image(
+        _block_mask(),
+        kind="mask_png",
+        source_asset_id=AssetStore.parse_handle(photo_handle),
+    )
+    foreground = segmentation.extract_foreground(photo, _block_mask())
+    fg_handle = store.put_image(
+        foreground,
+        kind="foreground_png",
+        source_asset_id=AssetStore.parse_handle(mask_handle),
+    )
+    handle, receipt = composite.draw_product(store, fg_handle, "a regal room")
+    assert receipt["mask_source"] == "asset"
+    return store, handle, receipt
+
+
+_CONTRACT_FIELDS = sorted(
+    set(composite._RECEIPT_FIELDS_ANY_SCHEMA)
+    | set(composite._RECEIPT_FIELDS_V2)
+    | {"receipt_schema"}
+)
+
+
+def test_malformed_receipts_fail_structured_never_raise(tmp_path):
+    # The receipt-shape strategy: drop, null, or retype EVERY
+    # contract field, one at a time. Each mutation must return a
+    # report with ok False — never an exception, never a pass.
+    # (Prose and attribution fields — claim, changed_predicate,
+    # plate info — are not graded and are out of scope by design.)
+    store, handle, receipt = _masked_store_run(tmp_path, profiled=True)
+    assert composite.verify_receipt_from_disk(store, handle, receipt)["ok"]
+
+    def retyped(value):
+        if isinstance(value, bool):
+            return "yes"
+        if isinstance(value, int):
+            return str(value)
+        if isinstance(value, float):
+            return "0.5"
+        if isinstance(value, str):
+            return 12345
+        if value is None:
+            return 0
+        return {"not": "a scalar"}
+
+    for field in _CONTRACT_FIELDS:
+        dropped = dict(receipt)
+        del dropped[field]
+        report = composite.verify_receipt_from_disk(store, handle, dropped)
+        assert report["ok"] is False, f"dropping {field} passed"
+        assert report["checks"]["receipt_shape"] is False, field
+
+        if receipt[field] is not None:
+            nulled = dict(receipt)
+            nulled[field] = None
+            report = composite.verify_receipt_from_disk(store, handle, nulled)
+            assert report["ok"] is False, f"nulling {field} passed"
+
+        retyped_receipt = dict(receipt)
+        retyped_receipt[field] = retyped(receipt[field])
+        report = composite.verify_receipt_from_disk(
+            store, handle, retyped_receipt
+        )
+        assert report["ok"] is False, f"retyping {field} passed"
+
+
+def test_verify_receipt_from_disk_rejects_non_dict_receipts(tmp_path):
+    store, handle, _receipt = _masked_store_run(tmp_path)
+    for bad in (["not", "a", "receipt"], "receipt", 42, 0.5, True):
+        report = composite.verify_receipt_from_disk(store, handle, bad)
+        assert report["ok"] is False
+        assert report["checks"]["receipt_shape"] is False
+
+
+def test_verify_receipt_from_disk_fails_on_a_swapped_mask_file(tmp_path):
+    # GPT's reproduction: replace the mask FILE with an all-zero
+    # mask of the same size. The record still says the original
+    # hashes — verification must re-hash the file and fail.
+    store, handle, receipt = _masked_store_run(tmp_path)
+    mask_path = store.resolve(receipt["mask_asset"])
+    Image.new("L", (8, 6), 0).save(mask_path, format="PNG")
+
+    report = composite.verify_receipt_from_disk(store, handle, receipt)
+    assert report["checks"]["mask_file_integrity"] is False
+    assert report["ok"] is False
+
+
+def test_verify_receipt_from_disk_enforces_the_receipt_terms(tmp_path):
+    # The terms printed in the receipt are law: the verifier grades
+    # only under threshold 255 / tolerance 0 / the delivered-file
+    # count. A receipt stating anything looser is invalid, even
+    # though every pixel and hash is untouched.
+    store, handle, receipt = _masked_store_run(tmp_path)
+    for field, loosened in (
+        ("opaque_alpha_threshold", 254),
+        ("opaque_alpha_threshold", 1),
+        ("pixel_tolerance", 99),
+        ("pixel_tolerance", 1),
+        ("count_sample", "invented"),
+        ("count_sample", "in_memory_buffer"),
+    ):
+        edited = dict(receipt)
+        edited[field] = loosened
+        report = composite.verify_receipt_from_disk(store, handle, edited)
+        assert report["checks"]["receipt_terms"] is False, (field, loosened)
+        assert report["ok"] is False
+
+
+def test_verify_receipt_from_disk_fails_on_unknown_receipt_handles(tmp_path):
+    # A receipt naming assets that do not exist: structured failure,
+    # not the KeyError the pre-hardening code propagated.
+    store, handle, receipt = _masked_store_run(tmp_path)
+    edited = dict(receipt)
+    edited["foreground_asset"] = "asset://" + "f" * 32
+    report = composite.verify_receipt_from_disk(store, handle, edited)
+    assert report["checks"]["foreground_asset_resolves"] is False
+    assert report["ok"] is False
+
+
+def test_new_receipts_carry_the_schema_marker(tmp_path):
+    _store, _handle, receipt = _masked_store_run(tmp_path)
+    assert receipt["receipt_schema"] == composite.RECEIPT_SCHEMA_VERSION
+    assert receipt["opaque_alpha_threshold"] == 255
+    assert receipt["pixel_tolerance"] == 0
+    assert receipt["count_sample"] == "decoded_delivered_file"
