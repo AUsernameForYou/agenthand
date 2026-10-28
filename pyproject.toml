@@ -36,6 +36,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8,<10",
+    # Property-based tests for the verifier/compositor counting
+    # core (tests/test_fidelity_properties.py).
+    "hypothesis>=6,<7",
 ]
 
 [project.scripts]
