@@ -419,7 +419,7 @@
 
     <div class="verify" id="verify">
       <p class="proof-title">VERIFY IT YOURSELF</p>
-      <p>Do not take the receipt's word for it. This runs entirely in your browser. The frozen sample is displayed in the judge path below; when you click one of its check buttons, the checker fetches the run's <a href="proof-receipt-v1.json">receipt file</a> and the byte-exact source photo, product layer, and final output, hashes the files with SHA-256, checks the hashes against the receipt it just fetched, then decodes both images and counts every fully opaque product pixel against the output. The one number the checker will not take from the receipt is the changed count a pass requires: zero, enforced in the code. A file carrying an embedded colour profile is refused outright — a browser decode would silently convert its colours, and this check deals only in exact values.</p>
+      <p>Do not take the receipt's word for it. This runs entirely in your browser. The frozen sample is displayed in the judge path below; when you click one of its check buttons, the checker fetches the run's <a href="proof-receipt-v1.json">receipt file</a> and the byte-exact source photo, product layer, and final output, hashes the files with SHA-256, checks the hashes against the receipt it just fetched, then decodes both images and counts every fully opaque product pixel against the output. The one number the checker will not take from the receipt is the changed count a pass requires: zero, enforced in the code. The checker decodes the PNG data itself rather than using the browser's colour-managed image decoder, so an embedded Display P3 profile does not change the pixel values being counted — the same convention the Python receipt uses. The profile is not stripped, and every file hash still has to match.</p>
 
       <div class="judge-path" aria-label="One-click judge path">
         <p class="proof-title">ONE-CLICK JUDGE PATH — FROZEN SAMPLE PRELOADED</p>
@@ -461,7 +461,7 @@
 
     <div class="opencode">
       <p class="proof-title">THE CHECK, IN THE OPEN</p>
-      <p class="proof-cap">This is the counting code itself — the same function the buttons above run, copied verbatim from <a href="verifier-v5.js">verifier-v5.js</a>.</p>
+      <p class="proof-cap">This is the counting code itself — the same function the buttons above run, copied verbatim from <a href="verifier-v6.js">verifier-v6.js</a>.</p>
       <pre class="code"><span class="c">/* Replicates composite.py's _measure for the claim that matters:
  * a foreground pixel with alpha 255 must appear in the composite
  * byte-identical. fgData / outData are RGBA byte arrays (ImageData.data).
@@ -508,7 +508,7 @@ function countChanged(fgData, outData, width, height, opts) {
 }</pre>
     </div>
 
-    <p class="stamp">[ provenance — run: 2026-10-26, produced by agenthand <a href="https://github.com/AUsernameForYou/agenthand/tree/401f1136af5a36ca814207ae8ce8b5435bd1722e">commit 401f113</a> · fixture: the run's own files, a chat-screen cut-out (see the note above) · the checker on this page is <a href="verifier-v5.js">verifier-v5.js</a>, 22.6 KB — read it ]</p>
+    <p class="stamp">[ provenance — run: 2026-10-26, produced by agenthand <a href="https://github.com/AUsernameForYou/agenthand/tree/401f1136af5a36ca814207ae8ce8b5435bd1722e">commit 401f113</a> · fixture: the run's own files, a chat-screen cut-out (see the note above) · the checker on this page is <a href="verifier-v6.js">verifier-v6.js</a>, 38.1 KB — read it ]</p>
     </div>
   </section>
 
@@ -637,7 +637,7 @@ python3.12 -m venv .venv
   requestAnimationFrame(step);
 })();
 </script>
-<script src="verifier-v5.js" defer></script>
+<script src="verifier-v6.js" defer></script>
 
 </body>
 </html>
