@@ -376,7 +376,7 @@
       <div><span class="k">product scaled&nbsp;</span> no</div>
       <div><span class="k">product sent to image model&nbsp;</span> no</div>
       <div><span class="k">changed opaque pixels&nbsp;</span> <span class="zero">0</span> <span class="tick">&#10003;</span></div>
-      <div><span class="k">cost of the calls&nbsp;</span> identify $0.007544 &middot; cut_out $0.0025 &middot; draw $0.01 &middot; total $0.020044</div>
+      <div><span class="k">cost of the calls&nbsp;</span> <span id="receipt-costs">identify $0.007544 &middot; cut_out $0.0025 &middot; draw $0.01 &middot; total $0.020044</span></div>
     </div>
     <button class="copy-btn" type="button" data-copy="receipt">Copy receipt</button>
 
@@ -626,22 +626,46 @@ function countChanged(fgData, outData, width, height, opts) {
 </script>
 <script>
 (function(){
-  // Hero proof line: count up to the verified run's real checked total.
-  // The final value is already in the HTML; reduced motion (or no JS)
-  // simply leaves it standing.
+  // The displayed run figures come from proof-run.json, the one
+  // manifest every surface reads — the verifier fetches the run's
+  // receipt the same way. The values already in the HTML are the
+  // fallback if the manifest cannot be fetched (and no-JS readers
+  // see them standing); the suite pins them to the manifest.
   var el=document.getElementById('hero-checked');
-  if(!el) return;
-  if(window.matchMedia('(prefers-reduced-motion: reduce)').matches) return;
-  var target=580613, t0=null, dur=1500;
+  var costsEl=document.getElementById('receipt-costs');
   function fmt(n){ return n.toString().replace(/\B(?=(\d{3})+(?!\d))/g,','); }
-  function step(ts){
-    if(!t0) t0=ts;
-    var p=Math.min((ts-t0)/dur,1);
-    var eased=1-Math.pow(1-p,3);
-    el.textContent=fmt(Math.round(target*eased));
-    if(p<1) requestAnimationFrame(step);
+  function animateTo(target){
+    if(!el) return;
+    if(window.matchMedia('(prefers-reduced-motion: reduce)').matches){
+      el.textContent=fmt(target);
+      return;
+    }
+    var t0=null, dur=1500;
+    function step(ts){
+      if(!t0) t0=ts;
+      var p=Math.min((ts-t0)/dur,1);
+      var eased=1-Math.pow(1-p,3);
+      el.textContent=fmt(Math.round(target*eased));
+      if(p<1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
   }
-  requestAnimationFrame(step);
+  function apply(manifest){
+    var c=manifest.costs_usd;
+    if(costsEl&&c){
+      costsEl.textContent='identify $'+c.identify+' · cut_out $'+c.cut_out+' · draw $'+c.draw+' · total $'+c.total;
+    }
+    if(manifest.pixels) animateTo(manifest.pixels.opaque_checked);
+  }
+  fetch('proof-run.json').then(function(res){
+    if(!res.ok) throw new Error('manifest fetch failed');
+    return res.json();
+  }).then(apply).catch(function(){
+    // Fallback: animate to the figure already standing in the HTML.
+    if(!el) return;
+    var n=parseInt((el.textContent||'').replace(/[^0-9]/g,''),10);
+    if(!isNaN(n)) animateTo(n);
+  });
 })();
 </script>
 <script src="verifier-v6.js" defer></script>

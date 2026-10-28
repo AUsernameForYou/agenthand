@@ -11,6 +11,8 @@ and these tests pin the whole arrangement down:
   real proof PNGs served by the site;
 - the published receipt's hashes are the served files' hashes;
 - the printed receipt on the page agrees with the receipt file;
+- proof-run.json is the canonical home for the run's figures, and
+  the replay data, README and page statics agree with it;
 - the verifier JS contains no run constants to grade against;
 - the counting code displayed on the page is the code the
   verifier file actually ships.
@@ -72,6 +74,71 @@ def test_page_figures_agree_with_the_receipt():
     # The printed receipt block carries the receipt file's hashes.
     assert RECEIPT["source_sha256"] in page
     assert RECEIPT["foreground_pixel_sha256"] in page
+
+
+MANIFEST = json.loads((DOCS / "proof-run.json").read_text(encoding="utf-8"))
+REPO_ROOT = Path(__file__).resolve().parents[1]
+
+
+def test_proof_run_manifest_matches_the_published_receipt():
+    # proof-run.json is the canonical home for the published run's
+    # figures: every number in it must be the receipt's number, and
+    # the receipt it names must be the file the site serves.
+    assert MANIFEST["fixture"] is True
+    assert MANIFEST["pixels"]["opaque_checked"] == RECEIPT["opaque_pixels"]
+    assert MANIFEST["pixels"]["changed"] == RECEIPT["changed_opaque_pixels"]
+    assert MANIFEST["pixels"]["edge_band_pixels"] == RECEIPT["edge_band_pixels"]
+    assert (
+        MANIFEST["pixels"]["color_profile_preserved"]
+        == RECEIPT["color_profile_preserved"]
+    )
+    settled = RECEIPT["provenance"]["settled_costs_usd"]
+    for tool in ("identify", "cut_out", "draw", "total"):
+        assert MANIFEST["costs_usd"][tool] == pytest.approx(settled[tool])
+    assert MANIFEST["call_ids"] == RECEIPT["provenance"]["call_ids"]
+    assert MANIFEST["receipt"]["file"] == "proof-receipt-v1.json"
+    assert MANIFEST["receipt"]["sha256"] == _sha256(DOCS / "proof-receipt-v1.json")
+    assert (
+        MANIFEST["receipt"]["foreground_pixel_sha256"]
+        == RECEIPT["foreground_pixel_sha256"]
+    )
+    assert (
+        MANIFEST["receipt"]["output_pixel_sha256"]
+        == RECEIPT["output_pixel_sha256"]
+    )
+
+
+def test_proof_run_manifest_matches_replay_readme_and_page():
+    # The other figure-carrying surfaces must agree with the
+    # manifest, so swapping in a new run is a one-file change plus
+    # whatever the suite names here.
+    replay = json.loads((DOCS / "replay-run-v1.json").read_text(encoding="utf-8"))
+    assert MANIFEST["models"] == {
+        call["tool"]: call["model"] for call in replay["calls"]
+    }
+    assert MANIFEST["run"]["started_at"] == replay["run"]["started_at"]
+    assert MANIFEST["run"]["ended_at"] == replay["run"]["ended_at"]
+    assert MANIFEST["costs_usd"]["total"] == pytest.approx(
+        replay["run"]["total_settled_cost_usd"]
+    )
+
+    readme = (REPO_ROOT / "README.md").read_text(encoding="utf-8")
+    assert f"{MANIFEST['pixels']['opaque_checked']:,}" in readme
+    for tool in ("identify", "cut_out", "draw"):
+        assert f"{tool} ${MANIFEST['costs_usd'][tool]}" in readme
+
+    page = (DOCS / "index.html").read_text(encoding="utf-8")
+    # The static fallback standing in the hero is the manifest's
+    # figure, and the display script reads the manifest itself —
+    # no run constant is baked into the page's JS.
+    assert (
+        f'<span id="hero-checked">{MANIFEST["pixels"]["opaque_checked"]:,}</span>'
+        in page
+    )
+    assert "fetch('proof-run.json')" in page
+    assert 'id="receipt-costs"' in page
+    scripts = re.findall(r"<script>(.*?)</script>", page, flags=re.DOTALL)
+    assert all("580613" not in s and "580,613" not in s for s in scripts)
 
 
 def test_verifier_grades_the_receipt_not_constants():
