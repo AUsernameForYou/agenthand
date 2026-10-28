@@ -383,6 +383,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
             "concept_source": "provided"
             if concept is not None
             else "identify_internal",
+            "concept_rewritten_from": None,
             "alternates": [],
             "plan_error": None,
             "output_asset": None,
@@ -403,11 +404,13 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     concept_source = "provided"
     alternates: list[str] = []
     plan_error = None
+    concept_rewritten_from = None
     if concept is None:
         plan = _plan_cut(store, handle)
         concept = plan["concept"]
         alternates = plan["alternates"]
         plan_error = plan.get("error")
+        concept_rewritten_from = plan.get("concept_rewritten_from")
         concept_source = "identify_internal"
 
     def _error(code: str, message: str, **extra) -> dict:
@@ -417,6 +420,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
             "image": handle,
             "concept": concept,
             "concept_source": concept_source,
+            "concept_rewritten_from": concept_rewritten_from,
             "alternates": alternates,
             "plan_error": plan_error,
             "output_asset": None,
@@ -513,6 +517,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         "concept": outcome["phrase"],
         "requested_concept": concept,
         "concept_source": concept_source,
+        "concept_rewritten_from": concept_rewritten_from,
         "alternates": alternates,
         "plan_error": plan_error,
         "output_asset": foreground_handle,
@@ -639,6 +644,7 @@ def _plan_cut(store: AssetStore, handle: str) -> dict:
         return {
             "description": None,
             "concept": None,
+            "concept_rewritten_from": None,
             "alternates": [],
             "model": IDENTIFY_MODEL,
             "error": result["error"],
@@ -660,8 +666,12 @@ def identify(image: str) -> dict:
     suitable for text-prompted segmentation ("brown leather wallet")
     with at least two alternate phrasings the mask-recovery loop can
     retry with, plus listing copy (suggested_title, listing_bullets,
-    condition_notes). The call is billed through the spend-cap choke
-    point and the result carries its actual cost and token usage.
+    condition_notes). When phrase hygiene had to change the model's
+    own concept (a frame/medium phrase rewritten or promoted over),
+    concept_rewritten_from names the phrase the model actually
+    returned; it is None when the concept passed through intact. The
+    call is billed through the spend-cap choke point and the result
+    carries its actual cost and token usage.
 
     Without META_API_KEY configured the tool returns a structured
     NOT_CONFIGURED error and makes no call (and no ledger entry). This
@@ -679,6 +689,7 @@ def identify(image: str) -> dict:
             "image": handle,
             "description": None,
             "concept": None,
+            "concept_rewritten_from": None,
             "alternates": [],
             "suggested_title": None,
             "listing_bullets": [],
@@ -692,6 +703,7 @@ def identify(image: str) -> dict:
         "image": handle,
         "description": result["description"],
         "concept": result["concept"],
+        "concept_rewritten_from": result.get("concept_rewritten_from"),
         "alternates": result["alternates"],
         "suggested_title": result["suggested_title"],
         "listing_bullets": result["listing_bullets"],

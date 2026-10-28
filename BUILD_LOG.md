@@ -395,3 +395,10 @@ The four-lane architecture review (verdict in
   (fill/frame_edge_contact); now bbox_fill/touches_frame_edges.
   README's cap claim corrected to what the code does (working cap
   configurable up to the $150 hard ceiling, never past it).
+- Fix 4 — phrase-hygiene rewrite flag. Plans now carry
+  concept_rewritten_from: when hygiene rewrites, promotes over, or
+  replaces the model's concept (a real "computer monitor" product
+  became "computer" silently), the plan and the identify/cut_out
+  results name the phrase the model actually returned. None when the
+  concept passed through intact. The rewrite behavior itself is
+  unchanged (it is the plan contract); it is no longer silent.

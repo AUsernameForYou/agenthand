@@ -644,6 +644,13 @@ def _parse_identify_payload(content: str) -> dict:
     return {
         "description": payload["description"].strip(),
         "concept": concept_out,
+        # Hygiene honesty (architecture Gauntlet fix 4): when the
+        # model's own concept did not survive as the plan's concept —
+        # rewritten ("computer monitor" -> "computer"), promoted over,
+        # or replaced from the description — the plan names what the
+        # model actually said, so a caller can see the lead phrase is
+        # not the model's choice. None when it passed through intact.
+        "concept_rewritten_from": concept if concept_out != concept else None,
         "alternates": alternates,
         "suggested_title": payload["suggested_title"].strip(),
         "listing_bullets": [b.strip() for b in bullets],

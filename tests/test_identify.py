@@ -512,6 +512,52 @@ def test_parse_object_phrases_pass_through_untouched():
     assert plan["alternates"] == GOOD_PAYLOAD["alternates"]
 
 
+def test_parse_flags_a_rewritten_frame_concept():
+    # Fable's case from the architecture review: a REAL product whose
+    # name contains a frame noun — "computer monitor" — is rewritten
+    # to "computer". The rewrite itself is the plan contract, but it
+    # must not be silent: the plan names what the model actually said.
+    payload = dict(GOOD_PAYLOAD)
+    payload["concept"] = "computer monitor"
+    payload["alternates"] = ["desktop monitor", "pc screen"]
+    plan = meta_client._parse_identify_payload(json.dumps(payload))
+    assert plan["concept"] == "computer"
+    assert plan["concept_rewritten_from"] == "computer monitor"
+
+
+def test_parse_flags_a_promoted_over_frame_concept():
+    payload = dict(GOOD_PAYLOAD)
+    payload["concept"] = "phone screen"
+    payload["alternates"] = ["smartphone", "cell phone", "mobile phone"]
+    plan = meta_client._parse_identify_payload(json.dumps(payload))
+    assert plan["concept"] == "smartphone"
+    assert plan["concept_rewritten_from"] == "phone screen"
+
+
+def test_parse_object_concept_has_no_rewrite_flag():
+    plan = meta_client._parse_identify_payload(_good_content())
+    assert plan["concept_rewritten_from"] is None
+
+
+def test_identify_result_surfaces_the_rewrite_flag(monkeypatch):
+    client = _install_fake(
+        monkeypatch,
+        [
+            _response(
+                _good_content(
+                    concept="phone screen",
+                    alternates=["smartphone", "cell phone"],
+                )
+            )
+        ],
+    )
+    result = server.identify(_data_uri())
+    assert result["status"] == "ok"
+    assert result["concept"] == "smartphone"
+    assert result["concept_rewritten_from"] == "phone screen"
+    assert len(client.completions.calls) == 1
+
+
 def test_sanitize_falls_back_to_the_description_when_nothing_survives():
     concept, alternates = meta_client._sanitize_plan_phrases(
         "screen", ["display"], "A brown leather wallet on a wooden table."
