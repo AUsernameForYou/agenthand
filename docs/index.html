@@ -333,7 +333,7 @@
      <span class="c">plate asset://4f1740f4&hellip; &middot; the product never sent to the image model</span>
 <span class="c"># receipt: 580,613 opaque pixels checked &middot; changed 0 &middot; total $0.020044
 # photo to receipt in 36.5 s, by the asset records' timestamps</span></pre>
-    <p class="note">Assembled from the run's own records: the spend ledger's settled lines and the asset sidecars. Nothing here is retyped from memory; the full hashes are in the receipt below.</p>
+    <p class="note">Assembled from the run's own records: the spend ledger's settled lines and the asset sidecars. The full hashes are in the receipt below — and the verifier further down grades against the run's actual receipt file, <a href="proof-receipt-v1.json">published beside the images</a>, not against numbers typed into this page.</p>
   </section>
 
   <section id="fidelity" aria-labelledby="fidelity-h">
@@ -386,7 +386,7 @@
 
     <div class="verify" id="verify">
       <p class="proof-title">VERIFY IT YOURSELF</p>
-      <p>Do not take the receipt's word for it. This runs entirely in your browser: it downloads the source photo, the product layer, and the final output (3.1 MB, only when you click), hashes the files with SHA-256, checks the hashes against the receipt and the run's records, then decodes both images and counts every fully opaque product pixel against the output.</p>
+      <p>Do not take the receipt's word for it. This runs entirely in your browser: it downloads the run's <a href="proof-receipt-v1.json">receipt file</a>, the source photo, the product layer, and the final output (3.1 MB, only when you click), hashes the files with SHA-256, checks the hashes against the receipt it just fetched, then decodes both images and counts every fully opaque product pixel against the output. The one number the checker will not take from the receipt is the changed count a pass requires: zero, enforced in the code. A file carrying an embedded colour profile is refused outright — a browser decode would silently convert its colours, and this check deals only in exact values.</p>
       <div class="vcounts">
         <div><span class="vlab">PIXELS CHECKED</span><span class="vcount" id="verify-checked">&mdash;</span></div>
         <div><span class="vlab">CHANGED</span><span class="vcount" id="verify-changed">&mdash;</span></div>
@@ -400,7 +400,7 @@
 
     <div class="opencode">
       <p class="proof-title">THE CHECK, IN THE OPEN</p>
-      <p class="proof-cap">This is the counting code itself — the same function the button above runs, copied verbatim from <a href="verifier-v3.js">verifier-v3.js</a>.</p>
+      <p class="proof-cap">This is the counting code itself — the same function the button above runs, copied verbatim from <a href="verifier-v4.js">verifier-v4.js</a>.</p>
       <pre class="code"><span class="c">/* Replicates composite.py's _measure for the claim that matters:
  * a foreground pixel with alpha 255 must appear in the composite
  * byte-identical. fgData / outData are RGBA byte arrays (ImageData.data).
@@ -447,7 +447,7 @@ function countChanged(fgData, outData, width, height, opts) {
 }</pre>
     </div>
 
-    <p class="stamp">[ provenance — run: 2026-10-26, produced by agenthand <a href="https://github.com/AUsernameForYou/agenthand/tree/401f1136af5a36ca814207ae8ce8b5435bd1722e">commit 401f113</a> · fixture: the run's own files, a chat-screen cut-out (see the note above) · the checker on this page is <a href="verifier-v3.js">verifier-v3.js</a>, 16.6 KB — read it ]</p>
+    <p class="stamp">[ provenance — run: 2026-10-26, produced by agenthand <a href="https://github.com/AUsernameForYou/agenthand/tree/401f1136af5a36ca814207ae8ce8b5435bd1722e">commit 401f113</a> · fixture: the run's own files, a chat-screen cut-out (see the note above) · the checker on this page is <a href="verifier-v4.js">verifier-v4.js</a>, 20.0 KB — read it ]</p>
     </div>
   </section>
 
@@ -576,7 +576,7 @@ python3.12 -m venv .venv
   requestAnimationFrame(step);
 })();
 </script>
-<script src="verifier-v3.js" defer></script>
+<script src="verifier-v4.js" defer></script>
 
 </body>
 </html>
