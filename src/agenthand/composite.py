@@ -416,6 +416,13 @@ def verify_receipt_from_disk(
     caller (the standalone verifier, the film's on-camera check) gets
     the full list of what is wrong. KeyError propagates for an unknown
     composite handle.
+
+    A pass additionally requires the receipt's own file and pixel
+    hashes to match the records of the assets it names (a receipt
+    cannot verify a different run's composite), exactly zero changed
+    opaque pixels (a receipt honestly reporting a change must fail),
+    and positive opaque coverage (a receipt covering no product
+    pixels vouches for nothing). Architecture Gauntlet fix 2.
     """
     if receipt is None:
         receipt = store.load_receipt(composite_handle)
@@ -449,6 +456,67 @@ def verify_receipt_from_disk(
             check(f"{label}_file_integrity", True)
         except (AssetIntegrityError, KeyError) as exc:
             check(f"{label}_file_integrity", False, str(exc))
+
+    # 1b. The receipt's own hashes must name THESE files. Step 1 only
+    #     proves each file matches its own asset record; without this
+    #     step, run A's receipt verifies against run B's composite
+    #     whenever the numbers happen to reproduce, and a receipt
+    #     whose output hash was edited still passes (architecture
+    #     Gauntlet: Claude, GPT, Fable each reproduced a variant).
+    source_record = store.get_record(source_handle)
+    foreground_record = store.get_record(foreground_handle)
+    check(
+        "source_hash_matches_receipt",
+        receipt.get("source_sha256") == source_record.sha256
+        and receipt.get("source_pixel_sha256") == source_record.pixel_sha256,
+        "the receipt's source hashes do not match the source asset's "
+        "recorded hashes; this receipt was not issued for this source",
+    )
+    check(
+        "foreground_hash_matches_receipt",
+        receipt.get("foreground_sha256") == foreground_record.sha256
+        and receipt.get("foreground_pixel_sha256")
+        == foreground_record.pixel_sha256,
+        "the receipt's foreground hashes do not match the foreground "
+        "asset's recorded hashes",
+    )
+    check(
+        "output_hash_matches_receipt",
+        receipt.get("output_asset") == composite_handle
+        and receipt.get("output_sha256") == composite_record.sha256
+        and receipt.get("output_pixel_sha256") == composite_record.pixel_sha256,
+        "the receipt does not name this composite (its output_asset / "
+        "output hashes point elsewhere); this receipt was issued for "
+        "a different composite, even if the files happen to be "
+        "byte-identical",
+    )
+    if receipt.get("mask_asset"):
+        if receipt.get("mask_sha256") or receipt.get("mask_pixel_sha256"):
+            try:
+                mask_record = store.get_record(receipt["mask_asset"])
+                check(
+                    "mask_hash_matches_receipt",
+                    receipt.get("mask_sha256") == mask_record.sha256
+                    and receipt.get("mask_pixel_sha256")
+                    == mask_record.pixel_sha256,
+                    "the receipt's mask hashes do not match the mask "
+                    "asset's recorded hashes",
+                )
+            except KeyError as exc:
+                check("mask_hash_matches_receipt", False, str(exc))
+        else:
+            # A receipt that names a mask asset without pinning its
+            # hashes: issued before mask pinning (the frozen replay
+            # package's receipt is the live example; its manifest pins
+            # every file's bytes instead). The strongest check
+            # available is the mask file's integrity against its own
+            # asset record. Receipts draw issues today always pin the
+            # mask hashes and take the strict branch above.
+            try:
+                store.verify_integrity(receipt["mask_asset"])
+                check("mask_asset_integrity", True)
+            except (AssetIntegrityError, KeyError) as exc:
+                check("mask_asset_integrity", False, str(exc))
 
     # 2. Decode the foreground and the delivered composite fresh from
     #    disk and recount — the receipt's numbers must reproduce.
@@ -495,6 +563,29 @@ def verify_receipt_from_disk(
             f"receipt says {receipt['opaque_fraction']}, recount from "
             f"disk finds {counts['opaque_fraction']}",
         )
+
+    # 2b. The verdict itself, stated as checks rather than implied by
+    #     agreement: a pass requires ZERO changed pixels — an honest
+    #     receipt reporting a real change reproduces perfectly under
+    #     the recount checks above and must still fail — and POSITIVE
+    #     coverage, because a receipt covering no opaque pixels
+    #     vouches for nothing (architecture Gauntlet, GPT + Claude).
+    check(
+        "zero_changed_pixels",
+        recomputed.get("changed_opaque_pixels") == 0
+        and receipt.get("changed_opaque_pixels") == 0,
+        f"changed opaque pixels: receipt says "
+        f"{receipt.get('changed_opaque_pixels')}, recount from disk "
+        f"finds {recomputed.get('changed_opaque_pixels')}; the "
+        "Fidelity Lock claim requires exactly 0",
+    )
+    check(
+        "positive_coverage",
+        (recomputed.get("opaque_pixels") or 0) > 0
+        and (receipt.get("opaque_pixels") or 0) > 0,
+        "the receipt covers 0 fully opaque foreground pixels; there "
+        "is no product evidence to verify",
+    )
 
     # 3. Colour-profile identity, re-derived from the files: the
     #    profile the receipt names must be the profile in the files,

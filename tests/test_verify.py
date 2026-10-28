@@ -268,6 +268,157 @@ def test_verify_receipt_from_disk_fails_on_a_tampered_output_file(tmp_path):
     assert report["checks"]["recount_changed_opaque_pixels"] is False
 
 
+def test_verify_files_refuses_an_empty_mask(tmp_path):
+    # GPT's reproduction: two completely different images and a mask
+    # that selects nothing verify "ok" today, because 0 of 0 checked
+    # pixels changed. A pass that checked nothing proves nothing.
+    paths, _ = _export_run(tmp_path)
+    Image.new("RGBA", (8, 6), (250, 250, 250, 255)).save(
+        paths["final"], format="PNG"
+    )
+    Image.new("L", (8, 6), 0).save(paths["mask"], format="PNG")
+
+    report = verify.verify_files(paths["source"], paths["final"], paths["mask"])
+    assert report["checked_pixels"] == 0
+    assert report["ok"] is False
+    assert any("no" in p and "checked" in p for p in report["problems"])
+
+
+def test_verify_receipt_from_disk_fails_when_the_receipt_reports_a_change(tmp_path):
+    # An HONEST violation receipt — the files really do differ at one
+    # opaque pixel and the receipt says so (changed == 1, counts
+    # matching the files) — must not verify ok. Before the hardening,
+    # every recount check passed and ok came back True.
+    store = AssetStore(tmp_path)
+    photo = _pattern_photo()
+    photo_handle = store.put_image(photo, kind="source_photo")
+    foreground = segmentation.extract_foreground(photo, _block_mask())
+    fg_handle = store.put_image(
+        foreground,
+        kind="foreground_png",
+        source_asset_id=AssetStore.parse_handle(photo_handle),
+    )
+    handle, receipt = composite.draw_product(store, fg_handle, "a regal room")
+    # Forge a violating composite + honest receipt by hand (draw never
+    # produces one): flip one opaque pixel in a copy of the composite
+    # and re-derive every count and hash from the tampered files.
+    tampered = store.read_image(handle)
+    tampered.putpixel((2, 2), (9, 9, 9, 255))
+    bad_handle = store.put_image(
+        tampered,
+        kind="composite",
+        source_asset_id=AssetStore.parse_handle(fg_handle),
+    )
+    bad_record = store.get_record(bad_handle)
+    counts = composite._measure(store.read_image(fg_handle), tampered)
+    assert counts["changed_opaque_pixels"] == 1
+    bad_receipt = dict(receipt)
+    bad_receipt.update(counts)
+    bad_receipt["output_asset"] = bad_handle
+    bad_receipt["output_sha256"] = bad_record.sha256
+    bad_receipt["output_pixel_sha256"] = bad_record.pixel_sha256
+    bad_receipt["color_profile_output_sha256"] = bad_record.color_profile_sha256
+    store.save_receipt(bad_handle, bad_receipt)
+
+    report = composite.verify_receipt_from_disk(store, bad_handle, bad_receipt)
+    assert report["recomputed"]["changed_opaque_pixels"] == 1
+    assert report["checks"]["zero_changed_pixels"] is False
+    assert report["ok"] is False
+
+
+def test_verify_receipt_from_disk_fails_for_receipt_a_against_composite_b(tmp_path):
+    # Two clean runs, identical fixtures, ONE store: receipt A names
+    # run A's assets, but the composite under test is run B's. The
+    # numbers all reproduce (the fixtures are identical), so only
+    # comparing the receipt's own output hash to the file catches
+    # the swap.
+    store = AssetStore(tmp_path)
+    _h, receipt_a = None, None
+    handles = []
+    for _ in range(2):
+        photo = _pattern_photo()
+        photo_handle = store.put_image(photo, kind="source_photo")
+        foreground = segmentation.extract_foreground(photo, _block_mask())
+        fg_handle = store.put_image(
+            foreground,
+            kind="foreground_png",
+            source_asset_id=AssetStore.parse_handle(photo_handle),
+        )
+        handle, receipt = composite.draw_product(store, fg_handle, "a regal room")
+        handles.append((handle, receipt))
+    (handle_a, receipt_a), (handle_b, _receipt_b) = handles
+    assert handle_a != handle_b
+
+    report = composite.verify_receipt_from_disk(store, handle_b, receipt_a)
+    assert report["checks"]["output_hash_matches_receipt"] is False
+    assert report["ok"] is False
+
+
+def test_verify_receipt_from_disk_fails_on_an_edited_output_hash(tmp_path):
+    store, handle, receipt = _store_run(tmp_path)
+    edited = dict(receipt)
+    edited["output_sha256"] = "0" * 64
+    report = composite.verify_receipt_from_disk(store, handle, edited)
+    assert report["checks"]["output_hash_matches_receipt"] is False
+    assert report["ok"] is False
+
+    edited = dict(receipt)
+    edited["source_pixel_sha256"] = "0" * 64
+    report = composite.verify_receipt_from_disk(store, handle, edited)
+    assert report["checks"]["source_hash_matches_receipt"] is False
+    assert report["ok"] is False
+
+
+def test_verify_receipt_from_disk_fails_on_an_edited_mask_hash(tmp_path):
+    # A run whose foreground is chained through its stored mask asset
+    # (the production shape after fix 1): the receipt's mask pin must
+    # be compared against the mask asset's record, not trusted.
+    store = AssetStore(tmp_path)
+    photo = _pattern_photo()
+    photo_handle = store.put_image(photo, kind="source_photo")
+    mask_handle = store.put_image(
+        _block_mask(),
+        kind="mask_png",
+        source_asset_id=AssetStore.parse_handle(photo_handle),
+    )
+    foreground = segmentation.extract_foreground(photo, _block_mask())
+    fg_handle = store.put_image(
+        foreground,
+        kind="foreground_png",
+        source_asset_id=AssetStore.parse_handle(mask_handle),
+    )
+    handle, receipt = composite.draw_product(store, fg_handle, "a regal room")
+    assert receipt["mask_source"] == "asset"
+
+    clean = composite.verify_receipt_from_disk(store, handle, receipt)
+    assert clean["ok"] is True, clean["problems"]
+
+    edited = dict(receipt)
+    edited["mask_pixel_sha256"] = "0" * 64
+    report = composite.verify_receipt_from_disk(store, handle, edited)
+    assert report["checks"]["mask_hash_matches_receipt"] is False
+    assert report["ok"] is False
+
+
+def test_verify_receipt_from_disk_fails_with_zero_opaque_coverage(tmp_path):
+    # A fully transparent foreground: nothing is covered, nothing can
+    # change, and a "pass" would vouch for zero product pixels.
+    store = AssetStore(tmp_path)
+    photo_handle = store.put_image(_pattern_photo(), kind="source_photo")
+    empty_fg = Image.new("RGBA", (8, 6), (0, 0, 0, 0))
+    fg_handle = store.put_image(
+        empty_fg,
+        kind="foreground_png",
+        source_asset_id=AssetStore.parse_handle(photo_handle),
+    )
+    handle, receipt = composite.draw_product(store, fg_handle, "a regal room")
+    assert receipt["opaque_pixels"] == 0
+
+    report = composite.verify_receipt_from_disk(store, handle, receipt)
+    assert report["checks"]["positive_coverage"] is False
+    assert report["ok"] is False
+
+
 def test_verify_receipt_from_disk_fails_on_a_stripped_output_profile(tmp_path):
     store, handle, receipt = _store_run(tmp_path, profiled=True)
     assert receipt["color_profile_preserved"] is True

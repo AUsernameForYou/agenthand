@@ -50,8 +50,11 @@ compositing; the receipt counts them separately instead of overclaiming.
 The receipt's counts are measured on the delivered file, decoded back
 from the store, and can be re-derived independently:
 `composite.verify_receipt_from_disk` recounts from the stored files,
-and the standalone `agenthand-verify SOURCE FINAL MASK` checker
-verifies exported files with no store at all. Ingest accepts the
+checks the receipt's own hashes against the assets it names, and
+passes only on exactly zero changed pixels with real coverage; the
+standalone `agenthand-verify SOURCE FINAL MASK` checker verifies
+exported files with no store at all and likewise refuses a mask that
+selects nothing. Ingest accepts the
 formats phones produce, including HEIC, and preserves each photo's
 embedded colour profile end to end.
 

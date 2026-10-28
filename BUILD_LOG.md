@@ -369,3 +369,14 @@ The four-lane architecture review (verdict in
   the real server tools (receipt mask hashes == stored mask record),
   the composite-handle refusal, and chain-shape refusals in
   composite. Suite: 188 pass.
+- Fix 2 — verifier hardening. verify_receipt_from_disk now compares
+  the receipt's own source/foreground/output/mask hashes against the
+  records of the assets it names (run A's receipt previously verified
+  against run B's composite), requires exactly zero changed opaque
+  pixels (an honest violation receipt previously verified ok), and
+  requires positive opaque coverage. The standalone agenthand-verify
+  refuses an empty mask (two different images previously passed with
+  0 of 0 pixels checked). Receipts that name a mask asset without
+  pinning its hashes (the frozen replay package's) fall back to the
+  mask file's record integrity; the replay package still verifies
+  PASS under the hardened verifier.

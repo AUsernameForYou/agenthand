@@ -56,10 +56,12 @@ def verify_files(
     """Verify an exported composite against its source photo and mask.
 
     Returns the report dict (see the module docstring for the rules);
-    ``ok`` is True only when sizes match, every fully-masked product
-    pixel is byte-identical between source and final, and the colour
-    profile is preserved. Undecodable or missing files raise — the
-    report is for files that exist but fail the fidelity rules.
+    ``ok`` is True only when sizes match, at least one product pixel
+    was actually checked (an empty or all-edge-band mask refuses),
+    every fully-masked product pixel is byte-identical between source
+    and final, and the colour profile is preserved. Undecodable or
+    missing files raise — the report is for files that exist but fail
+    the fidelity rules.
     """
     source = _load_rgba(source_path)
     final = _load_rgba(final_path)
@@ -95,6 +97,16 @@ def verify_files(
             problems.append(
                 f"{changed} of {checked} fully-masked product pixels "
                 "differ between the source photo and the final image"
+            )
+        if checked == 0:
+            # A mask that selects nothing checks nothing: before this
+            # refusal, two completely different images passed with an
+            # empty mask because 0 of 0 pixels changed (architecture
+            # Gauntlet, GPT reproduction).
+            problems.append(
+                "the mask selects no fully-on pixels, so no product "
+                "pixels were checked; a verification that compares "
+                "nothing does not pass"
             )
 
     source_profile = color_profile_sha256_of_image(source)
