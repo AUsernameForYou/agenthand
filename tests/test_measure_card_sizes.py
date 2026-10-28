@@ -25,16 +25,18 @@ ESTIMATOR.md "How small can the card be"):
   measure.MIN_CARD_PX (130 px) and widens its range through the
   130-170 px caution band; the sub-floor scenes are pinned as
   refusal regressions.
-- A degraded AH-35 scene stays honest (range balloons past +/-100%)
-  but is useless in practice.
 - The 3x2 mini is noisier than the size it replaced: multi-seed
   probes at 130-210 px across produced centre errors beyond the
   widened ranges on several seeds, clean and degraded, and one
   mid-distance scene flipped contained/missed when the plane
-  height changed by 1 mm. Its dependable envelope is close-ups
-  (~200 px across, clean light). No mid-distance AH-35 scene is
-  pinned as contained — that would be seed-shopping; the battery
-  pins its close-up, its degraded honesty scene and its refusals,
+  height changed by 1 mm. The architecture review reproduced the
+  misses at 134-138 px with healthy fit statistics, so the mini
+  now REFUSES outside its demonstrated close-up envelope
+  (measure.CARD_ENVELOPE_MIN_PX: ~190 px across or more) — the
+  degraded mid-distance scene that used to answer with a ballooned
+  +/-100% range is pinned as a refusal instead. No mid-distance
+  AH-35 scene is pinned as contained — that would be
+  seed-shopping; the battery pins its close-up and its refusals,
   and ESTIMATOR.md discloses the variance.
 - AH-BIG holds +/-2.5-3.5% at 2-3x distance, degraded included,
   and contains at 4x inside the caution band.
@@ -50,21 +52,13 @@ import pytest
 
 from agenthand import measure
 
-REAL_PROFILE = (
-    Path.home()
-    / "workspace"
-    / "meta-hackathon"
-    / "scale-card"
-    / "print"
-    / "layout-profile.json"
-)
+REAL_PROFILE = Path(__file__).parent / "fixtures" / "layout-profile.json"
 SCALED_PROFILE = (
     Path(__file__).parent / "fixtures" / "scaled-card-profiles.json"
 )
-pytestmark = pytest.mark.skipif(
-    not REAL_PROFILE.exists() or not SCALED_PROFILE.exists(),
-    reason="layout profiles not present",
-)
+# Both profiles are vendored under tests/fixtures, so the battery
+# runs on any clone — no skip guard. (It previously keyed off a
+# profile outside the repo and skipped silently on clean checkouts.)
 
 PHOTO_W, PHOTO_H = 1800, 1250
 INK = (17, 17, 17)
@@ -342,14 +336,28 @@ def test_caution_band_range_is_widened(battery):
     assert any("small in frame" in w for w in r["warnings"])
 
 
-def test_degraded_mini_blows_range_honestly(battery):
-    # AH-35 + blur/noise/gradient at 1.5x: the range balloons past
-    # +/-30% (useless in practice) but still contains the truth.
-    # At the 3x2 size the balloon is past +/-100%.
+def test_degraded_mini_refuses_outside_its_envelope(battery):
+    # AH-35 + blur/noise/gradient at mid distance: this scene used to
+    # answer with a ballooned (+/-100%) range that contained the
+    # truth on the battery's seed — but the architecture review
+    # reproduced centre errors beyond the quoted ranges at this size
+    # and distance band on other seeds, with healthy fit statistics.
+    # Outside its demonstrated close-up envelope the mini refuses.
     row = battery["ah35_degraded_mid"]
+    assert row["refused"]
+    assert "AH-35" in row["error"]
+    assert "close-up" in row["error"]
+    assert "bigger card" in row["error"].lower()
+
+
+def test_mini_close_up_still_answers_inside_its_envelope(battery):
+    # The demonstrated envelope: ~200 px across, clean light. The
+    # envelope floor must not refuse the one scene class the mini is
+    # validated for.
+    row = battery["ah35_close"]
+    assert row["card_px"] >= measure.CARD_ENVELOPE_MIN_PX["AH-35"]
     assert not row["refused"]
     assert row["contained"]
-    assert row["result"]["range_pct"] > 30.0
 
 
 def test_no_wild_numbers_anywhere(battery):

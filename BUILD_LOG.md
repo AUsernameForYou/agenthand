@@ -402,3 +402,16 @@ The four-lane architecture review (verdict in
   results name the phrase the model actually returned. None when the
   concept passed through intact. The rewrite behavior itself is
   unchanged (it is the plan contract); it is no longer silent.
+- Fix 5 — estimator profile vendored; AH-35 envelope refusal. The
+  layout profile now lives at tests/fixtures/layout-profile.json
+  (verbatim copy of the print profile, with a sync-guard test that
+  compares AH-46 against the print profile when both are present),
+  so the 28 estimator tests that silently skipped on any machine
+  without ~/workspace/meta-hackathon now run on a clean clone. And
+  the AH-35 mini refuses below ~190 px across
+  (CARD_ENVELOPE_MIN_PX): the architecture review reproduced
+  centre errors beyond its quoted ranges at 134-138 px with
+  healthy fit statistics, so outside its demonstrated close-up
+  envelope (~200 px, clean light) it no longer answers at all.
+  The degraded mid-distance scene that used to answer at ±111%
+  is pinned as a refusal; the close-up still answers.

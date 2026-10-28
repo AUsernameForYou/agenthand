@@ -97,6 +97,19 @@ MIN_CARD_PX = 130.0
 COMFORT_CARD_PX = 170.0
 _SMALL_CARD_SYS_MAX = 0.055
 
+# Per-card envelope floors (architecture Gauntlet fix 5): the
+# universal floor is not enough for every card. The 3x2 mini (AH-35)
+# is measurably noisier than the size it replaced: the architecture
+# review reproduced centre errors beyond the quoted ranges at
+# 134-138 px across with healthy-looking fit statistics, and
+# multi-seed probes missed at points across 130-210 px. The one
+# envelope the battery demonstrates as dependable is close-ups at
+# ~200 px across in clean light, so AH-35 refuses below 190 px —
+# inside its demonstrated close-up envelope or not at all. Other
+# cards keep the universal floor until their own batteries say
+# otherwise.
+CARD_ENVELOPE_MIN_PX = {"AH-35": 190.0}
+
 # Arm name -> (vertex key, direction in card-mm space). Ticks in the
 # profile are ordered by fraction_from_vertex ascending, which is the
 # start->end order along every arm under these directions.
@@ -1001,7 +1014,8 @@ def estimate(
     pixels (card_width_px), and warnings. The display string is the
     only user-facing form: it always carries the range. A card that
     spans too few pixels in frame raises MeasureError instead — see
-    MIN_CARD_PX.
+    MIN_CARD_PX, and CARD_ENVELOPE_MIN_PX for cards (the AH-35 mini)
+    whose validated envelope is narrower than the universal floor.
     """
     card = load_card_profile(profile_path, card_id)
     image = _load_image(source)
@@ -1017,6 +1031,15 @@ def estimate(
     # cannot see this failure mode — the RMS stays ~0.25 px while
     # the centre walks off — so the gate keys on card size alone.
     card_px = _card_width_px(H, card)
+    envelope_min = CARD_ENVELOPE_MIN_PX.get(card_id)
+    if envelope_min is not None and card_px < envelope_min:
+        raise MeasureError(
+            f"Card too small in frame for the {card_id} mini "
+            f"(~{card_px:.0f} px across; this card is only validated "
+            f"for close-ups at ~{envelope_min:.0f} px across or more, "
+            "where its ranges demonstrably cover the true size) — "
+            "move closer or use a bigger card."
+        )
     if card_px < MIN_CARD_PX:
         raise MeasureError(
             f"Card too small in frame (~{card_px:.0f} px across; the "

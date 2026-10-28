@@ -23,16 +23,19 @@ import pytest
 
 from agenthand import measure
 
-PROFILE_PATH = (
+PROFILE_PATH = Path(__file__).parent / "fixtures" / "layout-profile.json"
+# The layout profile is VENDORED (tests/fixtures/layout-profile.json,
+# a verbatim copy of the print profile) so this battery runs on any
+# clone. It used to point at ~/workspace/meta-hackathon/... and skip
+# silently everywhere else — 28 estimator tests that existed only on
+# Daniel's machines (architecture Gauntlet, all four lanes).
+PRINT_PROFILE_PATH = (
     Path.home()
     / "workspace"
     / "meta-hackathon"
     / "scale-card"
     / "print"
     / "layout-profile.json"
-)
-pytestmark = pytest.mark.skipif(
-    not PROFILE_PATH.exists(), reason="layout profile not present"
 )
 
 S = 5  # plane render scale, px per mm
@@ -191,6 +194,20 @@ CLEAN_CASES = [
     ((262.0, 110.0), (95.0, 60.0), 110),
     ((330.0, 120.0), (60.0, 40.0), 50),
 ]
+
+
+def test_vendored_profile_matches_the_print_profile_when_present():
+    # Sync guard for the vendored fixture: on a machine that also has
+    # the print profile (the scale-card print dir), the AH-46 entry
+    # the battery renders from must be identical to the printed one,
+    # so the fixture cannot drift from the physical card. On a clean
+    # clone the print profile is absent and this guard alone skips —
+    # the battery itself never does.
+    if not PRINT_PROFILE_PATH.exists():
+        pytest.skip("print profile not present on this machine")
+    vendored = json.loads(PROFILE_PATH.read_text(encoding="utf-8"))
+    printed = json.loads(PRINT_PROFILE_PATH.read_text(encoding="utf-8"))
+    assert vendored["cards"]["AH-46"] == printed["cards"]["AH-46"]
 
 
 @pytest.mark.parametrize("obj_xy,obj_wh,jitter", CLEAN_CASES)
