@@ -1047,6 +1047,18 @@ function initProof() {
       runVerification(true);
     });
   }
+
+  /* Deep link: ?tamper=1 runs the one-pixel tamper check on load, so
+   * the detection case can be linked directly instead of described.
+   * Any other query string leaves the page exactly as the buttons
+   * alone leave it. */
+  try {
+    if (new URLSearchParams(window.location.search).get("tamper") === "1") {
+      runVerification(true);
+    }
+  } catch (e) {
+    /* No usable query string: the buttons remain the only entry. */
+  }
 }
 
 if (typeof document !== "undefined") {
