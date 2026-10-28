@@ -124,11 +124,51 @@ server, and the two agree.
 
 ## Run it
 
+Register agenthand with any MCP client. The primary route uses
+[uv](https://docs.astral.sh/uv/): nothing to install ahead of time, uv
+fetches the published package and runs it.
+
+```json
+{
+  "mcpServers": {
+    "agenthand": {
+      "command": "uvx",
+      "args": ["agenthand"],
+      "env": { "META_API_KEY": "…" }
+    }
+  }
+}
+```
+
+Or install the package with pip and point the client at the installed
+command:
+
 ```bash
+pip install agenthand
+```
+
+```json
+{
+  "mcpServers": {
+    "agenthand": {
+      "command": "agenthand",
+      "env": { "META_API_KEY": "…" }
+    }
+  }
+}
+```
+
+The server starts and lists its tools without a key; the key is only
+needed when a tool makes a model call. Configuration is by environment
+variable; see `.env.example`.
+
+### From source (dev)
+
+```bash
+git clone https://github.com/AUsernameForYou/agenthand
+cd agenthand
 python3.12 -m venv .venv
 .venv/bin/pip install -e ".[dev]"
 .venv/bin/agenthand          # stdio transport
 .venv/bin/pytest             # unit tests
 ```
-
-Configuration is by environment variable; see `.env.example`.

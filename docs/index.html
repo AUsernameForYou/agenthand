@@ -455,22 +455,29 @@ function countChanged(fgData, outData, width, height, opts) {
     <p class="chapter"><span class="ch-no">03</span><span>Use it</span></p>
     <h2 id="use-h">An MCP server, over stdio today</h2>
     <p class="lede">agenthand speaks the Model Context Protocol. Run it locally and point any MCP client at it; a hosted endpoint comes later.</p>
-    <pre class="code" id="install-code">git clone https://github.com/AUsernameForYou/agenthand
-cd agenthand
-python3.12 -m venv .venv
-.venv/bin/pip install -e ".[dev]"
-.venv/bin/agenthand          <span class="c"># stdio transport</span></pre>
-    <button class="copy-btn" type="button" data-copy="install-code">Copy install</button>
-    <p>Then register it with your MCP client:</p>
-    <pre class="code" id="config-code">{
+    <pre class="code" id="install-code">{
   "mcpServers": {
     "agenthand": {
-      "command": "/path/to/agenthand/.venv/bin/agenthand",
+      "command": "uvx",
+      "args": ["agenthand"],
       "env": { "META_API_KEY": "&hellip;" }
     }
   }
 }</pre>
-    <button class="copy-btn" type="button" data-copy="config-code">Copy config</button>
+    <button class="copy-btn" type="button" data-copy="install-code">Copy config</button>
+    <p>That is the whole install: <a href="https://docs.astral.sh/uv/">uv</a> fetches the published package and runs it. The server starts and lists its tools without a key; the key is only needed when a tool makes a model call. Prefer pip? Install the package and register the installed command instead:</p>
+    <pre class="code" id="config-code">pip install agenthand
+
+{
+  "mcpServers": {
+    "agenthand": {
+      "command": "agenthand",
+      "env": { "META_API_KEY": "&hellip;" }
+    }
+  }
+}</pre>
+    <button class="copy-btn" type="button" data-copy="config-code">Copy pip route</button>
+    <p>From source (dev): <span style="font-family:ui-monospace,Menlo,Consolas,monospace">git clone https://github.com/AUsernameForYou/agenthand</span>, then <span style="font-family:ui-monospace,Menlo,Consolas,monospace">.venv/bin/pip install -e ".[dev]"</span> and run <span style="font-family:ui-monospace,Menlo,Consolas,monospace">.venv/bin/agenthand</span>.</p>
     <p class="note">Images travel as <span style="font-family:ui-monospace,Menlo,Consolas,monospace">asset://</span> handles, not bytes, so tools chain: identify plans, cut_out returns a handle, draw consumes it. Every billable call passes one spend cap with reserve-then-settle receipts, and the server refuses to spend when the ledger cannot be trusted.</p>
   </section>
 
