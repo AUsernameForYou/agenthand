@@ -45,6 +45,52 @@ def test_settle_records_actual_cost_and_usage():
     assert settled["usd_estimate"] == 0.15
 
 
+def test_missing_usage_settles_at_the_reservation_not_zero():
+    # GPT's reproduction: the provider response carried no usage, the
+    # call priced to $0, and the $0.25 reservation evaporated from the
+    # total. Fail-closed: a call that cannot be priced settles at its
+    # reserved projection — the reservation stays counted.
+    result = meta_client.billed_call(
+        "identify", "muse-spark-1.3", 0.25, lambda: {}
+    )
+    assert result["actual_usd"] == 0.25
+    assert result["usage_missing"] is True
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == 0.25
+    records = _records()
+    assert [r["phase"] for r in records] == ["pending", "settled"]
+    assert records[1]["usd_estimate"] == 0.25
+    assert "usage_missing" in records[1]["note"]
+
+
+def test_none_usage_also_settles_at_the_reservation():
+    result = meta_client.billed_call(
+        "identify", "muse-spark-1.3", 0.25, lambda: None
+    )
+    assert result["actual_usd"] == 0.25
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == 0.25
+
+
+def test_response_without_a_usage_object_is_unusable():
+    # _usage_of feeds billed_call; a chat response with no usage
+    # object at all cannot be priced, so it is an unusable response —
+    # the reservation stays counted via the exception path.
+    from types import SimpleNamespace
+
+    with pytest.raises(meta_client.IdentifyResultError):
+        meta_client._usage_of(SimpleNamespace(choices=[]))
+
+
+def test_zero_projection_stub_call_still_settles_zero(tmp_path, monkeypatch):
+    # The placeholder-plate dev path reserves $0 by design; the
+    # fail-closed settle must not invent spend for it.
+    result = meta_client.billed_call(
+        "draw", "muse-image-1.0", 0.0, lambda: {}, status="stub"
+    )
+    assert result["actual_usd"] == 0.0
+    assert result["usage_missing"] is False
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == 0.0
+
+
 def test_exception_after_send_leaves_reservation_counted():
     def boom():
         raise RuntimeError("provider timed out; the call may have billed")

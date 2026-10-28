@@ -33,3 +33,22 @@ def test_negative_cap_fails_closed(monkeypatch):
     monkeypatch.setenv("AGENTHAND_TOTAL_SPEND_CAP_USD", "-5")
     with pytest.raises(ValueError):
         config.get_total_spend_cap_usd()
+
+
+def test_ledger_path_defaults_inside_the_data_dir(monkeypatch, tmp_path):
+    monkeypatch.delenv("AGENTHAND_LEDGER_PATH", raising=False)
+    monkeypatch.setenv("AGENTHAND_DATA_DIR", str(tmp_path))
+    assert config.get_ledger_path() == tmp_path / "ledger.jsonl"
+
+
+def test_ledger_path_env_override_separates_ledger_from_data_dir(
+    monkeypatch, tmp_path
+):
+    # The dry-run gate isolates its asset store in a temp dir but must
+    # spend against the REAL ledger, or gate runs reset the cumulative
+    # cap accounting (architecture Gauntlet fix 3).
+    data_dir = tmp_path / "store"
+    real_ledger = tmp_path / "real" / "ledger.jsonl"
+    monkeypatch.setenv("AGENTHAND_DATA_DIR", str(data_dir))
+    monkeypatch.setenv("AGENTHAND_LEDGER_PATH", str(real_ledger))
+    assert config.get_ledger_path() == real_ledger

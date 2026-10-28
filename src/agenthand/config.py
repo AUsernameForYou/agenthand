@@ -33,6 +33,20 @@ def get_data_dir() -> Path:
 
 
 def get_ledger_path() -> Path:
+    """Where the spend ledger lives.
+
+    Defaults to ``ledger.jsonl`` inside the data dir. The
+    AGENTHAND_LEDGER_PATH override separates the ledger from the asset
+    store: the dry-run gate isolates its store in a temp dir (gate
+    assets must never pollute the verified store) but spends against
+    the real ledger, so gate spend counts toward the same cumulative
+    cap as everything else. Before this override existed, every gate
+    run started against a fresh empty ledger with a full cap —
+    a way around the spend cap (architecture Gauntlet fix 3).
+    """
+    raw = os.environ.get("AGENTHAND_LEDGER_PATH", "").strip()
+    if raw:
+        return Path(raw).expanduser()
     return get_data_dir() / "ledger.jsonl"
 
 

@@ -380,3 +380,18 @@ The four-lane architecture review (verdict in
   pinning its hashes (the frozen replay package's) fall back to the
   mask file's record integrity; the replay package still verifies
   PASS under the hardened verifier.
+- Fix 3 — fail-closed accounting. A priced call whose provider usage
+  is missing/empty used to settle at $0, superseding and erasing its
+  reservation (GPT reproduced $0.25 -> $0 counted); billed_call now
+  settles such calls at the reserved projection with a usage_missing
+  note, and _usage_of raises on a response with no usage object.
+  The dry-run gate no longer resets cumulative accounting: config
+  gained AGENTHAND_LEDGER_PATH, the gate isolates only its asset
+  store and spends against the real ledger (the billing lock now
+  lives beside the ledger it guards), and the gate reports per-tool
+  costs as ledger deltas — which also fixes its silent under-report
+  of cut_out (SAM only, internal identify invisible). The gate's
+  mask_review summary read keys review_mask never emits
+  (fill/frame_edge_contact); now bbox_fill/touches_frame_edges.
+  README's cap claim corrected to what the code does (working cap
+  configurable up to the $150 hard ceiling, never past it).

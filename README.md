@@ -84,17 +84,20 @@ under a file lock, the projected worst-case cost is checked against the
 ledger and reserved as a pending receipt; after the call, a settlement
 receipt records the actual cost priced from the provider's usage counts.
 If a call fails after it may have billed, the reservation stays counted.
+A call whose provider response carries no usable usage settles at its
+reserved projection rather than $0: missing usage never erases spend.
 Receipts land in a local JSONL ledger with tool, model, token and image
 counts, USD estimate, and the pricing-table version used. Prices live in
 one module (`src/agenthand/pricing.py`) so a price change is a one-line
 edit with a version bump; an unpriced model raises rather than estimating
-as $0.
+as $0. Every spend path shares the one ledger — the dry-run gate
+included (its asset store is isolated in a temp dir, its ledger is not).
 
 The server is fail-closed on spend. The working cap defaults to
-**$120.00** and can only be lowered by configuration; a hard ceiling of
-**$150.00** (the hackathon credit amount) cannot be exceeded. Corrupt,
-negative, or non-finite ledger entries refuse all spend: unknown spend
-state means no spend.
+**$120.00**; configuration may move it up or down but never past the
+hard ceiling of **$150.00** (the hackathon credit amount), which no
+configuration can exceed. Corrupt, negative, or non-finite ledger
+entries refuse all spend: unknown spend state means no spend.
 
 ## Status
 

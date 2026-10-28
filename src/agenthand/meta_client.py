@@ -11,7 +11,9 @@ reserve-then-settle accounting against the spend cap:
 2. The call runs (the lock is NOT held across the network call; the
    reservation on disk is what makes the spend visible to other callers).
 3. A "settled" receipt is appended with the actual cost, priced from the
-   usage the provider returned, usage counts included.
+   usage the provider returned, usage counts included. A priced call
+   whose usage is missing (prices to $0) settles at its reserved
+   projection instead: the reservation stays counted.
 4. If the call raises, no settlement is written: the reservation stays
    counted at its projected cost. A call that may have billed us is
    treated as having billed us.
@@ -55,10 +57,16 @@ _current_call_id: ContextVar[str | None] = ContextVar(
 )
 
 
-def _lock_file(data_dir: Path):
-    """Open (creating if needed) the ledger lock file. Caller closes it."""
-    data_dir.mkdir(parents=True, exist_ok=True)
-    return (data_dir / "ledger.lock").open("a+")
+def _lock_file(ledger_dir: Path):
+    """Open (creating if needed) the ledger lock file. Caller closes it.
+
+    The lock lives beside the LEDGER it guards, not beside the asset
+    store: with AGENTHAND_LEDGER_PATH separating the two (the dry-run
+    gate), two processes sharing one ledger through different data
+    dirs must still serialize on the same lock file.
+    """
+    ledger_dir.mkdir(parents=True, exist_ok=True)
+    return (ledger_dir / "ledger.lock").open("a+")
 
 
 def billed_call(
@@ -80,8 +88,11 @@ def billed_call(
         projected_usd: Worst-case cost reserved before the call runs.
         fn: Zero-argument callable performing the call. Returns a usage
             dict (any of input_tokens, output_tokens, cached_input_tokens,
-            images); the settled cost is priced from it. May return None
-            for zero usage.
+            images); the settled cost is priced from it. If a priced
+            call's usage prices to $0 (missing or empty), the call
+            settles at its reserved projection instead — missing usage
+            never erases a reservation. The returned dict's
+            usage_missing flag reports when that happened.
         status: Receipt status ("ok", or "stub" while a tool is unwired).
         note: Receipt note (stub explanations etc.).
 
@@ -100,13 +111,12 @@ def billed_call(
     # Validate the projection before anything is written.
     ledger._validate_amount(projected_usd, "projected cost")
 
-    data_dir = config.get_data_dir()
     ledger_path = config.get_ledger_path()
     cap_usd = config.get_total_spend_cap_usd()
     call_id = uuid.uuid4().hex
 
     # Reserve: check + append pending, atomically under the file lock.
-    with _lock_file(data_dir) as lock_fh:
+    with _lock_file(ledger_path.parent) as lock_fh:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
         ledger.check_spend_cap(ledger_path, projected_usd, cap_usd)
         ledger.append_receipt(
@@ -134,8 +144,28 @@ def billed_call(
 
     actual_usd = pricing.estimate_cost_usd(model, **usage) if model else 0.0
 
+    # Fail-closed settlement (architecture Gauntlet fix 3): a priced
+    # call whose reported usage prices to $0 has no trustworthy actual.
+    # Settling $0 would supersede the reservation in the ledger total
+    # and erase spend that may well have billed, so the call settles
+    # at its reserved projection instead — the reservation stays
+    # counted, and the settled receipt's note says why. A $0
+    # reservation (the placeholder-plate stub path) is exempt: it
+    # reserved nothing, so there is nothing to preserve.
+    usage_missing = bool(
+        model is not None and projected_usd > 0 and actual_usd == 0.0
+    )
+    settle_note = note
+    if usage_missing:
+        actual_usd = float(projected_usd)
+        suffix = (
+            "usage_missing: provider reported no usable usage; "
+            "settled at the reserved projection (fail-closed)"
+        )
+        settle_note = f"{note} | {suffix}" if note else suffix
+
     # Settle: append the actual, with the usage counts stored on the receipt.
-    with _lock_file(data_dir) as lock_fh:
+    with _lock_file(ledger_path.parent) as lock_fh:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
         ledger.append_receipt(
             ledger_path,
@@ -150,7 +180,7 @@ def billed_call(
                 status=status,
                 phase=ledger.PHASE_SETTLED,
                 call_id=call_id,
-                note=note,
+                note=settle_note,
             ),
         )
 
@@ -159,6 +189,7 @@ def billed_call(
         "projected_usd": float(projected_usd),
         "actual_usd": actual_usd,
         "usage": usage,
+        "usage_missing": usage_missing,
     }
 
 
@@ -362,10 +393,20 @@ def _usage_of(response) -> UsageDict:
     prompt_tokens is the total input; its cached subset rides in
     prompt_tokens_details.cached_tokens (the convention pricing.py
     documents).
+
+    A response with NO usage object raises IdentifyResultError: the
+    call cannot be priced from nothing, and silently mapping it to {}
+    used to settle the reservation at $0 — spend that may have billed
+    vanished from the ledger (architecture Gauntlet fix 3). Raising
+    leaves the reservation counted at its projection.
     """
     usage = getattr(response, "usage", None)
     if usage is None:
-        return {}
+        raise IdentifyResultError(
+            "The model's response carried no usage counts, so the "
+            "call cannot be priced; treating the response as unusable "
+            "and leaving the reservation counted."
+        )
     cached = 0
     details = getattr(usage, "prompt_tokens_details", None)
     if details is not None:

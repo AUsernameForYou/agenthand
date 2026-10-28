@@ -32,7 +32,16 @@ warnings, and checks the draw receipt hard:
 GATE: PASS only if every run is clean. Anything else is FAIL, with the
 failing run and check named. Runs use an isolated data dir (a temp
 dir; --keep-data-dir DIR to keep it) so the verified store is never
-polluted by gate runs.
+polluted by gate runs. The LEDGER is deliberately NOT isolated: gate
+spend lands in the repo's real ledger (AGENTHAND_LEDGER_PATH), so it
+counts toward the same cumulative spend cap as everything else.
+Earlier versions pointed the data dir at a temp folder and the ledger
+went with it — every gate run started against an empty ledger with a
+full cap (architecture Gauntlet fix 3). --keep-data-dir isolates the
+ledger too; use it only for offline rehearsal. Per-tool costs are
+read as ledger deltas across each call, so they are the amounts the
+cap actually counted — including cut_out's internal identify call,
+which cut_out's own cost_usd does not include.
 
 This spends REAL Meta credits. The key comes from the repo .env via
 agenthand's config — never from an argument, never printed. Before
@@ -64,7 +73,7 @@ sys.path.insert(0, str(REPO / "src"))
 _GATE_DIR = Path(tempfile.mkdtemp(prefix="agenthand-gate-"))
 os.environ["AGENTHAND_DATA_DIR"] = str(_GATE_DIR)
 
-from agenthand import composite, config, server  # noqa: E402
+from agenthand import composite, config, ledger, server  # noqa: E402
 from agenthand.assets import AssetStore  # noqa: E402
 
 DEFAULT_PHOTO = REPO / "tests" / "fixtures" / "chair_photo.jpg"
@@ -77,25 +86,33 @@ def _data_uri(photo: Path) -> str:
     return f"data:{mime};base64," + base64.b64encode(photo.read_bytes()).decode()
 
 
+def _ledger_total() -> float:
+    return ledger.ledger_total_usd(config.get_ledger_path())
+
+
 def _run_once(run_no: int, data_uri: str, scene: str, store: AssetStore) -> dict:
     out: dict = {"run": run_no, "ok": False, "problems": [], "timings_s": {}, "costs_usd": {}}
 
+    # Costs are ledger deltas: what the cap actually counted for the
+    # step, reservations included on failure — not the tools' own
+    # settled-cost fields (cut_out's excludes its internal identify).
+    spent_before = _ledger_total()
     t0 = time.perf_counter()
     ident = server.identify(data_uri)
     out["timings_s"]["identify"] = round(time.perf_counter() - t0, 2)
-    out["costs_usd"]["identify"] = ident.get("cost_usd", 0.0)
+    out["costs_usd"]["identify"] = round(_ledger_total() - spent_before, 6)
     if ident.get("status") != "ok":
         out["problems"].append(f"identify failed: {ident.get('error')}")
         return out
     out["concept"] = ident.get("concept")
 
+    spent_before = _ledger_total()
     t0 = time.perf_counter()
     cut = server.cut_out(ident["image"])
     out["timings_s"]["cut_out"] = round(time.perf_counter() - t0, 2)
-    out["costs_usd"]["cut_out"] = cut.get("cost_usd", 0.0)
+    out["costs_usd"]["cut_out"] = round(_ledger_total() - spent_before, 6)
     if cut.get("status") != "ok":
         error = cut.get("error") or {}
-        out["costs_usd"]["cut_out"] = error.get("cost_counted_usd", 0.0)
         out["problems"].append(f"cut_out failed: {error}")
         return out
     out["cut_out_concept"] = cut.get("concept")
@@ -103,14 +120,17 @@ def _run_once(run_no: int, data_uri: str, scene: str, store: AssetStore) -> dict
     review = cut.get("mask_review") or {}
     out["mask_review_warnings"] = review.get("warnings", [])
     out["mask_review"] = {
-        k: review.get(k) for k in ("bbox", "fill", "frame_edge_contact") if k in review
+        k: review.get(k)
+        for k in ("bbox", "bbox_fill", "touches_frame_edges")
+        if k in review
     }
 
+    spent_before = _ledger_total()
     t0 = time.perf_counter()
     draw_out = server.draw(cut["output_asset"], scene)
     out["timings_s"]["draw"] = round(time.perf_counter() - t0, 2)
     draw = draw_out[0] if isinstance(draw_out, list) else draw_out
-    out["costs_usd"]["draw"] = draw.get("cost_usd", 0.0)
+    out["costs_usd"]["draw"] = round(_ledger_total() - spent_before, 6)
     if draw.get("status") != "ok":
         out["problems"].append(f"draw failed: {draw.get('error')}")
         return out
@@ -158,6 +178,13 @@ def main() -> int:
 
     if args.keep_data_dir:
         os.environ["AGENTHAND_DATA_DIR"] = str(args.keep_data_dir)
+    elif not os.environ.get("AGENTHAND_LEDGER_PATH"):
+        # Isolated store, REAL ledger: the gate's asset store lives in
+        # the temp dir set at import, but its spend must land in the
+        # repo's ledger (the data dir config would use without the
+        # gate's override) so the cumulative cap sees it.
+        os.environ["AGENTHAND_LEDGER_PATH"] = str(REPO / "data" / "ledger.jsonl")
+    print(f"ledger: {config.get_ledger_path()}")
 
     projected = PER_RUN_PROJECTION_USD * args.runs
     print(f"photo: {args.photo}")
