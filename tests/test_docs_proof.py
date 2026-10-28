@@ -2,7 +2,8 @@
 
 The badass Gauntlet found the browser verifier grading hard-coded
 constants while the page claimed nothing was retyped. The honesty
-pass (verifier-v4.js) grades the run's published receipt instead —
+pass (verifier-v4.js, extended by verifier-v5.js) grades the run's
+published receipt instead —
 and these tests pin the whole arrangement down:
 
 - the 580,613 / 0 figure is what _measure actually finds on the
@@ -55,8 +56,11 @@ def test_published_receipt_matches_the_served_files():
     assert RECEIPT["output_sha256"] == _sha256(DOCS / "proof-output-v1.png")
     layer = Image.open(DOCS / "proof-layer-v1.png")
     output = Image.open(DOCS / "proof-output-v1.png")
+    mask = Image.open(DOCS / "proof-mask-v1.png")
     assert RECEIPT["foreground_pixel_sha256"] == pixel_hash_of_image(layer)
     assert RECEIPT["output_pixel_sha256"] == pixel_hash_of_image(output)
+    assert RECEIPT["mask_pixels_total"] == RECEIPT["opaque_pixels"]
+    assert mask.size == layer.size == output.size
 
 
 def test_page_figures_agree_with_the_receipt():
@@ -68,7 +72,7 @@ def test_page_figures_agree_with_the_receipt():
 
 
 def test_verifier_grades_the_receipt_not_constants():
-    js = (DOCS / "verifier-v4.js").read_text(encoding="utf-8")
+    js = (DOCS / "verifier-v5.js").read_text(encoding="utf-8")
     assert "proof-receipt-v1.json" in js
     for field in (
         "source_sha256",
@@ -82,8 +86,12 @@ def test_verifier_grades_the_receipt_not_constants():
     assert "580,613" not in js
     # Zero changed is the law in code, not an expectation from data.
     assert "counts.changed === 0" in js
+    assert "counts.changed === 1" in js  # the separate tamper-detection law
     page = (DOCS / "index.html").read_text(encoding="utf-8")
-    assert 'src="verifier-v4.js"' in page
+    assert 'src="verifier-v5.js"' in page
+    assert 'id="verify-btn"' in page
+    assert 'id="verify-tamper-btn"' in page
+    assert 'id="verify-tamper"' not in page  # no checkbox gate before the click
 
 
 def test_displayed_counting_code_matches_the_verifier_file():
@@ -92,11 +100,11 @@ def test_displayed_counting_code_matches_the_verifier_file():
     pre = page[page.index('<pre class="code">', start) : page.index("</pre>", start)]
     displayed = html_module.unescape(re.sub(r"<[^>]+>", "", pre)).strip()
 
-    js = (DOCS / "verifier-v4.js").read_text(encoding="utf-8")
+    js = (DOCS / "verifier-v5.js").read_text(encoding="utf-8")
     match = re.search(
         r"/\* Replicates composite\.py.*?\n\}\n", js, flags=re.DOTALL
     )
-    assert match, "countChanged not found in verifier-v4.js"
+    assert match, "countChanged not found in verifier-v5.js"
     shipped = match.group(0).strip()
     assert displayed == shipped
 
@@ -124,6 +132,15 @@ verdict = v.verdictFor(doctored, { checked: exp.expectedChecked, changed: 5 });
 if (verdict.pass) throw new Error("doctored receipt passed");
 verdict = v.verdictFor(exp, { checked: exp.expectedChecked, changed: 1 });
 if (verdict.pass) throw new Error("one changed pixel passed");
+// The separate tamper case succeeds only on exact detection: full
+// coverage, exactly one changed pixel, receipt still reporting zero,
+// and the decoded output pixel hash no longer matching.
+if (!v.onePixelTamperDetected(exp, { checked: exp.expectedChecked, changed: 1 }, false))
+  throw new Error("exact one-pixel tamper not detected");
+if (v.onePixelTamperDetected(exp, { checked: exp.expectedChecked, changed: 1 }, true))
+  throw new Error("tamper passed while output pixel hash still matched");
+if (v.onePixelTamperDetected(exp, { checked: exp.expectedChecked, changed: 2 }, false))
+  throw new Error("two changed pixels accepted as the one-pixel case");
 verdict = v.verdictFor(exp, { checked: 0, changed: 0 });
 if (verdict.pass) throw new Error("zero coverage passed");
 // ICC scan: the real fixture has no iCCP; a synthetic one does.
@@ -144,7 +161,7 @@ console.log("node helpers ok");
         [
             "node",
             str(script),
-            str(DOCS / "verifier-v4.js"),
+            str(DOCS / "verifier-v5.js"),
             str(DOCS / "proof-receipt-v1.json"),
             str(DOCS / "proof-layer-v1.png"),
         ],
