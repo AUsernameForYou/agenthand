@@ -694,6 +694,310 @@ def test_sample_video_frames_without_ffmpeg(tmp_path):
     assert note and "ffmpeg" in note
 
 
+# ---------------------------------------------------------------------------
+# Narration: the seller's voice names the items (Baseten / Spark Open).
+# The narration call is injected as a fake, so no test here can reach
+# Baseten or spend from either pool. The audio files are real WAVs
+# written with the stdlib, so extraction, probing, and the silence
+# gate all run their production code.
+# ---------------------------------------------------------------------------
+
+
+def _wav_file(path: Path, *, seconds: float = 1.0, rate: int = 8000, peak: float = 0.5) -> Path:
+    import math
+    import struct
+    import wave as wave_mod
+
+    with wave_mod.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(
+            b"".join(
+                struct.pack(
+                    "<h", int(peak * 32767 * math.sin(2 * math.pi * 440 * i / rate))
+                )
+                for i in range(int(seconds * rate))
+            )
+        )
+    return path
+
+
+class FakeNarration:
+    """The Baseten narration call, faked at the roomrun boundary."""
+
+    def __init__(self, reply: str = "", *, error: Exception | None = None):
+        self.reply = reply
+        self.error = error
+        self.calls: list[Path] = []
+
+    def __call__(self, audio_path: Path) -> dict:
+        self.calls.append(Path(audio_path))
+        if self.error is not None:
+            raise self.error
+        return {
+            "reply": self.reply,
+            "usage": {"prompt_tokens": 1000, "completion_tokens": 500, "total_tokens": 1500},
+            "latency_ms": 123,
+            "model": roomrun.NARRATION_MODEL,
+        }
+
+
+_NARRATION_REPLY = (
+    "TRANSCRIPT\n"
+    "Alright, sell this filter. Also some suitcases and other junk here.\n\n"
+    "SELLING\n"
+    "filter\n\n"
+    "MENTIONED\n"
+    "suitcase\n"
+)
+
+
+def _run_narrated(tmp_path, photos, fake, narration_fn, **kwargs):
+    kwargs.setdefault("budget_usd", 5.00)
+    kwargs.setdefault("verify_fn", _verify_ok)
+    return roomrun.run_room(
+        photos,
+        [],
+        tmp_path / "out",
+        store=fake.store,
+        chain=fake.chain(),
+        spend_probe=lambda: fake.spend,
+        narration_fn=narration_fn,
+        **kwargs,
+    )
+
+
+def test_parse_narration_reply_splits_named_and_mentioned():
+    parsed = roomrun.parse_narration_reply(_NARRATION_REPLY)
+    assert parsed["transcript"].startswith("Alright, sell this filter.")
+    assert parsed["selling"] == ["filter"]
+    assert parsed["mentioned"] == ["suitcase"]
+
+
+def test_parse_narration_reply_cleans_bullets_and_none():
+    parsed = roomrun.parse_narration_reply(
+        "TRANSCRIPT:\nhello\nSELLING:\n- red bike\n2. blue chair\nMENTIONED:\nNONE\n"
+    )
+    assert parsed["selling"] == ["red bike", "blue chair"]
+    assert parsed["mentioned"] == []
+
+
+def test_parse_narration_reply_without_headings_is_all_transcript():
+    parsed = roomrun.parse_narration_reply("just some words the model said")
+    assert parsed["transcript"] == "just some words the model said"
+    assert parsed["selling"] == [] and parsed["mentioned"] == []
+
+
+def test_probe_wav_and_cost_projection():
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as td:
+        loud = _wav_file(Path(td) / "loud.wav", seconds=2.0, peak=0.5)
+        duration, peak = roomrun.probe_wav(loud)
+        assert duration == pytest.approx(2.0, abs=0.01)
+        assert peak == pytest.approx(0.5, abs=0.02)
+        silent = _wav_file(Path(td) / "silent.wav", seconds=1.0, peak=0.0)
+        _, silent_peak = roomrun.probe_wav(silent)
+        assert silent_peak == 0.0
+    # Published rates: $1.25/M in, $4.25/M out; audio priced at
+    # 150 tokens/s plus the fixed prompt allowance, output at the cap.
+    projected = roomrun.project_narration_cost_usd(10.0)
+    assert projected == pytest.approx(
+        (10.0 * 150 + 512) * 1.25e-6 + 4096 * 4.25e-6
+    )
+    assert roomrun.narration_cost_usd(
+        {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
+    ) == pytest.approx(1.25 + 4.25)
+    assert roomrun.narration_cost_usd({}) is None
+
+
+def test_narrated_run_stages_named_and_confirms_mentioned(tmp_path):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "purifier.jpg"), _photo(tmp_path, "case.jpg", (200, 90, 10))]
+    fake = FakeChain(
+        store,
+        plans=[_plan("air purifier"), _plan("orange suitcase")],
+        contents={(0, "filter"): "filter1", (1, "suitcase"): "case1"},
+    )
+    narration = FakeNarration(_NARRATION_REPLY)
+    audio = _wav_file(tmp_path / "walk.wav")
+    manifest = _run_narrated(
+        tmp_path, photos, fake, narration, narrated_audios=[audio]
+    )
+    assert manifest["mode"] == "narrated"
+    assert len(narration.calls) == 1
+
+    section = manifest["narration"]
+    record = section["files"][0]
+    assert record["error"] is None
+    assert record["transcript"].startswith("Alright, sell this filter.")
+    assert record["named_items"] == ["filter"]
+    assert record["mentioned_items"] == ["suitcase"]
+    assert section["usage"]["total_tokens"] == 1500
+    # Baseten spend is priced at the published rates and kept OUT of
+    # the Meta room total.
+    assert section["cost_usd_estimate"] == pytest.approx(1000 * 1.25e-6 + 500 * 4.25e-6)
+    assert manifest["baseten_cost_usd_estimate"] == section["cost_usd_estimate"]
+    assert manifest["total_cost_usd"] == pytest.approx(fake.spend)
+    transcript_path = Path(section["transcript_file"])
+    assert transcript_path.exists()
+    assert "sell this filter" in transcript_path.read_text()
+
+    items = {i["name"]: i for i in manifest["items"]}
+    assert items["filter"]["status"] == "staged"
+    assert items["filter"]["narration"] == {"kind": "named", "source": str(audio)}
+    assert items["filter"]["verification"]["ok"] is True
+    suitcase = items["suitcase"]
+    assert suitcase["status"] == "staged"  # mentioned, then visually confirmed
+    assert suitcase["narration"]["kind"] == "mentioned"
+    assert any("mentioned in passing" in f for f in suitcase["flags"])
+    summary = (tmp_path / "out" / "summary.txt").read_text()
+    assert "NARRATION" in summary and "sell this filter" in summary
+
+
+def test_narrated_mentioned_item_refuted_when_not_visible(tmp_path):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "purifier.jpg")]
+    fake = FakeChain(
+        store,
+        plans=[_plan("air purifier")],
+        contents={(0, "filter"): "filter1"},  # no unicycle anywhere
+    )
+    narration = FakeNarration(
+        "TRANSCRIPT\nsell this filter, and there is a unicycle somewhere\n"
+        "SELLING\nfilter\nMENTIONED\nunicycle\n"
+    )
+    manifest = _run_narrated(
+        tmp_path, photos, fake, narration,
+        narrated_audios=[_wav_file(tmp_path / "walk.wav")],
+    )
+    items = {i["name"]: i for i in manifest["items"]}
+    assert items["filter"]["status"] == "staged"
+    unicycle = items["unicycle"]
+    assert unicycle["status"] == "failed"  # refuted by the visual pipeline
+    assert unicycle["failure"]["stage"] == "cut_out"
+    assert unicycle["narration"]["kind"] == "mentioned"
+    assert unicycle["sightings"]  # the refutation evidence is recorded
+
+
+def test_narration_failure_is_a_row_and_the_stills_run_continues(tmp_path):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "case.jpg", (200, 90, 10))]
+    fake = FakeChain(
+        store,
+        plans=[_plan("orange suitcase")],
+        contents={(0, "orange suitcase"): "case1"},
+    )
+    narration = FakeNarration(error=RuntimeError("baseten is down"))
+    manifest = _run_narrated(
+        tmp_path, photos, fake, narration,
+        item_names=["orange suitcase"],
+        narrated_audios=[_wav_file(tmp_path / "walk.wav")],
+    )
+    record = manifest["narration"]["files"][0]
+    assert record["error"]["code"] == "NARRATION_FAILED"
+    assert "baseten is down" in record["error"]["message"]
+    assert manifest["mode"] == "named"
+    assert manifest["items"][0]["status"] == "staged"  # stills-only mode intact
+    assert any("NARRATION_FAILED" in n for n in manifest["notes"])
+
+
+def test_silent_track_never_reaches_the_model(tmp_path):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "case.jpg", (200, 90, 10))]
+    fake = FakeChain(
+        store,
+        plans=[_plan("orange suitcase")],
+        contents={(0, "orange suitcase"): "case1"},
+    )
+    narration = FakeNarration(_NARRATION_REPLY)
+    manifest = _run_narrated(
+        tmp_path, photos, fake, narration,
+        item_names=["orange suitcase"],
+        narrated_audios=[_wav_file(tmp_path / "silent.wav", peak=0.0)],
+    )
+    record = manifest["narration"]["files"][0]
+    assert record["error"]["code"] == "SILENT_TRACK"
+    assert narration.calls == []  # no call was made, no pool was touched
+    assert manifest["items"][0]["status"] == "staged"
+
+
+def test_narration_cost_cap_refuses_before_the_call(tmp_path):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "case.jpg", (200, 90, 10))]
+    fake = FakeChain(
+        store,
+        plans=[_plan("orange suitcase")],
+        contents={(0, "orange suitcase"): "case1"},
+    )
+    narration = FakeNarration(_NARRATION_REPLY)
+    manifest = _run_narrated(
+        tmp_path, photos, fake, narration,
+        item_names=["orange suitcase"],
+        narrated_audios=[_wav_file(tmp_path / "walk.wav")],
+        narration_max_projected_usd=0.0001,
+    )
+    record = manifest["narration"]["files"][0]
+    assert record["error"]["code"] == "NARRATION_COST_REFUSED"
+    assert record["projected_cost_usd"] > 0.0001
+    assert narration.calls == []
+    assert manifest["items"][0]["status"] == "staged"
+
+
+def test_narration_annotates_a_typed_item_instead_of_duplicating(tmp_path):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "case.jpg", (200, 90, 10))]
+    fake = FakeChain(
+        store,
+        plans=[_plan("orange suitcase")],
+        contents={(0, "orange suitcase"): "case1"},
+    )
+    narration = FakeNarration(
+        "TRANSCRIPT\nthe orange suitcase is for sale\n"
+        "SELLING\norange suitcase\nMENTIONED\nNONE\n"
+    )
+    manifest = _run_narrated(
+        tmp_path, photos, fake, narration,
+        item_names=["orange suitcase"],
+        narrated_audios=[_wav_file(tmp_path / "walk.wav")],
+    )
+    assert len(manifest["items"]) == 1
+    item = manifest["items"][0]
+    assert item["status"] == "staged"
+    assert item["narration"]["kind"] == "named"
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_narrated_video_without_audio_track_is_a_row(tmp_path):
+    video = tmp_path / "silent-walk.mp4"
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-f", "lavfi",
+            "-i", "testsrc=duration=1:size=64x64:rate=5",
+            "-pix_fmt", "yuv420p", str(video), "-y",
+        ],
+        check=True,
+    )
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "case.jpg", (200, 90, 10))]
+    fake = FakeChain(
+        store,
+        plans=[_plan("orange suitcase")],
+        contents={(0, "orange suitcase"): "case1"},
+    )
+    narration = FakeNarration(_NARRATION_REPLY)
+    manifest = _run_narrated(
+        tmp_path, photos, fake, narration,
+        item_names=["orange suitcase"],
+        narrated_videos=[video],
+    )
+    record = manifest["narration"]["files"][0]
+    assert record["error"]["code"] == "NO_AUDIO_TRACK"
+    assert narration.calls == []
+    assert manifest["items"][0]["status"] == "staged"
+
+
 @pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
 def test_sample_video_frames_extracts(tmp_path):
     video = tmp_path / "walk.mp4"

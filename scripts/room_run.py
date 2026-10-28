@@ -10,6 +10,10 @@ Stages every named item found in the room's photos through the
 shipped chain (identify -> cut_out -> draw), one Fidelity Lock
 receipt per item, each item then re-verified independently from the
 stored files, and writes manifest.json + summary.txt to --out.
+Items can also be named by the seller's voice: --narrated-video /
+--narrated-audio transcribe the walkthrough narration with one
+Baseten Muse Spark Open call (Baseten partner pool, accounted in
+the manifest separately from the Meta total).
 This spends REAL Meta credits through the existing billed_call choke
 point; the per-run budget (default $1.00) is projection-checked
 before the first call and enforced as the ledger delta grows.

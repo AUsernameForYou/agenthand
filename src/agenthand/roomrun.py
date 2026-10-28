@@ -12,6 +12,21 @@ a fourth MCP tool — the three-tool surface stays exactly as shipped.
 
 Pipeline:
 
+0. Narration (optional). A narrated video or audio file the seller
+   recorded while walking the room is transcribed by ONE Muse Spark
+   Open call via Baseten (the narration link, added 2026-10-28). The
+   call returns the verbatim transcript plus two item lists: SELLING
+   — items the speaker explicitly marks for sale — and MENTIONED —
+   items referred to in passing. Selling items join the work list as
+   named items; mentioned items join it too, flagged as mentioned,
+   so the visual pipeline below confirms or refutes each against the
+   frames — a mentioned item is never silently dropped and never
+   silently promoted to a listing the seller did not ask for. The
+   transcript is stored beside the manifest and quoted in it.
+   Narration failure (no audio track, a silent track, a refused or
+   failed call) is an error row in the manifest, never an aborted
+   room: with stills or typed items present the run continues
+   stills-only.
 1. Sources. Stills from the given files/dirs, plus frames sampled from
    each given video with ffmpeg (fixed interval, timestamps recorded).
    A video frame is just another source photo with provenance.
@@ -78,9 +93,15 @@ Honesty notes (v1 limits, stated rather than smoothed over):
   the recovery, and a name no variant can segment is a failed item
   with NO_MATCH in the manifest, never a quietly substituted object.
 
-Spend discipline: every model call goes through the shipped tools, so
-every dollar flows through meta_client.billed_call under its
-fail-closed cap — this module never touches the API directly. Room
+Spend discipline: every Meta model call goes through the shipped
+tools, so every Meta dollar flows through meta_client.billed_call
+under its fail-closed cap. The ONE exception is the narration call,
+which is not a Meta API call: it runs on Baseten's Muse Spark Open
+deployment and draws on the $100 Baseten partner credit pool, a pool
+separate from the Meta ledger. Its usage and estimated cost are
+recorded in the manifest's narration section, never in the room
+total, and a per-call projection cap refuses an absurd call before
+it is made. Room
 runs keep their OWN ledger (default: ledger.jsonl inside the output
 dir; --ledger overrides): during a run, AGENTHAND_LEDGER_PATH points
 at the room ledger so every receipt the run causes lands there, and
@@ -95,6 +116,7 @@ ledger's delta across the run.
 from __future__ import annotations
 
 import argparse
+import array
 import base64
 import json
 import mimetypes
@@ -104,6 +126,7 @@ import shutil
 import subprocess
 import sys
 import uuid
+import wave
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -429,6 +452,405 @@ def sample_video_frames(
 
 
 # ---------------------------------------------------------------------------
+# Narration: the seller's voice becomes the item list
+#
+# One Muse Spark Open call via Baseten per narrated file (the pattern
+# proven by the 2026-10-28 voice spike): the audio rides as an
+# audio_url content part carrying a base64 data: URL, and the reply
+# carries the verbatim transcript plus the SELLING / MENTIONED item
+# split. Baseten spend lives in the $100 partner pool, entirely
+# outside the Meta ledger; the manifest records it separately.
+# ---------------------------------------------------------------------------
+
+NARRATION_MODEL = "meta-models/muse-spark-open-1026"
+NARRATION_BASE_URL = "https://inference.baseten.co/v1"
+# Spark Open always reasons before it answers; the voice spike showed
+# a 1024-token cap fully consumed by reasoning, leaving an empty
+# reply. 4096 leaves room for the reasoning AND the transcript.
+NARRATION_MAX_TOKENS = 4096
+# Baseten's published Model API rates for Muse Spark Open (Baseten
+# model library page, checked 2026-10-28). Estimates in the manifest
+# use exactly these; the API returns tokens, not dollars.
+NARRATION_INPUT_USD_PER_TOKEN = 1.25 / 1_000_000
+NARRATION_OUTPUT_USD_PER_TOKEN = 4.25 / 1_000_000
+# Audio bills as input tokens. The observed rate on a real 24 s
+# walkthrough was ~55 audio tokens per second; the projection prices
+# 150/s so it errs high, and adds a fixed prompt allowance.
+NARRATION_AUDIO_TOKENS_PER_SECOND = 150.0
+NARRATION_PROMPT_TOKENS = 512
+# A single narration call whose projection exceeds this is refused
+# before it is made. At the published rates an in-limits clip
+# (Baseten caps files at 5 minutes) projects to ~$0.08, so this only
+# trips on a pathological input or a misprobed duration.
+NARRATION_MAX_PROJECTED_USD = 0.25
+NARRATION_MAX_DURATION_S = 600.0  # probe sanity bound
+# A track whose peak never reaches 1% of full scale (-40 dBFS)
+# carries no speech anyone could transcribe.
+SILENCE_PEAK_FRACTION = 0.01
+
+_AUDIO_SUFFIXES = {".wav", ".mp3", ".flac", ".ogg", ".m4a", ".aac", ".opus"}
+_NARRATION_MIME = {
+    ".wav": "audio/wav",
+    ".mp3": "audio/mpeg",
+    ".flac": "audio/flac",
+    ".ogg": "audio/ogg",
+    ".m4a": "audio/mp4",
+    ".aac": "audio/aac",
+    ".opus": "audio/ogg",
+}
+
+NARRATION_PROMPT = (
+    "Transcribe this recording verbatim, word for word, and output it "
+    "under the heading TRANSCRIPT. Then, under the heading SELLING, "
+    "list each physical item the speaker explicitly says they want to "
+    "sell (wording like 'sell this', 'this one's for sale', 'get rid "
+    "of'), one per line, naming each item the way the speaker referred "
+    "to it; if the speaker marks no item for sale, write NONE under "
+    "that heading. Then, under the heading MENTIONED, list each other "
+    "physical item the speaker refers to in passing without saying "
+    "they want to sell it, one per line; if there are none, write "
+    "NONE. Use exactly those three headings, in that order, and do "
+    "not add any other text. Do not invent items the speaker did not "
+    "refer to."
+)
+
+
+def parse_narration_reply(text: str | None) -> dict:
+    """Split a narration reply into transcript / selling / mentioned.
+
+    Pure and forgiving in exactly one direction: a reply with no
+    recognizable heading is treated as all transcript with no items,
+    never as items with no transcript. Item lines are cleaned of
+    bullets and numbering; a NONE line means the empty list.
+    """
+    sections: dict[str, list[str]] = {"transcript": [], "selling": [], "mentioned": []}
+    headings = {"transcript": "transcript", "selling": "selling", "mentioned": "mentioned"}
+    current: str | None = None
+    found = False
+    for raw_line in (text or "").splitlines():
+        line = raw_line.strip()
+        key = line.rstrip(":").strip().lower()
+        if key in headings:
+            current = headings[key]
+            found = True
+            continue
+        if current is None:
+            continue  # preamble before the first heading is not evidence
+        sections[current].append(line)
+    if not found:
+        return {"transcript": (text or "").strip(), "selling": [], "mentioned": []}
+
+    def _items(lines: list[str]) -> list[str]:
+        out: list[str] = []
+        for line in lines:
+            cleaned = line.lstrip("-•*").strip()
+            cleaned = re.sub(r"^\d+[.)]\s*", "", cleaned).strip()
+            if not cleaned or cleaned.upper() == "NONE":
+                continue
+            if cleaned not in out:
+                out.append(cleaned)
+        return out
+
+    return {
+        "transcript": "\n".join(sections["transcript"]).strip(),
+        "selling": _items(sections["selling"]),
+        "mentioned": _items(sections["mentioned"]),
+    }
+
+
+def project_narration_cost_usd(
+    duration_s: float, *, max_tokens: int = NARRATION_MAX_TOKENS
+) -> float:
+    """Worst-case price of one narration call at the published rates."""
+    input_tokens = duration_s * NARRATION_AUDIO_TOKENS_PER_SECOND + NARRATION_PROMPT_TOKENS
+    return (
+        input_tokens * NARRATION_INPUT_USD_PER_TOKEN
+        + max_tokens * NARRATION_OUTPUT_USD_PER_TOKEN
+    )
+
+
+def narration_cost_usd(usage: dict | None) -> float | None:
+    """Price a finished call's returned usage; None when unreported."""
+    if not usage:
+        return None
+    prompt = usage.get("prompt_tokens") or 0
+    completion = usage.get("completion_tokens") or 0
+    if not prompt and not completion:
+        return None
+    return (
+        prompt * NARRATION_INPUT_USD_PER_TOKEN
+        + completion * NARRATION_OUTPUT_USD_PER_TOKEN
+    )
+
+
+def probe_wav(path: Path) -> tuple[float, float]:
+    """(duration_s, peak fraction of full scale) of a PCM WAV, stdlib only."""
+    with wave.open(str(path), "rb") as wav:
+        frames = wav.getnframes()
+        rate = wav.getframerate()
+        width = wav.getsampwidth()
+        raw = wav.readframes(frames)
+    duration = frames / rate if rate else 0.0
+    peak = 0.0
+    if width == 2 and raw:
+        samples = array.array("h")
+        samples.frombytes(raw[: len(raw) - len(raw) % 2])
+        if sys.byteorder == "big":
+            samples.byteswap()
+        if samples:
+            peak = max(max(samples), -min(samples)) / 32768.0
+    elif width == 1 and raw:
+        peak = max(abs(b - 128) for b in raw) / 128.0
+    elif width == 4 and raw:
+        samples = array.array("i")
+        samples.frombytes(raw[: len(raw) - len(raw) % 4])
+        if sys.byteorder == "big":
+            samples.byteswap()
+        if samples:
+            peak = max(max(samples), -min(samples)) / 2147483648.0
+    return duration, peak
+
+
+def _has_audio_stream(path: Path) -> bool:
+    """ffprobe stream check; True when it cannot tell (don't mislabel)."""
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return True
+    probe = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-select_streams", "a",
+            "-show_entries", "stream=index", "-of", "json", str(path),
+        ],
+        capture_output=True, text=True, timeout=30,
+    )
+    try:
+        return bool(json.loads(probe.stdout).get("streams"))
+    except Exception:
+        return True
+
+
+def extract_narration_audio(
+    source_path: Path,
+    kind: str,
+    work_dir: Path,
+    *,
+    ffmpeg: str | None = None,
+) -> tuple[Path | None, dict | None]:
+    """Decode a narrated input's audio track to a 48 kHz mono WAV.
+
+    Returns (wav_path, None) or (None, error). A video with no audio
+    stream is NO_AUDIO_TRACK, a distinct verdict from a decode
+    failure: the seller filmed in silence, which the manifest should
+    say plainly. A plain WAV input with no ffmpeg on the machine is
+    used as-is — the stdlib can probe it and the call takes WAV.
+    """
+    ffmpeg = ffmpeg if ffmpeg is not None else shutil.which("ffmpeg")
+    if kind == "audio" and source_path.suffix.lower() == ".wav" and not ffmpeg:
+        return source_path, None
+    if not ffmpeg:
+        return None, {
+            "code": "AUDIO_EXTRACT_FAILED",
+            "message": "ffmpeg not found on PATH; the narration track could not be decoded",
+        }
+    work_dir.mkdir(parents=True, exist_ok=True)
+    wav_path = work_dir / f"{source_path.stem}.wav"
+    result = subprocess.run(
+        [
+            ffmpeg, "-v", "error", "-i", str(source_path), "-vn",
+            "-ac", "1", "-ar", "48000", str(wav_path), "-y",
+        ],
+        capture_output=True, text=True, timeout=300,
+    )
+    if result.returncode != 0 or not wav_path.exists() or wav_path.stat().st_size <= 44:
+        if kind == "video" and not _has_audio_stream(source_path):
+            return None, {
+                "code": "NO_AUDIO_TRACK",
+                "message": f"{source_path.name} has no audio stream; nothing to transcribe",
+            }
+        return None, {
+            "code": "AUDIO_EXTRACT_FAILED",
+            "message": (
+                f"ffmpeg could not decode an audio track from {source_path.name}: "
+                f"{result.stderr.strip()[:300]}"
+            ),
+        }
+    return wav_path, None
+
+
+def _default_narration_fn(audio_path: Path) -> dict:
+    """Production narration: ONE Muse Spark Open call via Baseten.
+
+    The voice-spike shape, verbatim where it matters: an audio_url
+    content part carrying a base64 data: URL, the stored
+    custom.baseten credential attached as an authd surrogate by
+    dynamic_credentials (the raw key never reaches this process),
+    redirects refused, and a generous token budget because Spark
+    Open's reasoning eats small ones whole.
+    """
+    import time
+    import urllib.error
+    import urllib.request
+
+    helper_dir = (
+        os.environ.get("AGENTHAND_CREDENTIALS_BIN")
+        or "/opt/muse/skills/custom-connector-setup/bin"
+    )
+    if helper_dir not in sys.path:
+        sys.path.insert(0, helper_dir)
+    try:
+        from dynamic_credentials import add_surrogate_to_request, read_json_response
+    except Exception as exc:  # noqa: BLE001 — reported as a narration failure row
+        raise RuntimeError(
+            f"the Baseten credential helper is unavailable ({exc}); "
+            "narration cannot run on this machine"
+        ) from exc
+
+    mime = _NARRATION_MIME.get(audio_path.suffix.lower(), "audio/wav")
+    data_url = f"data:{mime};base64," + base64.b64encode(audio_path.read_bytes()).decode("ascii")
+    payload = {
+        "model": NARRATION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": NARRATION_PROMPT},
+                    {"type": "audio_url", "audio_url": {"url": data_url}},
+                ],
+            }
+        ],
+        "max_tokens": NARRATION_MAX_TOKENS,
+    }
+    request = urllib.request.Request(
+        f"{NARRATION_BASE_URL}/chat/completions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    add_surrogate_to_request(request, "custom.baseten", allowed_hosts=["inference.baseten.co"])
+
+    class _NoRedirect(urllib.request.HTTPRedirectHandler):
+        def redirect_request(self, *args):
+            raise RuntimeError("redirect refused, verify the endpoint")
+
+    opener = urllib.request.build_opener(_NoRedirect())
+    started = time.monotonic()
+    try:
+        with opener.open(request, timeout=300) as response:
+            body = read_json_response(response)
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", "replace")[:500]
+        raise RuntimeError(
+            f"Baseten narration call failed: HTTP {exc.code}: {detail}"
+        ) from exc
+    latency_ms = round((time.monotonic() - started) * 1000)
+    choices = body.get("choices") or []
+    content = ((choices[0].get("message") or {}).get("content") or "") if choices else ""
+    if not content.strip():
+        raise RuntimeError("Baseten narration call returned an empty reply")
+    return {
+        "reply": content,
+        "usage": body.get("usage") or {},
+        "latency_ms": latency_ms,
+        "model": body.get("model") or NARRATION_MODEL,
+    }
+
+
+def _narrate_one(
+    source_path: Path,
+    kind: str,
+    work_dir: Path,
+    narration_fn,
+    *,
+    max_projected_usd: float,
+) -> dict:
+    """One narrated input -> its manifest record. Never raises.
+
+    Every failure is a verdict in the record (no track, silent,
+    over-long, cost-refused, call failed) and the room run moves on:
+    narration is an input, not a load-bearing wall.
+    """
+    record: dict = {
+        "path": str(source_path),
+        "kind": kind,
+        "audio_file": None,
+        "duration_s": None,
+        "peak_fraction": None,
+        "transcript": None,
+        "named_items": [],
+        "mentioned_items": [],
+        "usage": None,
+        "projected_cost_usd": None,
+        "cost_usd_estimate": None,
+        "latency_ms": None,
+        "error": None,
+    }
+    wav_path, error = extract_narration_audio(source_path, kind, work_dir)
+    if error is not None:
+        record["error"] = error
+        return record
+    record["audio_file"] = str(wav_path)
+    try:
+        duration_s, peak = probe_wav(wav_path)
+    except Exception as exc:  # noqa: BLE001 — a probe failure is a row, not a crash
+        record["error"] = {
+            "code": "AUDIO_PROBE_FAILED",
+            "message": f"could not measure the narration track: {exc}",
+        }
+        return record
+    record["duration_s"] = round(duration_s, 2)
+    record["peak_fraction"] = round(peak, 4)
+    if duration_s > NARRATION_MAX_DURATION_S:
+        record["error"] = {
+            "code": "NARRATION_TOO_LONG",
+            "message": (
+                f"narration runs {duration_s:.0f}s; the per-call sanity "
+                f"bound is {NARRATION_MAX_DURATION_S:.0f}s"
+            ),
+        }
+        return record
+    projected = project_narration_cost_usd(duration_s)
+    record["projected_cost_usd"] = round(projected, 6)
+    if projected > max_projected_usd:
+        record["error"] = {
+            "code": "NARRATION_COST_REFUSED",
+            "message": (
+                f"projected narration cost ${projected:.4f} exceeds the "
+                f"per-call cap ${max_projected_usd:.2f}; the call was "
+                "refused before it was made"
+            ),
+        }
+        return record
+    if peak < SILENCE_PEAK_FRACTION:
+        record["error"] = {
+            "code": "SILENT_TRACK",
+            "message": (
+                f"the narration track peaks at {peak:.4f} of full scale, "
+                "under the -40 dBFS floor; there is no speech to transcribe"
+            ),
+        }
+        return record
+    try:
+        result = narration_fn(wav_path)
+    except Exception as exc:  # noqa: BLE001 — the call boundary, as elsewhere here
+        record["error"] = {
+            "code": "NARRATION_FAILED",
+            "message": f"{type(exc).__name__}: {exc}",
+        }
+        return record
+    parsed = parse_narration_reply(result.get("reply") or "")
+    record["transcript"] = parsed["transcript"]
+    record["named_items"] = parsed["selling"]
+    record["mentioned_items"] = parsed["mentioned"]
+    record["usage"] = result.get("usage") or {}
+    record["latency_ms"] = result.get("latency_ms")
+    cost = narration_cost_usd(record["usage"])
+    record["cost_usd_estimate"] = (
+        round(cost, 6) if cost is not None else record["projected_cost_usd"]
+    )
+    return record
+
+
+# ---------------------------------------------------------------------------
 # The chain: shipped tools behind injectable adapters (offline tests
 # substitute fakes; production uses server.identify/cut_out/draw).
 # ---------------------------------------------------------------------------
@@ -716,6 +1138,7 @@ def _process_item(
         "status": "failed",
         "stage_reached": "probe",
         "failure": None,
+        "narration": item.get("narration"),
         "sightings": [],
         "primary_photo_index": None,
         "also_seen_in": [],
@@ -910,6 +1333,10 @@ def run_room(
     spend_probe=None,
     verify_fn=None,
     ledger_path: Path | None = None,
+    narrated_videos: list[Path] | None = None,
+    narrated_audios: list[Path] | None = None,
+    narration_fn=None,
+    narration_max_projected_usd: float = NARRATION_MAX_PROJECTED_USD,
 ) -> dict:
     """Run one room end to end and return (and write) its manifest.
 
@@ -933,6 +1360,16 @@ def run_room(
     (composite.verify_receipt_from_disk) — every staged item is
     re-proven from the stored files before the manifest calls it
     staged.
+
+    narrated_videos / narrated_audios: inputs whose narration names
+    the items. Each gets ONE Baseten Muse Spark Open call through
+    narration_fn (default: _default_narration_fn) after its audio is
+    extracted and measured; the call's projection is refused above
+    narration_max_projected_usd. Selling items from the transcript
+    join the work list as named items; mentioned items join flagged,
+    for the visual pipeline to confirm or refute. Narration spend is
+    Baseten-pool only and lands in the manifest's narration section,
+    never in total_cost_usd (the Meta ledger delta).
     """
     store = store if store is not None else AssetStore(config.get_data_dir())
     chain = chain if chain is not None else _default_chain()
@@ -965,6 +1402,10 @@ def run_room(
             spend_probe=spend_probe,
             verify_fn=verify_fn,
             room_ledger=room_ledger,
+            narrated_videos=list(narrated_videos or []),
+            narrated_audios=list(narrated_audios or []),
+            narration_fn=narration_fn,
+            narration_max_projected_usd=narration_max_projected_usd,
         )
     finally:
         if previous_ledger_env is None:
@@ -992,6 +1433,10 @@ def _run_room_body(
     spend_probe,
     verify_fn,
     room_ledger: Path,
+    narrated_videos: list[Path],
+    narrated_audios: list[Path],
+    narration_fn,
+    narration_max_projected_usd: float,
 ) -> dict:
     from . import server  # local import: server pulls in the MCP SDK
 
@@ -1034,6 +1479,45 @@ def _run_room_body(
                 )
             )
 
+    # -- narration (optional): the seller's voice names the items ------------
+    narration_records: list[dict] = []
+    narration_named: list[tuple[str, str]] = []  # (item name, source path)
+    narration_mentioned: list[tuple[str, str]] = []
+    transcript_file: Path | None = None
+    if narrated_videos or narrated_audios:
+        effective_narration_fn = narration_fn or _default_narration_fn
+        narration_dir = out_dir / "narration"
+        for video in narrated_videos:
+            narration_records.append(
+                _narrate_one(
+                    Path(video), "video", narration_dir, effective_narration_fn,
+                    max_projected_usd=narration_max_projected_usd,
+                )
+            )
+        for audio in narrated_audios:
+            narration_records.append(
+                _narrate_one(
+                    Path(audio), "audio", narration_dir, effective_narration_fn,
+                    max_projected_usd=narration_max_projected_usd,
+                )
+            )
+        for record in narration_records:
+            for name in record["named_items"]:
+                narration_named.append((name, record["path"]))
+            for name in record["mentioned_items"]:
+                narration_mentioned.append((name, record["path"]))
+        spoken = [r for r in narration_records if r["transcript"]]
+        if spoken:
+            transcript_file = out_dir / "transcript.txt"
+            transcript_file.write_text(
+                "\n\n".join(
+                    f"# Narration transcript — {r['path']}\n{r['transcript']}"
+                    for r in spoken
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
     # -- worst-case projection gate -----------------------------------------
     from . import meta_client
 
@@ -1054,7 +1538,13 @@ def _run_room_body(
             meta_client.project_identify_cost_usd(server.IDENTIFY_MODEL, w, h)
             * meta_client.IDENTIFY_MAX_ATTEMPTS
         )
-    n_items_estimate = len(item_names) if item_names else len(sources)
+    n_narration_items = len(narration_named) + len(narration_mentioned)
+    if item_names:
+        n_items_estimate = len(item_names) + n_narration_items
+    elif auto:
+        n_items_estimate = len(sources) + n_narration_items
+    else:
+        n_items_estimate = n_narration_items
     per_item_projection = (
         MAX_SAM_CALLS_PER_ITEM
         * meta_client.project_cut_out_cost_usd(server.CUT_OUT_MODEL, 1)
@@ -1072,6 +1562,18 @@ def _run_room_body(
     notes.append(
         f"worst-case projection ${worst_case:.4f} within the ${budget_usd:.2f} run budget"
     )
+    for record in narration_records:
+        if record["error"] is not None:
+            notes.append(
+                f"narration from {record['path']} failed "
+                f"[{record['error']['code']}]: {record['error']['message']}"
+            )
+        else:
+            notes.append(
+                f"narration from {record['path']}: "
+                f"{len(record['named_items'])} item(s) named for sale, "
+                f"{len(record['mentioned_items'])} mentioned in passing"
+            )
 
     # -- plan pass ------------------------------------------------------------
     for source in sources:
@@ -1119,6 +1621,43 @@ def _run_room_body(
                     "flags": [],
                 }
             )
+    # Narration items join the work list. A narration name matching an
+    # item already listed (typed or enumerated) annotates that item
+    # instead of duplicating it — the same keep-evidence, no-silent-
+    # merge rule as the rest of the de-dup; a for-sale naming beats a
+    # passing mention when both land on one item. A genuinely new
+    # mentioned item is appended with its flag: it may stage only if
+    # the visual pipeline confirms it against the photos.
+    def _attach_narration(name: str, source_path: str, kind: str) -> None:
+        for existing in items:
+            if token_similarity(existing["name"], name) >= MERGE_SIMILARITY:
+                current = existing.get("narration")
+                if current is None or (
+                    current["kind"] == "mentioned" and kind == "named"
+                ):
+                    existing["narration"] = {"kind": kind, "source": source_path}
+                return
+        entry: dict = {
+            "name": name,
+            "candidate_photo_indices": _rank_photos(name, sources),
+            "flags": [],
+            "narration": {"kind": kind, "source": source_path},
+        }
+        if kind == "mentioned":
+            entry["flags"].append(
+                "mentioned in passing in the seller's narration, not "
+                "marked for sale; included so the visual pipeline can "
+                "confirm or refute it against the photos"
+            )
+        items.append(entry)
+
+    for narrated_name, narrated_source in narration_named:
+        _attach_narration(narrated_name, narrated_source, "named")
+    for narrated_name, narrated_source in narration_mentioned:
+        _attach_narration(narrated_name, narrated_source, "mentioned")
+    if narration_records and not auto and not item_names:
+        mode = "narrated"
+
     # Cap candidate probing per item (rank order preserved). The cap
     # is also the spend bound the projection gate priced.
     candidate_cap = min(max_photos_per_item, MAX_PHOTOS_PER_ITEM)
@@ -1154,6 +1693,7 @@ def _run_room_body(
                             "before this item was attempted"
                         ),
                     },
+                    "narration": item.get("narration"),
                     "sightings": [],
                     "primary_photo_index": None,
                     "also_seen_in": [],
@@ -1175,6 +1715,25 @@ def _run_room_body(
     _flag_cross_item_duplicates(records, sources)
 
     total_cost = round(spend_probe() - spend_before, 6)
+    narration_section = None
+    baseten_cost = None
+    if narration_records:
+        usage_totals = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+        for record in narration_records:
+            usage = record.get("usage") or {}
+            for key in usage_totals:
+                usage_totals[key] += usage.get(key) or 0
+        baseten_cost = round(
+            sum(r["cost_usd_estimate"] or 0.0 for r in narration_records), 6
+        )
+        narration_section = {
+            "model": NARRATION_MODEL,
+            "pool": "baseten_partner_credits",
+            "files": narration_records,
+            "transcript_file": str(transcript_file) if transcript_file else None,
+            "usage": usage_totals,
+            "cost_usd_estimate": baseten_cost,
+        }
     manifest = {
         "room_id": room_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -1183,6 +1742,8 @@ def _run_room_body(
         "budget_usd": budget_usd,
         "ledger_path": str(room_ledger),
         "total_cost_usd": total_cost,
+        "baseten_cost_usd_estimate": baseten_cost,
+        "narration": narration_section,
         "sources": [s.manifest_entry(i) for i, s in enumerate(sources)],
         "videos": video_notes,
         "items": records,
@@ -1210,15 +1771,47 @@ def summarize_manifest(manifest: dict) -> str:
             origin += f" @ {entry['timestamp_s']}s"
         concept = (entry["plan"] or {}).get("concept") or "—"
         lines.append(f"  photo {entry['index']}: [{origin}] {entry['path']} — plan: {concept}")
+    narration = manifest.get("narration")
+    if narration:
+        lines.append("")
+        lines.append(
+            "NARRATION (Baseten pool — separate from the room total above):"
+        )
+        for record in narration["files"]:
+            if record["error"] is not None:
+                lines.append(
+                    f"  {record['path']}: ERROR [{record['error']['code']}] "
+                    f"{record['error']['message']}"
+                )
+            else:
+                lines.append(
+                    f"  {record['path']}: {record['duration_s']}s of speech — "
+                    f"named for sale: {record['named_items'] or 'none'}; "
+                    f"mentioned: {record['mentioned_items'] or 'none'}; "
+                    f"est. ${record['cost_usd_estimate']:.6f}"
+                )
+                lines.append("  --- transcript ---")
+                lines.extend(
+                    f"  {line}" for line in (record["transcript"] or "").splitlines()
+                )
+                lines.append("  --- end transcript ---")
+        lines.append(
+            f"  Baseten total: ${narration['cost_usd_estimate']:.6f} "
+            f"(usage {narration['usage']}); transcript: {narration['transcript_file']}"
+        )
     lines.append("")
     staged = 0
     for item in manifest["items"]:
+        narration_tag = ""
+        item_narration = item.get("narration") or {}
+        if item_narration.get("kind"):
+            narration_tag = f" [narration: {item_narration['kind']}]"
         if item["status"] == "staged":
             staged += 1
             receipt = item["receipt"] or {}
             seen = f" (also seen in photos {item['also_seen_in']})" if item["also_seen_in"] else ""
             lines.append(
-                f"  STAGED  {item['name']}: photo {item['primary_photo_index']}{seen} — "
+                f"  STAGED  {item['name']}{narration_tag}: photo {item['primary_photo_index']}{seen} — "
                 f"{receipt.get('opaque_pixels')} opaque px, "
                 f"{receipt.get('changed_opaque_pixels')} changed, "
                 f"profile preserved: {receipt.get('color_profile_preserved')} — "
@@ -1234,14 +1827,14 @@ def summarize_manifest(manifest: dict) -> str:
         elif item["status"] == "verify_failed":
             failure = item["failure"] or {}
             lines.append(
-                f"  VERIFY FAILED  {item['name']}: the staged output did not "
+                f"  VERIFY FAILED  {item['name']}{narration_tag}: the staged output did not "
                 f"pass independent verification — {failure.get('message')}"
             )
             lines.append(f"          receipt: {item['receipt_file']}")
         else:
             failure = item["failure"] or {}
             lines.append(
-                f"  FAILED  {item['name']}: stage {failure.get('stage')} "
+                f"  FAILED  {item['name']}{narration_tag}: stage {failure.get('stage')} "
                 f"[{failure.get('code')}] {failure.get('message')}"
             )
         for flag in item.get("flags", []):
@@ -1275,6 +1868,30 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         help="Walkthrough video; frames are sampled into the photo pool. Repeatable.",
+    )
+    parser.add_argument(
+        "--narrated-video",
+        action="append",
+        default=[],
+        help=(
+            "Video whose narration names the items: its audio is "
+            "transcribed by one Baseten Muse Spark Open call, and the "
+            "items the seller names join the work list. Repeatable. "
+            "Pass the same file to --video too if its frames should "
+            "join the photo pool."
+        ),
+    )
+    parser.add_argument(
+        "--narrated-audio",
+        action="append",
+        default=[],
+        help="Audio file (wav/mp3/flac/ogg/m4a) whose narration names the items. Repeatable.",
+    )
+    parser.add_argument(
+        "--narration-max-usd",
+        type=float,
+        default=NARRATION_MAX_PROJECTED_USD,
+        help="Per-call projected-cost cap for a narration call (Baseten pool).",
     )
     parser.add_argument(
         "--items",
@@ -1325,8 +1942,11 @@ def main(argv: list[str] | None = None) -> int:
         os.environ["AGENTHAND_DATA_DIR"] = str(args.data_dir)
 
     item_names = [name.strip() for name in args.items.split(",") if name.strip()]
-    if not args.auto and not item_names:
-        parser.error("name the items with --items, or use --auto to enumerate")
+    if not args.auto and not item_names and not args.narrated_video and not args.narrated_audio:
+        parser.error(
+            "name the items with --items, use --auto to enumerate, "
+            "or let a narration name them (--narrated-video/--narrated-audio)"
+        )
     if not args.photos and not args.video:
         parser.error("give at least one --photos file/folder or --video")
 
@@ -1346,6 +1966,9 @@ def main(argv: list[str] | None = None) -> int:
             max_frames_per_video=args.max_frames_per_video,
             probe_all_candidates=not args.first_success_only,
             ledger_path=args.ledger,
+            narrated_videos=[Path(v) for v in args.narrated_video],
+            narrated_audios=[Path(a) for a in args.narrated_audio],
+            narration_max_projected_usd=args.narration_max_usd,
         )
     except RuntimeError as exc:
         print(f"ROOM RUN REFUSED: {exc}", file=sys.stderr)
