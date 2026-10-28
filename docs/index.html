@@ -527,14 +527,13 @@ function countChanged(fgData, outData, width, height, opts) {
     <pre class="code" id="install-code">{
   "mcpServers": {
     "agenthand": {
-      "command": "uvx",
-      "args": ["agenthand"],
+      "command": "/path/to/agenthand",
       "env": { "META_API_KEY": "&hellip;" }
     }
   }
 }</pre>
     <button class="copy-btn" type="button" data-copy="install-code">Copy config</button>
-    <p>That is the whole install: <a href="https://docs.astral.sh/uv/">uv</a> fetches the published package and runs it. The server starts and lists its tools without a key; the key is only needed when a tool makes a model call. Prefer pip? Install the package and register the installed command instead:</p>
+    <p>That is the whole install: download the Rust binary for your platform from the <a href="https://github.com/AUsernameForYou/agenthand-rust/releases/latest">agenthand-rust releases</a> (one-click <span style="font-family:ui-monospace,Menlo,Consolas,monospace">.mcpb</span> bundles, or the bare binary above). macOS builds are unsigned for now, so clear the Gatekeeper quarantine on first launch. The server starts and lists its tools without a key; the key is only needed when a tool makes a model call. Prefer the Python build? <a href="https://docs.astral.sh/uv/">uv</a> fetches the published package and runs it (<span style="font-family:ui-monospace,Menlo,Consolas,monospace">"command": "uvx", "args": ["agenthand"]</span>), or install the package with pip and register the installed command instead:</p>
     <pre class="code" id="config-code">pip install agenthand
 
 {
