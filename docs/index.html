@@ -147,6 +147,14 @@
     padding:1px 9px;
   }
   .receipt .tick{color:var(--ink);font-weight:700}
+  .bench{
+    border-collapse:collapse;margin:14px 0 10px;
+    font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
+    font-size:14.5px;line-height:1.6;
+  }
+  .bench th,.bench td{border:2px solid var(--ink);padding:6px 14px;text-align:left;white-space:nowrap}
+  .bench th{background:var(--panel)}
+  .bench-note{font-size:15.5px;color:var(--grey);max-width:680px;margin:0 0 8px}
   .copy-btn{
     font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;
     font-size:13.5px;font-weight:700;
@@ -557,7 +565,15 @@ function countChanged(fgData, outData, width, height, opts) {
     <p class="chapter"><span class="ch-no">05</span><span>Status</span></p>
     <h2 id="status-h">Built in the open, during the hackathon</h2>
     <p class="lede">agenthand was designed and built during the Meta Global AI Developer Hackathon, October 26 to November 4, 2026. The full chain runs end to end today: identify, cut_out, and draw, live on the Meta Model API, with Fidelity Lock receipts on every staged image. A demo video is on its way.</p>
-    <p class="lede">The server also exists as a single-binary Rust build, source in the agenthand-rust repository. Rebuilt from the frozen files of the verified run, it lands on the same counts and the same output pixel hash as the Python build, and a live run from the Rust binary was rechecked by the Python verifier; the two implementations agree, and Python stays the reference.</p>
+    <p class="proof-title">Built twice, measured side by side</p>
+    <p class="lede">agenthand exists twice: the reference server in Python, and a second implementation in Rust, written as a single binary (source in the agenthand-rust repository). Both were run against the same frozen proof run and measured side by side. The two builds agree exactly: the same output pixel hash (sha256 8b8defea&hellip;e802), the same count (580,613 opaque pixels checked, 0 changed), and the same total billed cost, $0.020044 to the micro-dollar. Python stays the reference. What differs is how fast the local work runs:</p>
+    <table class="bench">
+      <tr><th>Operation</th><th>Python</th><th>Rust</th></tr>
+      <tr><td>Cold start to initialize response</td><td>1,291.5 ms</td><td>2.4 ms (about 540x)</td></tr>
+      <tr><td>Verify over the proof images</td><td>569.7 ms</td><td>91.4 ms (about 6.2x)</td></tr>
+      <tr><td>Estimator run</td><td>2,824.4 ms</td><td>1,802.3 ms (about 1.6x)</td></tr>
+    </table>
+    <p class="bench-note">Measured on the same machine (a 2 vCPU AMD EPYC VM), medians of interleaved runs. One honest note: on a real tool call, Meta API latency dominates, so the commercially real win here is cold start, because every MCP client spawns the server fresh for each session.</p>
     <p class="lede">
       <a href="https://github.com/AUsernameForYou/agenthand">The code and the build log</a> &middot;
       <a href="https://cerebralvalley.ai/e/meta-ai-developer-hackathon/details">The hackathon</a>
