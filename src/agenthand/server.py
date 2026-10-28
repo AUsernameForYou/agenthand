@@ -70,6 +70,7 @@ from io import BytesIO
 from mcp.server.mcpserver import Image, MCPServer
 
 from . import composite, config, ingest, meta_client, segmentation
+from . import __version__ as _package_version
 from .assets import (
     HANDLE_PREFIX,
     KIND_FOREGROUND,
@@ -81,7 +82,7 @@ from .assets import (
 
 # mcp Python SDK v2: the high-level server class is MCPServer
 # (renamed from FastMCP in v1).
-mcp = MCPServer("agenthand")
+mcp = MCPServer("agenthand", version=_package_version)
 
 
 def _persist_full_receipt(

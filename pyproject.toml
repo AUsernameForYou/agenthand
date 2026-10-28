@@ -48,5 +48,18 @@ agenthand-verify = "agenthand.verify:main"
 [tool.hatch.build.targets.wheel]
 packages = ["src/agenthand"]
 
+# Keep the source distribution focused on installable source and release
+# metadata. The website images, test suite, and local build scripts are
+# development artifacts and would otherwise add roughly 14 MB to the sdist.
+[tool.hatch.build.targets.sdist]
+exclude = [
+    "/.github",
+    "/assets",
+    "/docs",
+    "/scripts",
+    "/tests",
+    "/BUILD_LOG.md",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]

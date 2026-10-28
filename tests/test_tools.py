@@ -15,7 +15,7 @@ os.environ.setdefault("AGENTHAND_DATA_DIR", "/tmp/agenthand-test-placeholder")
 import pytest  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from agenthand import composite, config, ledger, server  # noqa: E402
+from agenthand import __version__, composite, config, ledger, server  # noqa: E402
 from agenthand.assets import AssetStore  # noqa: E402
 
 
@@ -59,6 +59,10 @@ def _seed_foreground(store: AssetStore) -> str:
         kind="foreground_png",
         source_asset_id=AssetStore.parse_handle(photo),
     )
+
+
+def test_server_reports_the_package_version():
+    assert server.mcp.version == __version__
 
 
 def test_identify_without_key_returns_not_configured_and_bills_nothing(monkeypatch):
