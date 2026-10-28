@@ -217,6 +217,30 @@
   .verify-lines .fail{color:var(--ink);font-weight:800;text-decoration:underline}
   .tamper{display:block;margin:12px 0;font-size:14px;cursor:pointer}
   .tamper input{margin-right:8px}
+  .judge-path{border-top:2px solid var(--ink);margin-top:18px;padding-top:16px}
+  .sample-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin:14px 0}
+  .sample-card{border:1px solid #d8d8d8;background:#fff;margin:0;padding:8px;overflow-wrap:anywhere}
+  .sample-card img{
+    width:100%;height:168px;object-fit:contain;display:block;
+    background:repeating-conic-gradient(#e8e8e8 0% 25%, #ffffff 0% 50%) 0 0/18px 18px;
+  }
+  .sample-card figcaption{font-size:12px;line-height:1.45;margin-top:8px}
+  .sample-card .sample-kind{display:block;font-size:12px;font-weight:800;letter-spacing:0.08em}
+  .judge-actions{display:flex;flex-wrap:wrap;gap:10px;margin:16px 0 8px}
+  .judge-actions .copy-btn{margin:0}
+  .judge-actions #verify-btn{background:var(--ink);color:#fff}
+  .judge-actions a{
+    font-size:13.5px;font-weight:700;border:2px solid var(--ink);
+    padding:7px 14px;text-decoration:none;
+  }
+  .baseline-slot{
+    border:2px solid var(--ink);background:#fff;
+    padding:18px 20px;margin:24px 0 6px;
+  }
+  .baseline-slot p{margin:0 0 8px}
+  .baseline-slot p:last-child{margin-bottom:0}
+  .baseline-value{font-weight:800;letter-spacing:0.08em}
+  @media (max-width:700px){.sample-grid{grid-template-columns:1fr 1fr}}
   .opencode{margin:24px 0 0}
   .opencode .proof-cap{max-width:640px}
 
@@ -270,6 +294,7 @@
     <nav>
       <a href="#proof">See the run</a>
       <a href="#verify">Verify</a>
+      <a href="replay-v1.html">Replay</a>
       <a href="#use">Use it</a>
       <a href="https://github.com/AUsernameForYou/agenthand">GitHub</a>
     </nav>
@@ -334,6 +359,7 @@
 <span class="c"># receipt: 580,613 opaque pixels checked &middot; changed 0 &middot; total $0.020044
 # photo to receipt in 36.5 s, by the asset records' timestamps</span></pre>
     <p class="note">Assembled from the run's own records: the spend ledger's settled lines and the asset sidecars. The full hashes are in the receipt below — and the verifier further down grades against the run's actual receipt file, <a href="proof-receipt-v1.json">published beside the images</a>, not against numbers typed into this page.</p>
+    <p class="note"><a href="replay-v1.html">Open the cached replay</a> for the same run's three recorded calls, assets, ledger, and receipt. It is a replay of a real run, not a live call.</p>
   </section>
 
   <section id="fidelity" aria-labelledby="fidelity-h">
@@ -353,6 +379,13 @@
       <div><span class="k">cost of the calls&nbsp;</span> identify $0.007544 &middot; cut_out $0.0025 &middot; draw $0.01 &middot; total $0.020044</div>
     </div>
     <button class="copy-btn" type="button" data-copy="receipt">Copy receipt</button>
+
+    <aside class="baseline-slot" data-baseline-status="not-measured" aria-label="Plain regeneration baseline status">
+      <p class="proof-title">BASELINE — PLAIN REGENERATION</p>
+      <p><span class="baseline-value">NOT MEASURED</span> · No same-photo plain-regeneration run is present in the frozen package, so no baseline count is published beside the zero above.</p>
+      <p class="proof-cap">This slot is reserved for a separately recorded baseline with its own files and provenance. Until then, the honest value is blank, not estimated.</p>
+      <!-- TODO(baseline-regeneration): fill this slot only from a separately recorded same-photo plain-regeneration run. Do not infer a number from the Fidelity Lock run. -->
+    </aside>
 
     <ol class="steps">
       <li>The product is cut out of the seller's photo and stored untouched, with hashes of the source, the layer, and the mask.</li>
@@ -386,21 +419,49 @@
 
     <div class="verify" id="verify">
       <p class="proof-title">VERIFY IT YOURSELF</p>
-      <p>Do not take the receipt's word for it. This runs entirely in your browser: it downloads the run's <a href="proof-receipt-v1.json">receipt file</a>, the source photo, the product layer, and the final output (3.1 MB, only when you click), hashes the files with SHA-256, checks the hashes against the receipt it just fetched, then decodes both images and counts every fully opaque product pixel against the output. The one number the checker will not take from the receipt is the changed count a pass requires: zero, enforced in the code. The checker decodes the PNG data itself rather than using the browser's colour-managed image decoder, so an embedded Display P3 profile does not change the pixel values being counted — the same convention the Python receipt uses. The profile is not stripped, and every file hash still has to match.</p>
+      <p>Do not take the receipt's word for it. This runs entirely in your browser. The frozen sample is displayed in the judge path below; when you click one of its check buttons, the checker fetches the run's <a href="proof-receipt-v1.json">receipt file</a> and the byte-exact source photo, product layer, and final output, hashes the files with SHA-256, checks the hashes against the receipt it just fetched, then decodes both images and counts every fully opaque product pixel against the output. The one number the checker will not take from the receipt is the changed count a pass requires: zero, enforced in the code. The checker decodes the PNG data itself rather than using the browser's colour-managed image decoder, so an embedded Display P3 profile does not change the pixel values being counted — the same convention the Python receipt uses. The profile is not stripped, and every file hash still has to match.</p>
+
+      <div class="judge-path" aria-label="One-click judge path">
+        <p class="proof-title">ONE-CLICK JUDGE PATH — FROZEN SAMPLE PRELOADED</p>
+        <p>No upload and no file picker. The frozen sample below is already selected; each button fetches only these recorded files and the published receipt.</p>
+        <div class="sample-grid">
+          <figure class="sample-card">
+            <img src="proof-source-v1.png" width="1206" height="1925" loading="lazy" alt="Frozen sample source photo">
+            <figcaption><span class="sample-kind">ORIGINAL</span>asset://e3f0428f…</figcaption>
+          </figure>
+          <figure class="sample-card">
+            <img src="proof-mask-v1.png" width="1206" height="1925" loading="lazy" alt="Frozen sample mask recorded by cut_out">
+            <figcaption><span class="sample-kind">MASK</span>asset://7dc19362…</figcaption>
+          </figure>
+          <figure class="sample-card">
+            <img src="proof-layer-v1.png" width="1206" height="1925" loading="lazy" alt="Frozen sample stored product layer">
+            <figcaption><span class="sample-kind">PRODUCT LAYER</span>asset://b8663615…</figcaption>
+          </figure>
+          <figure class="sample-card">
+            <img src="proof-output-v1.png" width="1206" height="1925" loading="lazy" alt="Frozen sample final composite">
+            <figcaption><span class="sample-kind">FINAL OUTPUT</span>asset://45deaf1a…</figcaption>
+          </figure>
+        </div>
+        <div class="judge-actions">
+          <button class="copy-btn" id="verify-btn" type="button">Verify frozen sample</button>
+          <button class="copy-btn" id="verify-tamper-btn" type="button">Run one-pixel tamper check</button>
+          <a href="replay-v1.html">Open cached replay</a>
+        </div>
+        <p class="proof-cap">The tamper button is separate and pixel-only: the encoded files stay byte-identical, so their file hashes must still match; exactly one decoded, fully opaque product pixel is flipped, and detection requires the scan to report exactly 1 changed.</p>
+      </div>
+
       <div class="vcounts">
         <div><span class="vlab">PIXELS CHECKED</span><span class="vcount" id="verify-checked">&mdash;</span></div>
         <div><span class="vlab">CHANGED</span><span class="vcount" id="verify-changed">&mdash;</span></div>
       </div>
       <div class="verify-lines" id="verify-lines"></div>
       <p id="verify-progress"></p>
-      <p id="verify-status" role="status" aria-live="polite">Not run yet.</p>
-      <label class="tamper"><input type="checkbox" id="verify-tamper">Tamper test: alter one byte and one pixel of the output copy, in this browser only, and watch both checks fail</label>
-      <button class="copy-btn" id="verify-btn" type="button">Verify it yourself</button>
+      <p id="verify-status" role="status" aria-live="polite">Frozen sample selected. Not run yet.</p>
     </div>
 
     <div class="opencode">
       <p class="proof-title">THE CHECK, IN THE OPEN</p>
-      <p class="proof-cap">This is the counting code itself — the same function the button above runs, copied verbatim from <a href="verifier-v6.js">verifier-v6.js</a>.</p>
+      <p class="proof-cap">This is the counting code itself — the same function the buttons above run, copied verbatim from <a href="verifier-v6.js">verifier-v6.js</a>.</p>
       <pre class="code"><span class="c">/* Replicates composite.py's _measure for the claim that matters:
  * a foreground pixel with alpha 255 must appear in the composite
  * byte-identical. fgData / outData are RGBA byte arrays (ImageData.data).
@@ -447,7 +508,7 @@ function countChanged(fgData, outData, width, height, opts) {
 }</pre>
     </div>
 
-    <p class="stamp">[ provenance — run: 2026-10-26, produced by agenthand <a href="https://github.com/AUsernameForYou/agenthand/tree/401f1136af5a36ca814207ae8ce8b5435bd1722e">commit 401f113</a> · fixture: the run's own files, a chat-screen cut-out (see the note above) · the checker on this page is <a href="verifier-v6.js">verifier-v6.js</a>, 35.5 KB — read it ]</p>
+    <p class="stamp">[ provenance — run: 2026-10-26, produced by agenthand <a href="https://github.com/AUsernameForYou/agenthand/tree/401f1136af5a36ca814207ae8ce8b5435bd1722e">commit 401f113</a> · fixture: the run's own files, a chat-screen cut-out (see the note above) · the checker on this page is <a href="verifier-v6.js">verifier-v6.js</a>, 38.1 KB — read it ]</p>
     </div>
   </section>
 

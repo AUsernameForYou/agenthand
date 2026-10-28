@@ -28,9 +28,18 @@
  * History: v1 flipped a byte inside the encoded PNG and aborted on
  * decode; v2 moved the byte flip to the hashing path only and added
  * the decoded-pixel flip; v3 added the live-progress surface. v4 is
- * the honesty pass; v6 replaces canvas decoding and the iCCP
- * refusal with the deterministic raw PNG decoder below. The
- * counting code is unchanged since v1.
+ * the honesty pass above; the counting code is unchanged since v1.
+ * v5 keeps that grading intact and adds a judge-first surface: the
+ * frozen sample is already selected, the clean check is one click,
+ * and the tamper check is a separate one-click run that flips
+ * exactly one decoded pixel (the encoded files are not altered).
+ * v6 keeps the v5 judge surface and replaces canvas decoding and
+ * the iCCP refusal with the deterministic raw PNG decoder below.
+ *
+ * TODO(baseline-regeneration): no plain-regeneration baseline is
+ * recorded in the frozen package, so this verifier deliberately
+ * publishes no baseline count. Add one only from a separately
+ * recorded same-photo regeneration run, with its own provenance.
  */
 "use strict";
 
@@ -97,6 +106,21 @@ function verdictFor(expected, counts) {
     receiptOk: receiptOk,
     pass: checkedOk && changedOk && receiptOk,
   };
+}
+
+/* The one-pixel tamper case is a detection test, not a clean-run
+ * verdict. It succeeds only when the full receipt coverage is
+ * scanned, exactly one pixel is reported changed, the published
+ * receipt still reports zero, and the altered decoded output no
+ * longer matches the receipt's output pixel hash. */
+function onePixelTamperDetected(expected, counts, outputPixelHashMatches) {
+  return (
+    counts.checked === expected.expectedChecked &&
+    counts.checked > 0 &&
+    counts.changed === 1 &&
+    expected.receiptChanged === 0 &&
+    outputPixelHashMatches === false
+  );
 }
 
 /* Walk the PNG chunk headers (no decode) looking for an iCCP
@@ -704,12 +728,12 @@ function countChanged(fgData, outData, width, height, opts) {
   });
 }
 
-/* Tamper-mode helpers. The byte flip is for the HASHING path only: it
- * returns a throwaway copy with one byte altered, so the file hash of
- * the copy cannot match. Never decode the returned buffer — a flipped
- * byte inside a PNG's IDAT zlib stream can make the file undecodable.
- * The pixel flip is the scan-path counterpart: it alters one pixel of
- * already-decoded RGBA data, which always decodes and scans fine. */
+/* Tamper helpers. tamperedCopy is retained from v4 for compatibility
+ * with the headless helper tests; the v5 one-pixel check does NOT use
+ * it. That check leaves every encoded file byte untouched, so all file
+ * hashes must still match, and flips one pixel only after decoding.
+ * The pixel flip alters already-decoded RGBA data, which always scans
+ * fine and must produce exactly one changed pixel. */
 function tamperedCopy(buffer) {
   var copy = new Uint8Array(buffer.slice(0));
   copy[100] = copy[100] ^ 0xff; // one byte, in the copy only
@@ -780,7 +804,7 @@ function initProof() {
 
   /* ---------------- verifier ---------------- */
   var verifyBtn = document.getElementById("verify-btn");
-  var tamperBox = document.getElementById("verify-tamper");
+  var tamperBtn = document.getElementById("verify-tamper-btn");
   var statusEl = document.getElementById("verify-status");
   var checkedEl = document.getElementById("verify-checked");
   var changedEl = document.getElementById("verify-changed");
@@ -790,6 +814,11 @@ function initProof() {
 
   var reduced = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
   var running = false;
+
+  function setButtonsDisabled(disabled) {
+    verifyBtn.disabled = disabled;
+    if (tamperBtn) tamperBtn.disabled = disabled;
+  }
 
   function line(text, ok) {
     var div = document.createElement("div");
@@ -838,15 +867,14 @@ function initProof() {
     return decodePngRgba(buffer, label);
   }
 
-  verifyBtn.addEventListener("click", function () {
+  function runVerification(tamper) {
     if (running) return;
     running = true;
-    verifyBtn.disabled = true;
+    setButtonsDisabled(true);
     linesEl.innerHTML = "";
     checkedEl.textContent = "0";
     changedEl.textContent = "0";
     changedEl.className = "vcount";
-    var tamper = tamperBox && tamperBox.checked;
     var t0 = performance.now();
     function elapsed() {
       return ((performance.now() - t0) / 1000).toFixed(1) + "s";
@@ -856,7 +884,7 @@ function initProof() {
     }
     progress("fetching the run's receipt and the byte-exact files · 0.0s");
     statusEl.textContent = tamper
-      ? "Tamper test: one byte and one pixel of the output copy are altered in this browser only. Watch both checks fail."
+      ? "One-pixel tamper check: the encoded files stay untouched; exactly one fully opaque pixel in the decoded output copy will be flipped in this browser only."
       : "Fetching the run's receipt and the byte-exact files…";
 
     Promise.all([
@@ -874,10 +902,10 @@ function initProof() {
         // which ignores iCCP for sample values exactly as Pillow's
         // receipt calculation does. Profiled and unprofiled files
         // take the same grading path.
-        // Tamper: the byte flip applies to a throwaway copy used ONLY
-        // for hashing. outputBuf itself stays pristine — decoding it
-        // must succeed so the pixel flip and the scan can run.
-        var outputHashBuf = tamper ? tamperedCopy(outputBuf) : outputBuf;
+        // The one-pixel case is intentionally pixel-only: the encoded
+        // output buffer is hashed exactly as served, so its file hash
+        // must still match. The flip happens after decoding, below.
+        var outputHashBuf = outputBuf;
         progress("fetched · hashing with SHA-256 · " + elapsed());
         statusEl.textContent = "Hashing…";
         return Promise.all([
@@ -904,6 +932,7 @@ function initProof() {
           var ok = actual === expectation;
           if (!ok) hashesOk = false;
           line(label + " sha256 " + (ok ? "matches the receipt" : "MISMATCH vs the receipt"), ok);
+          return ok;
         }
         check("source photo (file)", r.sourceHash, expected.sourceFileSha256);
         check("product layer (file)", r.layerHash, expected.layerFileSha256);
@@ -926,7 +955,20 @@ function initProof() {
           sha256Hex(outData.buffer.slice(0)),
         ]).then(function (pixelHashes) {
           check("product layer (pixel)", pixelHashes[0], expected.layerPixelSha256);
-          check("final output (pixel)", pixelHashes[1], expected.outputPixelSha256);
+          var outputPixelHashMatches =
+            pixelHashes[1] === expected.outputPixelSha256;
+          if (tamper) {
+            line(
+              "final output (pixel) sha256 " +
+                (outputPixelHashMatches
+                  ? "still matches the receipt — the one-pixel flip did not take"
+                  : "differs from the receipt after the one-pixel flip, as it must"),
+              !outputPixelHashMatches
+            );
+            if (outputPixelHashMatches) hashesOk = false;
+          } else {
+            check("final output (pixel)", pixelHashes[1], expected.outputPixelSha256);
+          }
 
           statusEl.textContent = "Scanning every opaque product pixel…";
           return countChanged(
@@ -953,10 +995,16 @@ function initProof() {
             checkedEl.textContent = fmt(counts.checked);
             changedEl.textContent = fmt(counts.changed);
             var verdict = verdictFor(expected, counts);
+            var tamperDetected = tamper &&
+              onePixelTamperDetected(
+                expected,
+                counts,
+                outputPixelHashMatches
+              );
             changedEl.className = "vcount" + (counts.changed === 0 ? " zero" : " bad");
             line(
               "pixels checked " + fmt(counts.checked) + " · changed " + fmt(counts.changed),
-              verdict.checkedOk && verdict.changedOk
+              tamper ? tamperDetected : verdict.checkedOk && verdict.changedOk
             );
             if (!verdict.receiptOk) {
               line(
@@ -965,18 +1013,21 @@ function initProof() {
                 false
               );
             }
-            var pass = hashesOk && verdict.pass;
+            var pass = !tamper && hashesOk && verdict.pass;
+            var tamperPass = tamper && hashesOk && tamperDetected;
             progress(
               "finished in " + elapsed() + " · " +
               new Date().toLocaleTimeString([], { hour12: false })
             );
             statusEl.textContent = pass
               ? "Verified in your browser: the files are the run's files, graded against the run's own receipt, and the product layer reached the output unchanged."
-              : tamper
-                ? "Tamper test worked: the altered copy fails the hash check and the pixel scan. The untouched files above it are the real thing — uncheck the box and run it again."
-                : "A check failed. That is what the check is for — the files served here do not match the receipt.";
+              : tamperPass
+                ? "One-pixel tamper check worked: every file hash still matches, the decoded output pixel hash differs, and the scan finds exactly 1 changed pixel. Run the frozen sample check to see the untouched files pass."
+                : tamper
+                  ? "The one-pixel tamper case was not detected exactly as specified. That is a failed check — the scan, hashes, and receipt are shown above."
+                  : "A check failed. That is what the check is for — the files served here do not match the receipt.";
             running = false;
-            verifyBtn.disabled = false;
+            setButtonsDisabled(false);
           });
         });
       })
@@ -984,9 +1035,18 @@ function initProof() {
         progress("stopped after " + elapsed());
         statusEl.textContent = "Verification could not run: " + err.message;
         running = false;
-        verifyBtn.disabled = false;
+        setButtonsDisabled(false);
       });
+  }
+
+  verifyBtn.addEventListener("click", function () {
+    runVerification(false);
   });
+  if (tamperBtn) {
+    tamperBtn.addEventListener("click", function () {
+      runVerification(true);
+    });
+  }
 }
 
 if (typeof document !== "undefined") {
@@ -1007,6 +1067,7 @@ if (typeof window !== "undefined") {
     flipFirstOpaquePixel: flipFirstOpaquePixel,
     expectationsFromReceipt: expectationsFromReceipt,
     verdictFor: verdictFor,
+    onePixelTamperDetected: onePixelTamperDetected,
     pngHasICC: pngHasICC,
   };
 }
@@ -1021,6 +1082,7 @@ if (typeof module !== "undefined" && module.exports) {
     flipFirstOpaquePixel: flipFirstOpaquePixel,
     expectationsFromReceipt: expectationsFromReceipt,
     verdictFor: verdictFor,
+    onePixelTamperDetected: onePixelTamperDetected,
     pngHasICC: pngHasICC,
   };
 }
