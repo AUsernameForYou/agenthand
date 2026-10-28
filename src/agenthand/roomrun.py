@@ -45,14 +45,24 @@ Pipeline:
    listings reads as one room's worth of staging. The per-item
    fidelity receipt is the draw tool's own, persisted beside the
    composite in the store and linked from the manifest.
-6. Manifest. JSON + a readable summary: room id, sources, per-item
-   status (staged / failed, with the stage and error that failed it),
-   receipt links and pixel counts, sightings, duplicate flags, and
-   the run's total cost read as the delta of the real cost ledger
-   across the run — the amounts the spend cap actually counted,
-   failed attempts included. Partial failure is a first-class
-   outcome: a room where four items stage and two honestly fail is a
-   successful room run with a truthful manifest.
+6. Verify. A staged item is not believed on draw's say-so: the
+   repo's independent verifier (composite.verify_receipt_from_disk)
+   re-reads the item's stored source, foreground, and composite
+   files, re-checks their hashes, and recounts the changed opaque
+   pixels from disk. Its verdict lands in the manifest as the item's
+   "verification" field, distinct from the draw receipt it checks.
+   An item whose verification fails is reported verify_failed, not
+   staged — the demo-ready Gauntlet's fix #1: a room run "verifies
+   end to end" only when an independent path re-proves each item.
+7. Manifest. JSON + a readable summary: room id, sources, per-item
+   status (staged / failed / verify_failed, with the stage and error
+   that failed it), receipt links and pixel counts, the independent
+   verification per item, sightings, duplicate flags, and the run's
+   total cost read as the delta of the run's own cost ledger across
+   the run — the amounts the spend cap actually counted, failed
+   attempts included. Partial failure is a first-class outcome: a
+   room where four items stage and two honestly fail is a successful
+   room run with a truthful manifest.
 
 Honesty notes (v1 limits, stated rather than smoothed over):
 
@@ -69,13 +79,17 @@ Honesty notes (v1 limits, stated rather than smoothed over):
   with NO_MATCH in the manifest, never a quietly substituted object.
 
 Spend discipline: every model call goes through the shipped tools, so
-every dollar flows through meta_client.billed_call under the existing
-fail-closed cap — this module never touches the API or the ledger
-directly (it only READS the ledger total to report the run's cost).
-The CLI additionally enforces a per-run budget (default $1.00): a
-worst-case projection is checked before the first call, and the run
-stops staging further items if the ledger delta crosses the budget
-mid-run (remaining items are marked failed with BUDGET_STOP).
+every dollar flows through meta_client.billed_call under its
+fail-closed cap — this module never touches the API directly. Room
+runs keep their OWN ledger (default: ledger.jsonl inside the output
+dir; --ledger overrides): during a run, AGENTHAND_LEDGER_PATH points
+at the room ledger so every receipt the run causes lands there, and
+the server's cumulative ledger — the one the published proof run's
+accounting lives in — is never touched by an experiment (demo-ready
+Gauntlet separation gate). The per-run budget (default $1.00) plus
+the worst-case projection checked before the first call are the
+binding bounds on room spend; the manifest's total is the room
+ledger's delta across the run.
 """
 
 from __future__ import annotations
@@ -84,6 +98,7 @@ import argparse
 import base64
 import json
 import mimetypes
+import os
 import re
 import shutil
 import subprocess
@@ -419,6 +434,59 @@ def sample_video_frames(
 # ---------------------------------------------------------------------------
 
 
+def _default_verify(store: AssetStore, composite_handle: str) -> dict:
+    """The production verifier: the repo's independent receipt check.
+
+    composite.verify_receipt_from_disk re-reads the stored source,
+    foreground, and composite files, re-checks every file against its
+    recorded hashes, and recounts the changed opaque pixels fresh
+    from disk — nothing is taken from draw's in-memory receipt except
+    the claims being checked. The receipt persisted beside the
+    composite is the one graded, so what verifies is what a judge
+    with the store would find.
+    """
+    from . import composite
+
+    return composite.verify_receipt_from_disk(store, composite_handle)
+
+
+def _run_verification(ctx: "_RunContext", composite_handle: str) -> dict:
+    """Run the verifier over one staged item; shape its manifest field.
+
+    The returned dict is the manifest's "verification" record —
+    deliberately distinct from the item's "receipt" (draw's own
+    numbers): these are the independent recount's numbers. A
+    verifier that cannot run at all (no persisted receipt, an
+    unknown handle) is a FAILED verification, never an exception
+    that aborts the room and never a silent pass: an item nobody
+    could check has not been shown to be intact.
+    """
+    try:
+        report = ctx.verify_fn(ctx.store, composite_handle)
+    except Exception as exc:  # noqa: BLE001 — verifier boundary, as in composite
+        return {
+            "ok": False,
+            "changed_opaque_pixels": None,
+            "opaque_pixels": None,
+            "color_profile_preserved": None,
+            "problems": [
+                f"the independent verifier could not run: "
+                f"{type(exc).__name__}: {exc}"
+            ],
+            "checks_failed": [],
+        }
+    recomputed = report.get("recomputed") or {}
+    checks = report.get("checks") or {}
+    return {
+        "ok": bool(report.get("ok")),
+        "changed_opaque_pixels": recomputed.get("changed_opaque_pixels"),
+        "opaque_pixels": recomputed.get("opaque_pixels"),
+        "color_profile_preserved": recomputed.get("color_profile_preserved"),
+        "problems": list(report.get("problems") or []),
+        "checks_failed": sorted(k for k, v in checks.items() if not v),
+    }
+
+
 def _default_chain() -> dict:
     from . import server
 
@@ -473,6 +541,7 @@ class _RunContext:
     store: AssetStore
     chain: dict
     scene: str
+    verify_fn: object = None  # (store, composite_handle) -> report dict
     max_photos_per_item: int = MAX_PHOTOS_PER_ITEM
     max_sam_calls_per_item: int = MAX_SAM_CALLS_PER_ITEM
     sam_calls: int = 0  # per item; reset by the item loop
@@ -482,9 +551,19 @@ class _RunContext:
 def _rank_photos(item_name: str, sources: list[PhotoSource]) -> list[int]:
     """Source indices in probe order for one item.
 
-    Ranked by token overlap of the item's name in each photo's plan
-    text; ties break toward stills (sharper, larger) and then toward
-    the earlier source. The full ordering is returned — mentioning
+    Ranked by plan-text evidence for the item, strongest signal
+    first: a photo whose plan names the item's HEAD NOUN (the item's
+    last token — "hat", "suitcase", "box") outranks every photo
+    whose plan merely shares a modifier with the name. The flat
+    overlap this replaced let a colour word do exactly that damage
+    in the first real room run: three photos whose plans mentioned
+    "black" (a suitcase's trim, a railing, a purifier's grille)
+    outranked every photo that actually held the black hat, because
+    the hat-bearing plans said "hat" and never "black" — and the
+    probe cap then spent itself on the wrong photos. Within the
+    head-noun tier, token overlap of the full name decides; ties
+    break toward stills (sharper, larger) and then toward the
+    earlier source. The full ordering is returned — mentioning
     photos first, then every silent photo as coverage fill (stills
     before frames) — and the caller's probe cap bounds how far down
     the order a run actually probes. A silent plan is weak evidence
@@ -492,26 +571,31 @@ def _rank_photos(item_name: str, sources: list[PhotoSource]) -> list[int]:
     so the bookcase photo whose plan says "bookshelf" can still hold
     the hat on its top shelf.
     """
+    item_tokens = tokens_of(item_name)
+    head_noun = item_tokens[-1] if item_tokens else None
 
-    def overlap(idx: int) -> float:
+    def _matches(token: str, others: set[str]) -> bool:
+        return any(
+            token == other
+            or (len(token) >= 4 and other.startswith(token))
+            or (len(other) >= 4 and token.startswith(other))
+            for other in others
+        )
+
+    def score(idx: int) -> float:
         plan = sources[idx].plan
         if not plan:
             return 0.0
         text_tokens = _token_set(plan_text(plan))
-        item_tokens = _token_set(item_name)
-        if not text_tokens or not item_tokens:
+        item_token_set = _token_set(item_name)
+        if not text_tokens or not item_token_set:
             return 0.0
-        shared = sum(
-            1
-            for t in item_tokens
-            if any(
-                t == o or (len(t) >= 4 and o.startswith(t)) or (len(o) >= 4 and t.startswith(o))
-                for o in text_tokens
-            )
-        )
-        return shared / len(item_tokens)
+        shared = sum(1 for t in item_token_set if _matches(t, text_tokens))
+        overlap = shared / len(item_token_set)
+        head_bonus = 1.0 if head_noun and _matches(head_noun, text_tokens) else 0.0
+        return head_bonus + overlap
 
-    scored = [(overlap(i), i) for i in range(len(sources))]
+    scored = [(score(i), i) for i in range(len(sources))]
     order = sorted(
         scored,
         key=lambda pair: (
@@ -638,6 +722,7 @@ def _process_item(
         "output_asset": None,
         "receipt": None,
         "receipt_file": None,
+        "verification": None,
         "listing": None,
         "possible_duplicate_of": [],
         "flags": list(item.get("flags", [])),
@@ -721,8 +806,6 @@ def _process_item(
         return record
 
     receipt = draw_result.get("fidelity_receipt") or {}
-    record["status"] = "staged"
-    record["stage_reached"] = "done"
     record["output_asset"] = draw_result.get("output_asset")
     record["receipt"] = {
         "source_asset": receipt.get("source_asset"),
@@ -734,6 +817,27 @@ def _process_item(
     }
     receipt_path = ctx.store.receipt_path(record["output_asset"])
     record["receipt_file"] = str(receipt_path) if receipt_path.exists() else None
+
+    # Verify loop (demo-ready Gauntlet fix #1): draw's receipt is
+    # draw grading its own work. The item counts as staged only when
+    # the independent verifier, re-reading the stored files, agrees.
+    record["stage_reached"] = "verify"
+    verification = _run_verification(ctx, record["output_asset"])
+    record["verification"] = verification
+    if verification["ok"]:
+        record["status"] = "staged"
+        record["stage_reached"] = "done"
+    else:
+        record["status"] = "verify_failed"
+        problems = verification["problems"]
+        record["failure"] = {
+            "stage": "verify",
+            "code": "VERIFY_FAILED",
+            "message": (
+                "the staged output did not pass independent verification: "
+                + ("; ".join(problems) if problems else "verifier reported failure")
+            ),
+        }
     return record
 
 
@@ -804,6 +908,8 @@ def run_room(
     store: AssetStore | None = None,
     chain: dict | None = None,
     spend_probe=None,
+    verify_fn=None,
+    ledger_path: Path | None = None,
 ) -> dict:
     """Run one room end to end and return (and write) its manifest.
 
@@ -812,20 +918,87 @@ def run_room(
     that cross-photo evidence is what the de-dup record is built
     from. When False, probing stops at the first success per item
     (cheaper, thinner manifest).
-    """
-    from . import server  # local import: server pulls in the MCP SDK
 
+    ledger_path: the run's own cost ledger. The default is
+    ledger.jsonl inside out_dir — room runs are experiments and
+    never spend against the server's cumulative ledger (the one the
+    published proof run's accounting lives in). For the run's
+    duration AGENTHAND_LEDGER_PATH points at this ledger, so every
+    receipt billed_call writes for the run lands in it; the previous
+    value is restored on exit. The manifest records the path and its
+    total is this ledger's delta across the run.
+
+    verify_fn: (store, composite_handle) -> verifier report. The
+    default is the repo's independent verifier
+    (composite.verify_receipt_from_disk) — every staged item is
+    re-proven from the stored files before the manifest calls it
+    staged.
+    """
     store = store if store is not None else AssetStore(config.get_data_dir())
     chain = chain if chain is not None else _default_chain()
+    verify_fn = verify_fn if verify_fn is not None else _default_verify
     room_id = room_id or f"room-{uuid.uuid4().hex[:8]}"
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    room_ledger = (
+        Path(ledger_path) if ledger_path is not None else out_dir / "ledger.jsonl"
+    )
 
-    ledger_path = config.get_ledger_path()
+    previous_ledger_env = os.environ.get("AGENTHAND_LEDGER_PATH")
+    os.environ["AGENTHAND_LEDGER_PATH"] = str(room_ledger)
+    try:
+        return _run_room_body(
+            still_paths,
+            video_paths,
+            out_dir,
+            item_names=item_names,
+            auto=auto,
+            scene=scene,
+            room_id=room_id,
+            budget_usd=budget_usd,
+            frame_every_seconds=frame_every_seconds,
+            max_frames_per_video=max_frames_per_video,
+            max_photos_per_item=max_photos_per_item,
+            probe_all_candidates=probe_all_candidates,
+            store=store,
+            chain=chain,
+            spend_probe=spend_probe,
+            verify_fn=verify_fn,
+            room_ledger=room_ledger,
+        )
+    finally:
+        if previous_ledger_env is None:
+            os.environ.pop("AGENTHAND_LEDGER_PATH", None)
+        else:
+            os.environ["AGENTHAND_LEDGER_PATH"] = previous_ledger_env
+
+
+def _run_room_body(
+    still_paths: list[Path],
+    video_paths: list[Path],
+    out_dir: Path,
+    *,
+    item_names: list[str] | None,
+    auto: bool,
+    scene: str,
+    room_id: str,
+    budget_usd: float,
+    frame_every_seconds: float,
+    max_frames_per_video: int,
+    max_photos_per_item: int,
+    probe_all_candidates: bool,
+    store: AssetStore,
+    chain: dict,
+    spend_probe,
+    verify_fn,
+    room_ledger: Path,
+) -> dict:
+    from . import server  # local import: server pulls in the MCP SDK
+
     if spend_probe is None:
 
         def spend_probe() -> float:  # noqa: F811 — closure default
-            return ledger.ledger_total_usd(ledger_path)
+            return ledger.ledger_total_usd(room_ledger)
 
     spend_before = spend_probe()
 
@@ -958,6 +1131,7 @@ def run_room(
         store=store,
         chain=chain,
         scene=scene,
+        verify_fn=verify_fn,
         max_photos_per_item=max_photos_per_item,
     )
 
@@ -986,6 +1160,7 @@ def run_room(
                     "output_asset": None,
                     "receipt": None,
                     "receipt_file": None,
+                    "verification": None,
                     "listing": None,
                     "possible_duplicate_of": [],
                     "flags": list(item.get("flags", [])),
@@ -1006,6 +1181,7 @@ def run_room(
         "mode": mode,
         "room_style": scene,
         "budget_usd": budget_usd,
+        "ledger_path": str(room_ledger),
         "total_cost_usd": total_cost,
         "sources": [s.manifest_entry(i) for i, s in enumerate(sources)],
         "videos": video_notes,
@@ -1047,6 +1223,19 @@ def summarize_manifest(manifest: dict) -> str:
                 f"{receipt.get('changed_opaque_pixels')} changed, "
                 f"profile preserved: {receipt.get('color_profile_preserved')} — "
                 f"${item['cost_usd']:.6f}"
+            )
+            lines.append(f"          receipt: {item['receipt_file']}")
+            verification = item.get("verification") or {}
+            lines.append(
+                f"          verified independently: "
+                f"{verification.get('opaque_pixels')} opaque px recounted from disk, "
+                f"{verification.get('changed_opaque_pixels')} changed"
+            )
+        elif item["status"] == "verify_failed":
+            failure = item["failure"] or {}
+            lines.append(
+                f"  VERIFY FAILED  {item['name']}: the staged output did not "
+                f"pass independent verification — {failure.get('message')}"
             )
             lines.append(f"          receipt: {item['receipt_file']}")
         else:
@@ -1117,24 +1306,23 @@ def main(argv: list[str] | None = None) -> int:
         "--data-dir",
         type=Path,
         default=None,
+        help="Isolate the asset store here (AGENTHAND_DATA_DIR).",
+    )
+    parser.add_argument(
+        "--ledger",
+        type=Path,
+        default=None,
         help=(
-            "Isolate the asset store here. The cost ledger stays at its "
-            "configured path (the real ledger by default) so run spend "
-            "counts toward the same cumulative cap as everything else."
+            "The run's cost ledger (default: ledger.jsonl inside the "
+            "output dir). Room runs are isolated from the server's "
+            "cumulative ledger by default; point this at that ledger "
+            "only if the run's spend should deliberately count there."
         ),
     )
     args = parser.parse_args(argv)
 
     if args.data_dir:
-        import os
-
         os.environ["AGENTHAND_DATA_DIR"] = str(args.data_dir)
-        # Mirror the dry-run gate's fix: an isolated store must not
-        # imply an isolated ledger, or the run would restart the
-        # cumulative spend cap from zero.
-        if not os.environ.get("AGENTHAND_LEDGER_PATH"):
-            default_ledger = Path(__file__).resolve().parents[2] / "data" / "ledger.jsonl"
-            os.environ["AGENTHAND_LEDGER_PATH"] = str(default_ledger)
 
     item_names = [name.strip() for name in args.items.split(",") if name.strip()]
     if not args.auto and not item_names:
@@ -1157,6 +1345,7 @@ def main(argv: list[str] | None = None) -> int:
             frame_every_seconds=args.frame_every,
             max_frames_per_video=args.max_frames_per_video,
             probe_all_candidates=not args.first_success_only,
+            ledger_path=args.ledger,
         )
     except RuntimeError as exc:
         print(f"ROOM RUN REFUSED: {exc}", file=sys.stderr)

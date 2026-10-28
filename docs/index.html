@@ -566,7 +566,7 @@ function countChanged(fgData, outData, width, height, opts) {
     <h2 id="status-h">Built in the open, during the hackathon</h2>
     <p class="lede">agenthand was designed and built during the Meta Global AI Developer Hackathon, October 26 to November 4, 2026. The full chain runs end to end today: identify, cut_out, and draw, live on the Meta Model API, with Fidelity Lock receipts on every staged image. A demo video is on its way.</p>
     <p class="proof-title">Built twice, measured side by side</p>
-    <p class="lede">agenthand exists twice: the reference server in Python, and a second implementation in Rust, written as a single binary (source in the agenthand-rust repository). Both were run against the same frozen proof run and measured side by side. The two builds agree exactly: the same output pixel hash (sha256 8b8defea&hellip;e802), the same count (580,613 opaque pixels checked, 0 changed), and the same total billed cost, $0.020044 to the micro-dollar. Python stays the reference. What differs is how fast the local work runs:</p>
+    <p class="lede">agenthand exists twice: the reference server in Python, and a second implementation in Rust, written as a single binary. Both were run against the same frozen proof run and measured side by side. The two builds agree exactly: the same output pixel hash (sha256 8b8defea&hellip;e802), the same count (580,613 opaque pixels checked, 0 changed), and the same total billed cost, $0.020044 to the micro-dollar. Python stays the reference. What differs is how fast the local work runs:</p>
     <table class="bench">
       <tr><th>Operation</th><th>Python</th><th>Rust</th></tr>
       <tr><td>Cold start to initialize response</td><td>1,291.5 ms</td><td>2.4 ms (about 540x)</td></tr>

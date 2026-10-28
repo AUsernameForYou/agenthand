@@ -8,10 +8,13 @@
 
 Stages every named item found in the room's photos through the
 shipped chain (identify -> cut_out -> draw), one Fidelity Lock
-receipt per item, and writes manifest.json + summary.txt to --out.
+receipt per item, each item then re-verified independently from the
+stored files, and writes manifest.json + summary.txt to --out.
 This spends REAL Meta credits through the existing billed_call choke
 point; the per-run budget (default $1.00) is projection-checked
 before the first call and enforced as the ledger delta grows.
+Receipts land in the run's own ledger (<out>/ledger.jsonl) by
+default, isolated from the server's cumulative ledger.
 """
 
 from __future__ import annotations

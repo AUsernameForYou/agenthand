@@ -20,7 +20,7 @@ from pathlib import Path  # noqa: E402
 import pytest  # noqa: E402
 from PIL import Image  # noqa: E402
 
-from agenthand import config, ingest, roomrun  # noqa: E402
+from agenthand import composite, config, ingest, ledger, roomrun  # noqa: E402
 from agenthand.assets import AssetStore  # noqa: E402
 
 
@@ -160,8 +160,23 @@ class FakeChain:
         }
 
 
+def _verify_ok(store, handle):
+    """A passing verifier report, shaped like the real one's."""
+    return {
+        "ok": True,
+        "checks": {"zero_changed_pixels": True},
+        "problems": [],
+        "recomputed": {
+            "changed_opaque_pixels": 0,
+            "opaque_pixels": 100,
+            "color_profile_preserved": True,
+        },
+    }
+
+
 def _run(tmp_path, photos, fake, **kwargs):
     kwargs.setdefault("budget_usd", 5.00)
+    kwargs.setdefault("verify_fn", _verify_ok)
     return roomrun.run_room(
         photos,
         [],
@@ -241,6 +256,43 @@ def test_rank_photos_prefers_mention_then_stills():
     )
     ranked = roomrun._rank_photos("unicycle", sources)
     assert ranked == [0, 1, 2]
+
+
+def test_rank_photos_head_noun_beats_modifier_match():
+    """The first real room run's failure shape: for "black hat", the
+    plans naming "black" (a suitcase's trim, a railing) outranked the
+    plans naming "hat" (the bookcase views that held it), and the
+    probe cap was spent before any hat-bearing photo was probed. The
+    item's head noun is the strong signal; a shared colour is not."""
+
+    def plan_with(text):
+        return {
+            "description": text,
+            "concept": "",
+            "suggested_title": "",
+            "listing_bullets": [],
+            "condition_notes": "",
+        }
+
+    sources = [
+        roomrun.PhotoSource(
+            path=Path("case.jpg"),
+            origin="still",
+            plan=plan_with("orange suitcase with black trim and spinner wheels"),
+        ),
+        roomrun.PhotoSource(
+            path=Path("floor.jpg"),
+            origin="video_frame",
+            plan=plan_with("wood plank flooring with a black railing"),
+        ),
+        roomrun.PhotoSource(
+            path=Path("shelf.jpg"),
+            origin="video_frame",
+            plan=plan_with("white bookshelf holding boxes, a straw hat and hats"),
+        ),
+    ]
+    ranked = roomrun._rank_photos("black hat", sources)
+    assert ranked[0] == 2  # the hat-bearing photo probes first
 
 
 # ---------------------------------------------------------------------------
@@ -408,6 +460,225 @@ def test_projection_gate_refuses_before_any_call(tmp_path):
     with pytest.raises(RuntimeError, match="worst-case projection"):
         _run(tmp_path, photos, fake, item_names=["orange suitcase"], budget_usd=0.01)
     assert fake.calls == {"identify": 0, "cut_out": 0, "draw": 0}
+
+
+# ---------------------------------------------------------------------------
+# Verify loop (demo-ready Gauntlet fix #1): draw's receipt is never
+# believed on its own — the independent verifier's verdict is a
+# distinct manifest field, and a failed verdict un-stages the item.
+# ---------------------------------------------------------------------------
+
+
+def _verify_fail(store, handle):
+    return {
+        "ok": False,
+        "checks": {"zero_changed_pixels": False},
+        "problems": ["2 of 100 fully-masked product pixels differ"],
+        "recomputed": {
+            "changed_opaque_pixels": 2,
+            "opaque_pixels": 100,
+            "color_profile_preserved": True,
+        },
+    }
+
+
+def _one_item_fake(tmp_path):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "case.jpg", (200, 90, 10))]
+    fake = FakeChain(
+        store,
+        plans=[_plan("orange suitcase")],
+        contents={(0, "orange suitcase"): "case1"},
+    )
+    return photos, fake
+
+
+def test_verify_failure_means_not_staged(tmp_path):
+    photos, fake = _one_item_fake(tmp_path)
+    manifest = _run(
+        tmp_path, photos, fake,
+        item_names=["orange suitcase"], verify_fn=_verify_fail,
+    )
+    item = manifest["items"][0]
+    assert item["status"] == "verify_failed"  # NOT staged
+    assert item["failure"]["stage"] == "verify"
+    assert item["failure"]["code"] == "VERIFY_FAILED"
+    # The verifier's own numbers are the record, distinct from the
+    # receipt draw issued (which still claims 0 changed, untouched).
+    assert item["verification"]["ok"] is False
+    assert item["verification"]["changed_opaque_pixels"] == 2
+    assert item["receipt"]["changed_opaque_pixels"] == 0
+    summary = (tmp_path / "out" / "summary.txt").read_text()
+    assert "VERIFY FAILED" in summary
+    assert "0 of 1 items staged" in summary
+
+
+def test_verification_numbers_come_from_the_verifier(tmp_path):
+    def verify_recount(store, handle):
+        report = _verify_ok(store, handle)
+        report["recomputed"] = {
+            "changed_opaque_pixels": 0,
+            "opaque_pixels": 4242,  # the recount's count, not draw's
+            "color_profile_preserved": True,
+        }
+        return report
+
+    photos, fake = _one_item_fake(tmp_path)
+    manifest = _run(
+        tmp_path, photos, fake,
+        item_names=["orange suitcase"], verify_fn=verify_recount,
+    )
+    item = manifest["items"][0]
+    assert item["status"] == "staged"
+    assert item["verification"]["ok"] is True
+    assert item["verification"]["opaque_pixels"] == 4242
+    assert item["receipt"]["opaque_pixels"] == 100  # the fake draw's claim
+    summary = (tmp_path / "out" / "summary.txt").read_text()
+    assert "4242 opaque px recounted from disk, 0 changed" in summary
+
+
+def test_verifier_that_cannot_run_fails_the_item_not_the_room(tmp_path):
+    def verify_broken(store, handle):
+        raise ValueError("no receipt persisted beside the composite")
+
+    photos, fake = _one_item_fake(tmp_path)
+    manifest = _run(
+        tmp_path, photos, fake,
+        item_names=["orange suitcase"], verify_fn=verify_broken,
+    )
+    item = manifest["items"][0]
+    assert item["status"] == "verify_failed"
+    assert item["verification"]["ok"] is False
+    assert "could not run" in item["verification"]["problems"][0]
+
+
+class RealDrawChain:
+    """identify/cut_out faked, draw REAL (composite.draw_product).
+
+    The foreground is lineage-correct (parented to the ingested
+    source photo), so draw runs the production compositor and
+    persists a production receipt — and run_room's DEFAULT verifier
+    (composite.verify_receipt_from_disk) grades it from disk.
+    """
+
+    def __init__(self, store):
+        self.store = store
+
+    def identify(self, image_ref: str) -> dict:
+        handle = ingest.ingest(image_ref, self.store)
+        return {"status": "ok", "image": handle, "cost_usd": 0.0, **_plan("straw hat")}
+
+    def cut_out(self, handle: str, concept: str) -> dict:
+        if concept != "straw hat":
+            return {
+                "status": "error",
+                "error": {"code": "NO_MATCH", "message": "not here", "cost_counted_usd": 0.0},
+            }
+        fg_img = Image.new("RGBA", (48, 36), (0, 0, 0, 0))
+        px = fg_img.load()
+        for y in range(36):
+            for x in range(20):
+                px[x, y] = (200, 30, 30, 255)
+            px[20, y] = (0, 200, 30, 128)
+        fg = self.store.put_image(
+            fg_img,
+            kind="foreground_png",
+            source_asset_id=AssetStore.parse_handle(handle),
+        )
+        return {
+            "status": "ok",
+            "output_asset": fg,
+            "mask_asset": None,
+            "mask_overlay_asset": None,
+            "mask_review": {"bbox": [0, 0, 21, 36], "warnings": []},
+            "cost_usd": 0.0,
+        }
+
+    def draw(self, fg_handle: str, scene: str) -> dict:
+        handle, receipt = composite.draw_product(self.store, fg_handle, scene)
+        return {
+            "status": "ok",
+            "output_asset": handle,
+            "fidelity_receipt": receipt,
+            "cost_usd": 0.0,
+        }
+
+
+def test_default_verifier_reproves_a_real_draw(tmp_path):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "shelf.jpg")]
+    chain = RealDrawChain(store)
+    manifest = roomrun.run_room(
+        photos,
+        [],
+        tmp_path / "out",
+        item_names=["straw hat"],
+        store=store,
+        chain={"identify": chain.identify, "cut_out": chain.cut_out, "draw": chain.draw},
+        spend_probe=lambda: 0.0,
+        budget_usd=5.00,
+        # no verify_fn: the production default must be what runs
+    )
+    item = manifest["items"][0]
+    assert item["status"] == "staged"
+    verification = item["verification"]
+    assert verification["ok"] is True
+    assert verification["changed_opaque_pixels"] == 0
+    assert verification["opaque_pixels"] == 20 * 36  # the recount, from disk
+    assert verification["opaque_pixels"] == item["receipt"]["opaque_pixels"]
+    assert verification["checks_failed"] == []
+
+
+# ---------------------------------------------------------------------------
+# Ledger isolation: a room run's receipts land in its own ledger
+# (default <out>/ledger.jsonl); the configured (cumulative) ledger
+# is never touched, and the manifest total is the room ledger's.
+# ---------------------------------------------------------------------------
+
+
+def test_room_run_spends_against_its_own_ledger(tmp_path, monkeypatch):
+    submission_ledger = tmp_path / "submission-ledger.jsonl"
+    monkeypatch.setenv("AGENTHAND_LEDGER_PATH", str(submission_ledger))
+    photos, fake = _one_item_fake(tmp_path)
+
+    def wrap(fn, tool, cost):
+        def inner(*args):
+            result = fn(*args)
+            # billed_call resolves the ledger path at call time; so
+            # does this simulation of it.
+            ledger.append_receipt(
+                config.get_ledger_path(),
+                ledger.Receipt(tool=tool, model="fake", usd_estimate=cost),
+            )
+            return result
+
+        return inner
+
+    base = fake.chain()
+    chain = {
+        "identify": wrap(base["identify"], "identify", FakeChain.IDENTIFY_COST),
+        "cut_out": wrap(base["cut_out"], "cut_out", FakeChain.CUT_COST),
+        "draw": wrap(base["draw"], "draw", FakeChain.DRAW_COST),
+    }
+    out_dir = tmp_path / "out"
+    manifest = roomrun.run_room(
+        photos,
+        [],
+        out_dir,
+        item_names=["orange suitcase"],
+        store=fake.store,
+        chain=chain,
+        verify_fn=_verify_ok,
+        budget_usd=5.00,
+        # no spend_probe, no ledger_path: both defaults are the point
+    )
+    room_ledger = out_dir / "ledger.jsonl"
+    assert manifest["ledger_path"] == str(room_ledger)
+    assert ledger.ledger_total_usd(room_ledger) == pytest.approx(fake.spend)
+    assert manifest["total_cost_usd"] == pytest.approx(fake.spend)
+    assert not submission_ledger.exists()  # the cumulative ledger untouched
+    # The caller's environment is restored after the run.
+    assert os.environ["AGENTHAND_LEDGER_PATH"] == str(submission_ledger)
 
 
 # ---------------------------------------------------------------------------
