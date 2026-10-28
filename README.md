@@ -116,38 +116,18 @@ files. The placeholder plate survives only behind an explicit dev flag
 for offline tests. Today the server runs locally over stdio; a hosted
 endpoint comes later.
 
-The primary build is the single-binary Rust build
-([AUsernameForYou/agenthand-rust](https://github.com/AUsernameForYou/agenthand-rust)).
-It passed a parity gate against the frozen
+The server also exists as a single-binary Rust build. It passed a parity gate against the frozen
 files of the verified run above, reproducing the run's counts and its
 output pixel hash, and a live run from the Rust binary was cross-checked
-by the Python verifier. This Python implementation is the reference
-the port is measured against, and it remains the fallback install
-(and the build that handles HEIC today); the two agree.
+by the Python verifier. The Python implementation remains the
+reference; the Rust build is a second implementation of the same
+server, and the two agree.
 
 ## Run it
 
-Register agenthand with any MCP client. The primary route is the
-Rust binary: download the `.mcpb` bundle for your platform from the
-[agenthand-rust releases](https://github.com/AUsernameForYou/agenthand-rust/releases/latest)
-(one click in MCPB-supporting clients), or point your client at the
-bare binary:
-
-```json
-{
-  "mcpServers": {
-    "agenthand": {
-      "command": "/path/to/agenthand",
-      "env": { "META_API_KEY": "…" }
-    }
-  }
-}
-```
-
-macOS builds are unsigned for now, so clear the Gatekeeper quarantine
-on first launch (right-click → Open). The alternative route uses
+Register agenthand with any MCP client. The primary route uses
 [uv](https://docs.astral.sh/uv/): nothing to install ahead of time, uv
-fetches the published Python package and runs it.
+fetches the published package and runs it.
 
 ```json
 {
