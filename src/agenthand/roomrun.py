@@ -37,7 +37,10 @@ Pipeline:
    it just ranks blind.
 3. Per item. Candidate photos are ranked by token overlap between the
    item's name and each photo's plan text (stills before frames on
-   ties — they are sharper and larger). cut_out probes the top
+   ties — they are sharper and larger). The probe cap can never drop
+   a still: every still photo is always in the candidate set, and
+   video frames fill the cap's remaining slots in rank order (probe
+   order inside the set stays the rank order). cut_out probes the
    candidates with the item's name as the SAM concept (plus bounded
    deterministic variants: the photo plan's own phrase when it overlaps
    the name, a colour-stripped form, the head noun). Every probe is a
@@ -55,6 +58,15 @@ Pipeline:
    primary masks on the same photo almost perfectly overlap, are
    flagged as possible duplicates of each other. NOTHING is ever
    silently merged away: a flag keeps both listings and says why.
+   One collision shape gets a repair attempt on top of the flag:
+   when two staged primaries sit on the same photo with masks
+   overlapping at least 95% of the smaller mask, and exactly one
+   item's own listing evidence names that item and not the other,
+   the other item is displaced — it re-stages from its largest
+   non-colliding successful sighting, when it has one, under a
+   fresh receipt and verification. Ambiguous evidence, no clean
+   alternate sighting, a failed re-stage, or a re-stage the run
+   budget cannot cover all leave the flag standing instead.
 5. Stage. In the default "scene" stage mode, draw runs the primary
    foreground with ONE shared scene prompt for the whole room (the
    room's plate style), so the set of listings reads as one room's
@@ -128,6 +140,7 @@ from __future__ import annotations
 import argparse
 import array
 import base64
+import copy
 import json
 import math
 import mimetypes
@@ -167,6 +180,10 @@ MAX_SAM_CALLS_PER_ITEM = 6
 MERGE_SIMILARITY = 0.6
 FLAG_SIMILARITY = 0.4
 MASK_IOU_FLAG = 0.9
+# Collision re-selection: two staged primaries on one photo whose
+# foreground masks overlap at least this fraction of the SMALLER
+# mask are the same physical object for one of the two items.
+MASK_OVERLAP_COLLISION = 0.95
 
 # Leading adjectives the variant generator may strip to widen a SAM
 # phrase ("gray storage box" -> "storage box"). Colours and sizes are
@@ -1082,6 +1099,47 @@ def _rank_photos(item_name: str, sources: list[PhotoSource]) -> list[int]:
     return [i for _, i in order]
 
 
+def _select_candidate_indices(
+    item_name: str,
+    ranked: list[int],
+    sources: list[PhotoSource],
+    cap: int,
+) -> list[int]:
+    """Apply the probe cap to one item's ranked candidates.
+
+    Coverage rule: every still photo is always selected — a cap
+    filled by higher-ranked video frames must never silently drop
+    the still that holds an item the frames' plans never named.
+    Video frames fill the cap's remaining slots in rank order; when
+    the stills alone meet or exceed the cap, the set is the stills.
+    A still missing from the ranked list (auto-enumerate groups
+    carry only their own photos) is added and probes after the
+    ranked candidates, in its own rank order among the added
+    stills. Probe order inside the selected set is the rank order.
+    """
+    ranked = list(dict.fromkeys(ranked))
+    rank_pos = {idx: pos for pos, idx in enumerate(ranked)}
+    full_pos = {idx: pos for pos, idx in enumerate(_rank_photos(item_name, sources))}
+
+    def order_key(idx: int) -> tuple:
+        if idx in rank_pos:
+            return (0, rank_pos[idx])
+        return (1, full_pos.get(idx, idx))
+
+    selected = {
+        i for i, source in enumerate(sources) if source.origin == "still"
+    }
+    remaining = max(0, cap - len(selected))
+    for idx in ranked:
+        if remaining <= 0:
+            break
+        if sources[idx].origin == "still" or idx in selected:
+            continue
+        selected.add(idx)
+        remaining -= 1
+    return sorted(selected, key=order_key)
+
+
 def _probe_item(
     ctx: _RunContext,
     item_name: str,
@@ -1192,6 +1250,7 @@ def _none_listing(note: str) -> dict:
         "source": "none",
         "note": note,
         "crop_asset": None,
+        "plan_concept": None,
     }
 
 
@@ -1257,8 +1316,140 @@ def _crop_listing(
             "source": "item_crop",
             "note": None,
             "crop_asset": crop_handle,
+            # The crop plan's own concept, kept as the listing's
+            # evidence for the duplicate-collision keeper check:
+            # the title alone ("Woven Straw Sun Hat") is wordier
+            # than the concept the plan actually segmented.
+            "plan_concept": result.get("concept"),
         }, cost
     return _none_listing(_NO_COPY_NOTE + "; the item-crop identify attempt failed"), cost
+
+
+def _sighting_primary_key(sources: list[PhotoSource], sighting: dict) -> tuple:
+    """Primary-selection ordering for one successful sighting.
+
+    The clearest view wins: most opaque product pixels first; ties
+    toward stills, then the earlier photo. Primary selection and
+    collision re-selection share this exact ordering.
+    """
+    source = sources[sighting["photo_index"]]
+    return (
+        -(sighting.get("opaque_pixels") or 0),
+        0 if source.origin == "still" else 1,
+        sighting["photo_index"],
+    )
+
+
+def _stage_primary(
+    ctx: _RunContext, record: dict, sources: list[PhotoSource], primary: dict
+) -> bool:
+    """Stage one item from the given primary sighting, in place.
+
+    Sets the record's primary / also-seen-in, recomputes its listing
+    from that primary (the photo plan when that plan was about this
+    item, else the item-crop path), draws in the run's stage mode,
+    records the receipt, and runs the independent verification.
+    Returns True only when the item ends staged; on a draw or
+    verify failure the record carries the failure instead. Costs of
+    every call made count into the record either way. Used for the
+    first staging and for a collision re-selection, so a re-staged
+    item is produced by exactly the same path as a staged one.
+    """
+    name = record["name"]
+    record["primary_photo_index"] = primary["photo_index"]
+    record["also_seen_in"] = [
+        s["photo_index"]
+        for s in record["sightings"]
+        if s["status"] == "ok" and s is not primary
+    ]
+
+    # Listing copy: the primary photo's plan when that plan was about
+    # this item; otherwise the item-crop path (identify run on a crop
+    # of this item's own primary sighting). Copy is never borrowed
+    # from another item (see the module docstring's honesty note).
+    plan = sources[primary["photo_index"]].plan
+    if plan_matches_item(plan, name):
+        record["listing"] = {
+            "title": plan.get("suggested_title"),
+            "bullets": plan.get("listing_bullets") or [],
+            "condition_notes": plan.get("condition_notes"),
+            "source": "photo_plan",
+            "note": None,
+            "crop_asset": None,
+            "plan_concept": plan.get("concept"),
+        }
+    else:
+        listing, crop_cost = _crop_listing(ctx, name, sources, primary)
+        record["listing"] = listing
+        record["cost_usd"] += crop_cost
+
+    record["stage_reached"] = "draw"
+    if ctx.stage_mode in backdrop.BACKDROP_STAGE_MODES:
+        draw_backdrop_fn = ctx.chain.get("draw_backdrop")
+        if draw_backdrop_fn is not None:
+            draw_result = draw_backdrop_fn(primary["foreground_asset"], ctx.stage_mode)
+        else:
+            try:
+                draw_result = draw_with_code_plate(
+                    ctx.store, primary["foreground_asset"], ctx.stage_mode
+                )
+            except Exception as exc:  # noqa: BLE001 — a draw failure is a record
+                draw_result = {
+                    "status": "error",
+                    "error": {
+                        "code": "DRAW_FAILED",
+                        "message": f"backdrop draw failed: {type(exc).__name__}: {exc}",
+                    },
+                }
+    else:
+        draw_result = ctx.chain["draw"](primary["foreground_asset"], ctx.scene)
+    record["cost_usd"] += _call_cost(draw_result)
+    if draw_result.get("status") != "ok":
+        error = draw_result.get("error") or {}
+        record["failure"] = {
+            "stage": "draw",
+            "code": error.get("code", "DRAW_FAILED"),
+            "message": error.get("message", "draw failed"),
+        }
+        return False
+
+    receipt = draw_result.get("fidelity_receipt") or {}
+    record["output_asset"] = draw_result.get("output_asset")
+    record["receipt"] = {
+        "source_asset": receipt.get("source_asset"),
+        "foreground_pixel_sha256": receipt.get("foreground_pixel_sha256"),
+        "opaque_pixels": receipt.get("opaque_pixels"),
+        "changed_opaque_pixels": receipt.get("changed_opaque_pixels"),
+        "color_profile_preserved": receipt.get("color_profile_preserved"),
+        "plate_kind": receipt.get("plate_kind"),
+        "backdrop": receipt.get("backdrop"),
+        "cost_usd": draw_result.get("cost_usd"),
+    }
+    receipt_path = ctx.store.receipt_path(record["output_asset"])
+    record["receipt_file"] = str(receipt_path) if receipt_path.exists() else None
+
+    # Verify loop (demo-ready Gauntlet fix #1): draw's receipt is
+    # draw grading its own work. The item counts as staged only when
+    # the independent verifier, re-reading the stored files, agrees.
+    record["stage_reached"] = "verify"
+    verification = _run_verification(ctx, record["output_asset"])
+    record["verification"] = verification
+    if verification["ok"]:
+        record["status"] = "staged"
+        record["stage_reached"] = "done"
+        record["failure"] = None
+        return True
+    record["status"] = "verify_failed"
+    problems = verification["problems"]
+    record["failure"] = {
+        "stage": "verify",
+        "code": "VERIFY_FAILED",
+        "message": (
+            "the staged output did not pass independent verification: "
+            + ("; ".join(problems) if problems else "verifier reported failure")
+        ),
+    }
+    return False
 
 
 def _process_item(
@@ -1322,106 +1513,10 @@ def _process_item(
         }
         return record
 
-    # Primary = the clearest view: most opaque product pixels; ties
-    # toward stills, then the earlier photo.
-    def _primary_key(s: dict) -> tuple:
-        source = sources[s["photo_index"]]
-        return (
-            -(s.get("opaque_pixels") or 0),
-            0 if source.origin == "still" else 1,
-            s["photo_index"],
-        )
-
-    primary = sorted(successes, key=_primary_key)[0]
-    record["primary_photo_index"] = primary["photo_index"]
-    record["also_seen_in"] = [
-        s["photo_index"] for s in successes if s is not primary
-    ]
-
-    # Listing copy: the primary photo's plan when that plan was about
-    # this item; otherwise the item-crop path (identify run on a crop
-    # of this item's own primary sighting). Copy is never borrowed
-    # from another item (see the module docstring's honesty note).
-    plan = sources[primary["photo_index"]].plan
-    if plan_matches_item(plan, name):
-        record["listing"] = {
-            "title": plan.get("suggested_title"),
-            "bullets": plan.get("listing_bullets") or [],
-            "condition_notes": plan.get("condition_notes"),
-            "source": "photo_plan",
-            "note": None,
-            "crop_asset": None,
-        }
-    else:
-        listing, crop_cost = _crop_listing(ctx, name, sources, primary)
-        record["listing"] = listing
-        record["cost_usd"] += crop_cost
-
-    record["stage_reached"] = "draw"
-    if ctx.stage_mode in backdrop.BACKDROP_STAGE_MODES:
-        draw_backdrop_fn = ctx.chain.get("draw_backdrop")
-        if draw_backdrop_fn is not None:
-            draw_result = draw_backdrop_fn(primary["foreground_asset"], ctx.stage_mode)
-        else:
-            try:
-                draw_result = draw_with_code_plate(
-                    ctx.store, primary["foreground_asset"], ctx.stage_mode
-                )
-            except Exception as exc:  # noqa: BLE001 — a draw failure is a record
-                draw_result = {
-                    "status": "error",
-                    "error": {
-                        "code": "DRAW_FAILED",
-                        "message": f"backdrop draw failed: {type(exc).__name__}: {exc}",
-                    },
-                }
-    else:
-        draw_result = ctx.chain["draw"](primary["foreground_asset"], ctx.scene)
-    record["cost_usd"] += _call_cost(draw_result)
-    if draw_result.get("status") != "ok":
-        error = draw_result.get("error") or {}
-        record["failure"] = {
-            "stage": "draw",
-            "code": error.get("code", "DRAW_FAILED"),
-            "message": error.get("message", "draw failed"),
-        }
-        return record
-
-    receipt = draw_result.get("fidelity_receipt") or {}
-    record["output_asset"] = draw_result.get("output_asset")
-    record["receipt"] = {
-        "source_asset": receipt.get("source_asset"),
-        "foreground_pixel_sha256": receipt.get("foreground_pixel_sha256"),
-        "opaque_pixels": receipt.get("opaque_pixels"),
-        "changed_opaque_pixels": receipt.get("changed_opaque_pixels"),
-        "color_profile_preserved": receipt.get("color_profile_preserved"),
-        "plate_kind": receipt.get("plate_kind"),
-        "backdrop": receipt.get("backdrop"),
-        "cost_usd": draw_result.get("cost_usd"),
-    }
-    receipt_path = ctx.store.receipt_path(record["output_asset"])
-    record["receipt_file"] = str(receipt_path) if receipt_path.exists() else None
-
-    # Verify loop (demo-ready Gauntlet fix #1): draw's receipt is
-    # draw grading its own work. The item counts as staged only when
-    # the independent verifier, re-reading the stored files, agrees.
-    record["stage_reached"] = "verify"
-    verification = _run_verification(ctx, record["output_asset"])
-    record["verification"] = verification
-    if verification["ok"]:
-        record["status"] = "staged"
-        record["stage_reached"] = "done"
-    else:
-        record["status"] = "verify_failed"
-        problems = verification["problems"]
-        record["failure"] = {
-            "stage": "verify",
-            "code": "VERIFY_FAILED",
-            "message": (
-                "the staged output did not pass independent verification: "
-                + ("; ".join(problems) if problems else "verifier reported failure")
-            ),
-        }
+    primary = sorted(
+        successes, key=lambda s: _sighting_primary_key(sources, s)
+    )[0]
+    _stage_primary(ctx, record, sources, primary)
     return record
 
 
@@ -1473,6 +1568,306 @@ def _flag_cross_item_duplicates(records: list[dict], sources: list[PhotoSource])
                         f"primary masks on photo {sight_a['photo_index']} "
                         f"overlap {other!r} with IoU {iou:.2f}; kept separate"
                     )
+
+
+# ---------------------------------------------------------------------------
+# Collision re-selection: two staged items, one physical object
+# ---------------------------------------------------------------------------
+
+
+def _mask_overlap_fraction(
+    store: AssetStore, handle_a: str | None, handle_b: str | None
+) -> float:
+    """Overlap of two stored foreground masks, as a fraction of the
+    smaller mask: |A and B| / min(|A|, |B|) over opaque (alpha > 0)
+    pixels, read from the stored foreground assets.
+
+    Masks are only ever compared for sightings on the same source
+    photo, where the foregrounds share the photo's dimensions. If
+    two assets nevertheless differ in size, both are padded with
+    transparent pixels to the common canvas (top-left aligned)
+    before counting. A missing or empty mask overlaps nothing.
+    """
+    if not handle_a or not handle_b:
+        return 0.0
+    try:
+        import numpy as np
+
+        mask_a = np.asarray(store.read_image(handle_a).getchannel("A")) > 0
+        mask_b = np.asarray(store.read_image(handle_b).getchannel("A")) > 0
+    except Exception:
+        return 0.0
+    if mask_a.shape != mask_b.shape:
+        height = max(mask_a.shape[0], mask_b.shape[0])
+        width = max(mask_a.shape[1], mask_b.shape[1])
+        padded_a = np.zeros((height, width), dtype=bool)
+        padded_a[: mask_a.shape[0], : mask_a.shape[1]] = mask_a
+        padded_b = np.zeros((height, width), dtype=bool)
+        padded_b[: mask_b.shape[0], : mask_b.shape[1]] = mask_b
+        mask_a, mask_b = padded_a, padded_b
+    smaller = min(int(np.count_nonzero(mask_a)), int(np.count_nonzero(mask_b)))
+    if smaller == 0:
+        return 0.0
+    return int(np.count_nonzero(mask_a & mask_b)) / smaller
+
+
+def _primary_sighting(record: dict) -> dict | None:
+    """The successful sighting a staged record is staged from."""
+    for sighting in record.get("sightings", []):
+        if (
+            sighting.get("status") == "ok"
+            and sighting.get("photo_index") == record.get("primary_photo_index")
+        ):
+            return sighting
+    return None
+
+
+def _listing_evidence_plan(record: dict, sources: list[PhotoSource]) -> dict | None:
+    """The plan a staged item's own listing evidence came from.
+
+    photo_plan listings carry the primary photo's identify plan;
+    item_crop listings carry the crop identify's plan, represented
+    by the concept that plan returned (stored on the listing as
+    plan_concept when the crop ran, with the listing title as the
+    fallback for records that predate the field). A "none" listing
+    is no evidence.
+    """
+    listing = record.get("listing") or {}
+    source_kind = listing.get("source")
+    if source_kind == "photo_plan":
+        primary_index = record.get("primary_photo_index")
+        if primary_index is None:
+            return None
+        return sources[primary_index].plan
+    if source_kind == "item_crop":
+        concept = listing.get("plan_concept") or listing.get("title")
+        if not concept:
+            return None
+        return {"concept": concept}
+    return None
+
+
+def _evidence_names_only(
+    record: dict, other_name: str, sources: list[PhotoSource]
+) -> bool:
+    """True when an item's listing evidence names it, and only it.
+
+    The match is the existing plan-match machinery applied to the
+    item's evidence plan: the evidence's concept must match the
+    item's own name and must not match the other item's name.
+    """
+    plan = _listing_evidence_plan(record, sources)
+    if plan is None:
+        return False
+    return plan_matches_item(plan, record["name"]) and not plan_matches_item(
+        plan, other_name
+    )
+
+
+_STAGED_RESULT_FIELDS = (
+    "primary_photo_index",
+    "also_seen_in",
+    "listing",
+    "output_asset",
+    "receipt",
+    "receipt_file",
+    "verification",
+    "status",
+    "stage_reached",
+    "failure",
+)
+
+
+def _restage_from_sighting(
+    ctx: _RunContext, record: dict, sources: list[PhotoSource], sighting: dict
+) -> bool:
+    """Re-stage a displaced item from an alternate sighting.
+
+    Runs the full staging path (draw in the run's stage mode,
+    receipt, independent verification, listing recomputed from the
+    new primary). On success the new staged result stands. On any
+    failure the original staged result is restored field for field,
+    except cost: the re-stage's calls were really spent, so their
+    cost stays counted into the item.
+    """
+    snapshot = {key: copy.deepcopy(record.get(key)) for key in _STAGED_RESULT_FIELDS}
+    cost_before = record["cost_usd"]
+    if _stage_primary(ctx, record, sources, sighting):
+        return True
+    attempt_cost = record["cost_usd"] - cost_before
+    for key, value in snapshot.items():
+        record[key] = value
+    record["cost_usd"] = cost_before + attempt_cost
+    return False
+
+
+def _collision_keeper(
+    ctx: _RunContext, rec_a: dict, rec_b: dict, sources: list[PhotoSource]
+) -> tuple[dict, dict, dict] | None:
+    """(keeper, displaced, keeper primary sighting) for one pair, or
+    None when the pair does not collide or the listing evidence
+    does not name exactly one keeper."""
+    sight_a, sight_b = _primary_sighting(rec_a), _primary_sighting(rec_b)
+    if sight_a is None or sight_b is None:
+        return None
+    if sight_a["photo_index"] != sight_b["photo_index"]:
+        return None
+    overlap = _mask_overlap_fraction(
+        ctx.store, sight_a.get("foreground_asset"), sight_b.get("foreground_asset")
+    )
+    if overlap < MASK_OVERLAP_COLLISION:
+        return None
+    a_only = _evidence_names_only(rec_a, rec_b["name"], sources)
+    b_only = _evidence_names_only(rec_b, rec_a["name"], sources)
+    if a_only and not b_only:
+        return rec_a, rec_b, sight_a
+    if b_only and not a_only:
+        return rec_b, rec_a, sight_b
+    return None
+
+
+def _find_alternate_sighting(
+    ctx: _RunContext,
+    displaced: dict,
+    keeper_sighting: dict,
+    sources: list[PhotoSource],
+) -> dict | None:
+    """The displaced item's largest successful sighting that does
+    not collide with the keeper's primary, in primary-selection
+    order; None when every successful sighting collides."""
+    successes = [
+        s
+        for s in displaced["sightings"]
+        if s["status"] == "ok" and s.get("foreground_asset")
+    ]
+    successes.sort(key=lambda s: _sighting_primary_key(sources, s))
+    for sighting in successes:
+        if sighting["photo_index"] != keeper_sighting["photo_index"]:
+            return sighting  # different photo: cannot be the same instance
+        overlap = _mask_overlap_fraction(
+            ctx.store,
+            sighting.get("foreground_asset"),
+            keeper_sighting.get("foreground_asset"),
+        )
+        if overlap < MASK_OVERLAP_COLLISION:
+            return sighting
+    return None
+
+
+def _resolve_primary_collisions(
+    ctx: _RunContext,
+    records: list[dict],
+    sources: list[PhotoSource],
+    *,
+    budget_ok=None,
+) -> list[str]:
+    """One re-selection pass over staged primaries that collide.
+
+    A collision is a pair of staged items whose primaries come from
+    the same source photo and whose foreground masks overlap at
+    least MASK_OVERLAP_COLLISION of the smaller mask. The keeper is
+    the item whose own listing evidence names it and not the other
+    item; with exactly one keeper the other item is displaced to
+    its largest successful sighting whose mask does not collide
+    with the keeper's primary on that sighting's own photo (a
+    sighting on a different photo than the keeper's primary cannot
+    be the same object instance, so it never collides here). The
+    pass runs once: an item already re-selected is not examined
+    again, and a re-selected primary that collides with a third
+    item is flagged, not iterated. Returns manifest notes.
+    """
+    notes: list[str] = []
+    reselected: set[str] = set()
+    staged = [r for r in records if r["status"] == "staged"]
+    for i, rec_a in enumerate(staged):
+        for rec_b in staged[i + 1 :]:
+            if rec_a["name"] in reselected or rec_b["name"] in reselected:
+                continue
+            if rec_a["status"] != "staged" or rec_b["status"] != "staged":
+                continue
+            collision = _collision_keeper(ctx, rec_a, rec_b, sources)
+            if collision is None:
+                continue  # no collision, or no unique keeper: flags stand
+            keeper, displaced, keeper_sighting = collision
+            alternate = _find_alternate_sighting(
+                ctx, displaced, keeper_sighting, sources
+            )
+            if alternate is None:
+                continue  # no clean alternate: the duplicate flag stands
+            if budget_ok is not None and not budget_ok(alternate["photo_index"]):
+                displaced["flags"].append(
+                    "primary re-selection after duplicate collision with "
+                    f"{keeper['name']!r} was skipped: the re-stage would "
+                    "exceed the run budget; the duplicate flag stands"
+                )
+                notes.append(
+                    f"primary re-selection for {displaced['name']!r} after "
+                    f"duplicate collision with {keeper['name']!r} was "
+                    "skipped: the re-stage would exceed the run budget"
+                )
+                continue
+            if not _restage_from_sighting(ctx, displaced, sources, alternate):
+                displaced["flags"].append(
+                    "primary re-selection after duplicate collision with "
+                    f"{keeper['name']!r} failed; the original primary "
+                    "and the duplicate flag stand"
+                )
+                notes.append(
+                    f"primary re-selection for {displaced['name']!r} after "
+                    f"duplicate collision with {keeper['name']!r} failed; "
+                    "the original staged result stands"
+                )
+                continue
+            reselected.add(displaced["name"])
+            if keeper["name"] in displaced["possible_duplicate_of"]:
+                displaced["possible_duplicate_of"].remove(keeper["name"])
+            displaced["flags"].append("primary_reselected_after_duplicate_collision")
+            displaced["flags"].append(
+                f"primary re-selected from photo {alternate['photo_index']} "
+                f"after duplicate collision with {keeper['name']!r} "
+                f"on photo {keeper_sighting['photo_index']}"
+            )
+            notes.append(
+                f"primary re-selected for {displaced['name']!r} after "
+                f"duplicate collision with {keeper['name']!r}: re-staged "
+                f"from photo {alternate['photo_index']}"
+            )
+            # No second pass: a fresh primary that collides with a
+            # third item is flagged on the displaced item only.
+            _flag_third_collisions(ctx, displaced, keeper, alternate, staged)
+    return notes
+
+
+def _flag_third_collisions(
+    ctx: _RunContext,
+    displaced: dict,
+    keeper: dict,
+    alternate: dict,
+    staged: list[dict],
+) -> None:
+    """Flag a re-selected primary that also collides with a third
+    staged item. The pass does not iterate: the flag is the outcome."""
+    for other in staged:
+        if other is displaced or other is keeper or other["status"] != "staged":
+            continue
+        other_sighting = _primary_sighting(other)
+        if other_sighting is None:
+            continue
+        if other_sighting["photo_index"] != alternate["photo_index"]:
+            continue
+        overlap = _mask_overlap_fraction(
+            ctx.store,
+            alternate.get("foreground_asset"),
+            other_sighting.get("foreground_asset"),
+        )
+        if overlap < MASK_OVERLAP_COLLISION:
+            continue
+        if other["name"] not in displaced["possible_duplicate_of"]:
+            displaced["possible_duplicate_of"].append(other["name"])
+        displaced["flags"].append(
+            f"re-selected primary on photo {alternate['photo_index']} "
+            f"also overlaps {other['name']!r}; flagged, not re-selected again"
+        )
 
 
 def run_room(
@@ -1846,13 +2241,16 @@ def _run_room_body(
     if narration_records and not auto and not item_names:
         mode = "narrated"
 
-    # Cap candidate probing per item (rank order preserved). The cap
-    # is also the spend bound the projection gate priced.
+    # Cap candidate probing per item. The cap is also the spend
+    # bound the projection gate priced, but it can never drop a
+    # still: every still is always a candidate, and video frames
+    # fill the cap's remaining slots in rank order (probe order
+    # inside the selected set stays the rank order).
     candidate_cap = min(max_photos_per_item, MAX_PHOTOS_PER_ITEM)
     for item in items:
-        item["candidate_photo_indices"] = item["candidate_photo_indices"][
-            :candidate_cap
-        ]
+        item["candidate_photo_indices"] = _select_candidate_indices(
+            item["name"], item["candidate_photo_indices"], sources, candidate_cap
+        )
 
     ctx = _RunContext(
         store=store,
@@ -1905,6 +2303,30 @@ def _run_room_body(
         )
 
     _flag_cross_item_duplicates(records, sources)
+
+    # Collision re-selection post-pass, alongside the de-dup flags:
+    # a displaced item may re-stage from a clean alternate sighting.
+    # Its spend is real run spend (the manifest total below is read
+    # after this pass), and a re-stage is only attempted when the
+    # projected cost of one draw plus one crop identify, priced the
+    # same way the up-front projection gate prices them, keeps the
+    # run within its budget.
+    def _restage_budget_ok(photo_index: int) -> bool:
+        source = sources[photo_index]
+        projected = meta_client.project_identify_cost_usd(
+            server.IDENTIFY_MODEL, source.width, source.height
+        ) * meta_client.IDENTIFY_MAX_ATTEMPTS
+        if stage_mode not in backdrop.BACKDROP_STAGE_MODES:
+            projected += meta_client.project_draw_cost_usd(
+                server.DRAW_BACKGROUND_MODEL
+            )
+        return spend_probe() - spend_before + projected <= budget_usd
+
+    notes.extend(
+        _resolve_primary_collisions(
+            ctx, records, sources, budget_ok=_restage_budget_ok
+        )
+    )
 
     # Pricing is a pure post-pass over the finished records: every
     # item gains its pricing record, comps or no comps.
