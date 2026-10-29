@@ -56,17 +56,27 @@ Pipeline:
    candidates and flags them possible duplicates. Across items, two
    listings whose primary foregrounds are pixel-identical, or whose
    primary masks on the same photo almost perfectly overlap, are
-   flagged as possible duplicates of each other. NOTHING is ever
-   silently merged away: a flag keeps both listings and says why.
+   flagged as possible duplicates of each other. The cross-item
+   check runs at sighting level: any two successful sightings of
+   two staged items, on the same photo, whose masks overlap at
+   least 95% of the smaller mask also link the items as possible
+   duplicates, primaries or not. NOTHING is ever silently merged
+   away: a flag keeps both listings and says why.
    One collision shape gets a repair attempt on top of the flag:
-   when two staged primaries sit on the same photo with masks
-   overlapping at least 95% of the smaller mask, and exactly one
-   item's own listing evidence names that item and not the other,
-   the other item is displaced — it re-stages from its largest
-   non-colliding successful sighting, when it has one, under a
-   fresh receipt and verification. Ambiguous evidence, no clean
-   alternate sighting, a failed re-stage, or a re-stage the run
-   budget cannot cover all leave the flag standing instead.
+   when a colliding sighting pair involves at least one item's
+   primary, the object is contested; when exactly one item's own
+   listing evidence names that item and not the other, the keeper
+   keeps the object and the other item is displaced, but only when
+   its own primary is one of the colliding sightings — it
+   re-stages from its largest successful sighting that does not
+   collide with any of the keeper's sightings, when it has one,
+   under a fresh receipt and verification. A keeper whose primary
+   is not the contested object is never moved. Ambiguous evidence,
+   no clean alternate sighting, a failed re-stage, or a re-stage
+   the run budget cannot cover all leave the original staged
+   result standing. Duplicate flags are never removed by a
+   re-selection: they describe the probing ambiguity, and the
+   re-selection flag and run note record the resolution.
 5. Stage. In the default "scene" stage mode, draw runs the primary
    foreground with ONE shared scene prompt for the whole room (the
    room's plate style), so the set of listings reads as one room's
@@ -1520,12 +1530,19 @@ def _process_item(
     return record
 
 
-def _flag_cross_item_duplicates(records: list[dict], sources: list[PhotoSource]) -> None:
+def _flag_cross_item_duplicates(
+    records: list[dict], sources: list[PhotoSource], store: AssetStore | None = None
+) -> None:
     """Flag (never merge) items that look like the same physical object.
 
-    Evidence: identical primary-foreground pixel hashes, or primary
+    Evidence: identical primary-foreground pixel hashes, primary
     masks on the SAME photo whose normalized bboxes almost perfectly
-    overlap (two names segmenting one object).
+    overlap (two names segmenting one object), or — at sighting
+    level — any pair of successful sightings of the two items on
+    the same photo whose foreground masks overlap at least
+    MASK_OVERLAP_COLLISION of the smaller mask. The sighting-level
+    evidence needs the store to read the masks from; without one it
+    is skipped and the primary-level evidence still applies.
     """
     staged = [r for r in records if r["status"] == "staged"]
     by_hash: dict[str, list[dict]] = {}
@@ -1568,6 +1585,40 @@ def _flag_cross_item_duplicates(records: list[dict], sources: list[PhotoSource])
                         f"primary masks on photo {sight_a['photo_index']} "
                         f"overlap {other!r} with IoU {iou:.2f}; kept separate"
                     )
+    if store is not None:
+        _flag_sighting_level_duplicates(staged, store)
+
+
+def _flag_sighting_level_duplicates(staged: list[dict], store: AssetStore) -> None:
+    """Mutual possible-duplicate flags from sighting-level collisions.
+
+    Any colliding sighting pair (see _colliding_sighting_pairs)
+    between two staged items links them in both directions, whether
+    or not either sighting is a primary.
+    """
+    for i, rec_a in enumerate(staged):
+        for rec_b in staged[i + 1 :]:
+            for sight_a, sight_b, overlap in _colliding_sighting_pairs(
+                store, rec_a, rec_b
+            ):
+                photo_index = sight_a["photo_index"]
+                for rec, sight, other in (
+                    (rec_a, sight_a, rec_b["name"]),
+                    (rec_b, sight_b, rec_a["name"]),
+                ):
+                    if other not in rec["possible_duplicate_of"]:
+                        rec["possible_duplicate_of"].append(other)
+                    kind = (
+                        "primary sighting"
+                        if sight["photo_index"] == rec["primary_photo_index"]
+                        else "sighting"
+                    )
+                    rec["flags"].append(
+                        f"{kind} on photo {photo_index} overlaps a "
+                        f"sighting of {other!r} on the same photo with "
+                        f"mask overlap {overlap:.2f} of the smaller "
+                        "mask; kept separate"
+                    )
 
 
 # ---------------------------------------------------------------------------
@@ -1609,6 +1660,47 @@ def _mask_overlap_fraction(
     if smaller == 0:
         return 0.0
     return int(np.count_nonzero(mask_a & mask_b)) / smaller
+
+
+def _successful_sightings(record: dict) -> list[dict]:
+    """A record's successful sightings that carry a foreground."""
+    return [
+        s
+        for s in record.get("sightings", [])
+        if s.get("status") == "ok" and s.get("foreground_asset")
+    ]
+
+
+def _sightings_by_photo(record: dict) -> dict[int, list[dict]]:
+    """A record's successful sightings grouped by photo index."""
+    by_photo: dict[int, list[dict]] = {}
+    for sighting in _successful_sightings(record):
+        by_photo.setdefault(sighting["photo_index"], []).append(sighting)
+    return by_photo
+
+
+def _colliding_sighting_pairs(
+    store: AssetStore, rec_a: dict, rec_b: dict
+) -> list[tuple[dict, dict, float]]:
+    """Sighting pairs of two items that are the same object instance.
+
+    Every pair of successful sightings, one from each record, on
+    the same photo whose foreground masks overlap at least
+    MASK_OVERLAP_COLLISION of the smaller mask. Returns
+    (sighting_a, sighting_b, overlap) triples, in photo order.
+    """
+    by_photo_b = _sightings_by_photo(rec_b)
+    pairs: list[tuple[dict, dict, float]] = []
+    for sight_a in _successful_sightings(rec_a):
+        for sight_b in by_photo_b.get(sight_a["photo_index"], []):
+            overlap = _mask_overlap_fraction(
+                store,
+                sight_a.get("foreground_asset"),
+                sight_b.get("foreground_asset"),
+            )
+            if overlap >= MASK_OVERLAP_COLLISION:
+                pairs.append((sight_a, sight_b, overlap))
+    return pairs
 
 
 def _primary_sighting(record: dict) -> dict | None:
@@ -1701,55 +1793,76 @@ def _restage_from_sighting(
     return False
 
 
-def _collision_keeper(
+def _collision_contest(
     ctx: _RunContext, rec_a: dict, rec_b: dict, sources: list[PhotoSource]
-) -> tuple[dict, dict, dict] | None:
-    """(keeper, displaced, keeper primary sighting) for one pair, or
-    None when the pair does not collide or the listing evidence
-    does not name exactly one keeper."""
-    sight_a, sight_b = _primary_sighting(rec_a), _primary_sighting(rec_b)
-    if sight_a is None or sight_b is None:
+) -> tuple[dict, dict, int] | None:
+    """(keeper, displaced, contested photo index) for one pair, or
+    None when the pair is not a displacement contest.
+
+    A contest exists when some colliding sighting pair (see
+    _colliding_sighting_pairs) involves at least one item's
+    primary: the colliding object is then claimed by a staged
+    listing. The keeper is the item whose own listing evidence
+    names it and not the other item, when exactly one item
+    qualifies. The displaced item is the other one, and only when
+    its own primary is one of the colliding sightings: a keeper
+    whose primary is the contested object does not displace an
+    item whose primary sits elsewhere, and a keeper whose own
+    primary is not the contested object is never moved.
+    """
+    primary_a, primary_b = _primary_sighting(rec_a), _primary_sighting(rec_b)
+    if primary_a is None or primary_b is None:
         return None
-    if sight_a["photo_index"] != sight_b["photo_index"]:
+    pairs = _colliding_sighting_pairs(ctx.store, rec_a, rec_b)
+    if not pairs:
         return None
-    overlap = _mask_overlap_fraction(
-        ctx.store, sight_a.get("foreground_asset"), sight_b.get("foreground_asset")
+    a_contested = any(
+        sight_a["photo_index"] == primary_a["photo_index"] for sight_a, _, _ in pairs
     )
-    if overlap < MASK_OVERLAP_COLLISION:
-        return None
+    b_contested = any(
+        sight_b["photo_index"] == primary_b["photo_index"] for _, sight_b, _ in pairs
+    )
+    if not a_contested and not b_contested:
+        return None  # colliding sightings, but neither primary claims the object
     a_only = _evidence_names_only(rec_a, rec_b["name"], sources)
     b_only = _evidence_names_only(rec_b, rec_a["name"], sources)
     if a_only and not b_only:
-        return rec_a, rec_b, sight_a
-    if b_only and not a_only:
-        return rec_b, rec_a, sight_b
-    return None
+        keeper, displaced, displaced_contested = rec_a, rec_b, b_contested
+    elif b_only and not a_only:
+        keeper, displaced, displaced_contested = rec_b, rec_a, a_contested
+    else:
+        return None  # no unique keeper: flags stand
+    if not displaced_contested:
+        return None
+    return keeper, displaced, displaced["primary_photo_index"]
 
 
 def _find_alternate_sighting(
     ctx: _RunContext,
     displaced: dict,
-    keeper_sighting: dict,
+    keeper: dict,
     sources: list[PhotoSource],
 ) -> dict | None:
     """The displaced item's largest successful sighting that does
-    not collide with the keeper's primary, in primary-selection
-    order; None when every successful sighting collides."""
-    successes = [
-        s
-        for s in displaced["sightings"]
-        if s["status"] == "ok" and s.get("foreground_asset")
-    ]
+    not collide with ANY of the keeper's successful sightings, in
+    primary-selection order; None when every successful sighting
+    collides. A candidate on a photo where the keeper has no
+    successful sighting cannot be the contested instance and
+    qualifies on that ground alone."""
+    keeper_by_photo = _sightings_by_photo(keeper)
+    successes = _successful_sightings(displaced)
     successes.sort(key=lambda s: _sighting_primary_key(sources, s))
     for sighting in successes:
-        if sighting["photo_index"] != keeper_sighting["photo_index"]:
-            return sighting  # different photo: cannot be the same instance
-        overlap = _mask_overlap_fraction(
-            ctx.store,
-            sighting.get("foreground_asset"),
-            keeper_sighting.get("foreground_asset"),
+        collides = any(
+            _mask_overlap_fraction(
+                ctx.store,
+                sighting.get("foreground_asset"),
+                keeper_sighting.get("foreground_asset"),
+            )
+            >= MASK_OVERLAP_COLLISION
+            for keeper_sighting in keeper_by_photo.get(sighting["photo_index"], [])
         )
-        if overlap < MASK_OVERLAP_COLLISION:
+        if not collides:
             return sighting
     return None
 
@@ -1761,20 +1874,19 @@ def _resolve_primary_collisions(
     *,
     budget_ok=None,
 ) -> list[str]:
-    """One re-selection pass over staged primaries that collide.
+    """One re-selection pass over staged items in collision contests.
 
-    A collision is a pair of staged items whose primaries come from
-    the same source photo and whose foreground masks overlap at
-    least MASK_OVERLAP_COLLISION of the smaller mask. The keeper is
-    the item whose own listing evidence names it and not the other
-    item; with exactly one keeper the other item is displaced to
-    its largest successful sighting whose mask does not collide
-    with the keeper's primary on that sighting's own photo (a
-    sighting on a different photo than the keeper's primary cannot
-    be the same object instance, so it never collides here). The
-    pass runs once: an item already re-selected is not examined
-    again, and a re-selected primary that collides with a third
-    item is flagged, not iterated. Returns manifest notes.
+    Contests are detected at sighting level (see _collision_contest):
+    a colliding sighting pair that involves a primary, with exactly
+    one evidence keeper, displaces the item whose primary is
+    contested and is not the keeper. The displaced item re-stages
+    from its largest successful sighting that does not collide with
+    any of the keeper's successful sightings (see
+    _find_alternate_sighting). The pass runs once: an item already
+    re-selected is not examined again, and a re-selected primary
+    that collides with a third item is flagged, not iterated.
+    Duplicate flags are never removed by a re-selection. Returns
+    manifest notes.
     """
     notes: list[str] = []
     reselected: set[str] = set()
@@ -1785,13 +1897,11 @@ def _resolve_primary_collisions(
                 continue
             if rec_a["status"] != "staged" or rec_b["status"] != "staged":
                 continue
-            collision = _collision_keeper(ctx, rec_a, rec_b, sources)
-            if collision is None:
-                continue  # no collision, or no unique keeper: flags stand
-            keeper, displaced, keeper_sighting = collision
-            alternate = _find_alternate_sighting(
-                ctx, displaced, keeper_sighting, sources
-            )
+            contest = _collision_contest(ctx, rec_a, rec_b, sources)
+            if contest is None:
+                continue  # no contest, or no unique keeper: flags stand
+            keeper, displaced, contested_photo = contest
+            alternate = _find_alternate_sighting(ctx, displaced, keeper, sources)
             if alternate is None:
                 continue  # no clean alternate: the duplicate flag stands
             if budget_ok is not None and not budget_ok(alternate["photo_index"]):
@@ -1819,13 +1929,11 @@ def _resolve_primary_collisions(
                 )
                 continue
             reselected.add(displaced["name"])
-            if keeper["name"] in displaced["possible_duplicate_of"]:
-                displaced["possible_duplicate_of"].remove(keeper["name"])
             displaced["flags"].append("primary_reselected_after_duplicate_collision")
             displaced["flags"].append(
                 f"primary re-selected from photo {alternate['photo_index']} "
                 f"after duplicate collision with {keeper['name']!r} "
-                f"on photo {keeper_sighting['photo_index']}"
+                f"on photo {contested_photo}"
             )
             notes.append(
                 f"primary re-selected for {displaced['name']!r} after "
@@ -1845,22 +1953,27 @@ def _flag_third_collisions(
     alternate: dict,
     staged: list[dict],
 ) -> None:
-    """Flag a re-selected primary that also collides with a third
-    staged item. The pass does not iterate: the flag is the outcome."""
+    """Flag a re-selected primary that also collides with any
+    successful sighting of a third staged item, on the alternate's
+    photo. The pass does not iterate: the flag is the outcome."""
     for other in staged:
         if other is displaced or other is keeper or other["status"] != "staged":
             continue
-        other_sighting = _primary_sighting(other)
-        if other_sighting is None:
-            continue
-        if other_sighting["photo_index"] != alternate["photo_index"]:
-            continue
-        overlap = _mask_overlap_fraction(
-            ctx.store,
-            alternate.get("foreground_asset"),
-            other_sighting.get("foreground_asset"),
+        other_sightings = [
+            s
+            for s in _successful_sightings(other)
+            if s["photo_index"] == alternate["photo_index"]
+        ]
+        collides = any(
+            _mask_overlap_fraction(
+                ctx.store,
+                alternate.get("foreground_asset"),
+                other_sighting.get("foreground_asset"),
+            )
+            >= MASK_OVERLAP_COLLISION
+            for other_sighting in other_sightings
         )
-        if overlap < MASK_OVERLAP_COLLISION:
+        if not collides:
             continue
         if other["name"] not in displaced["possible_duplicate_of"]:
             displaced["possible_duplicate_of"].append(other["name"])
@@ -2302,7 +2415,7 @@ def _run_room_body(
             _process_item(ctx, item, sources, probe_all=probe_all_candidates)
         )
 
-    _flag_cross_item_duplicates(records, sources)
+    _flag_cross_item_duplicates(records, sources, store=store)
 
     # Collision re-selection post-pass, alongside the de-dup flags:
     # a displaced item may re-stage from a clean alternate sighting.

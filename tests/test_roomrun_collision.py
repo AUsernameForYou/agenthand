@@ -66,11 +66,13 @@ OBJECT_RECTS = {
     "straw_shared": (4, 4, 24, 20),   # 320 opaque px
     "straw_other": (28, 20, 40, 32),  # 144 opaque px, disjoint
     "fedora": (30, 4, 46, 20),        # 256 opaque px, disjoint from straw_shared
+    "straw_big": (2, 2, 34, 26),      # 768 opaque px; overlaps the fedora by 64 px
 }
 OBJECT_COLORS = {
     "straw_shared": (220, 180, 60, 255),
     "straw_other": (210, 170, 50, 255),
     "fedora": (20, 20, 20, 255),
+    "straw_big": (225, 185, 70, 255),
 }
 
 
@@ -325,7 +327,10 @@ def test_collision_displaced_item_restages_from_the_still(tmp_path, monkeypatch)
     assert black["receipt"]["opaque_pixels"] == 256  # the fedora, not the straw hat
     assert "primary_reselected_after_duplicate_collision" in black["flags"]
     assert any("straw hat" in f for f in black["flags"])
-    assert "straw hat" not in black["possible_duplicate_of"]
+    # Duplicate flags describe the probing ambiguity and persist
+    # after a successful re-selection (cycle 2 unified rule).
+    assert "straw hat" in black["possible_duplicate_of"]
+    assert "black hat" in straw["possible_duplicate_of"]
     assert any(
         "black hat" in n and "straw hat" in n for n in manifest["notes"]
     )
@@ -441,3 +446,108 @@ def test_mask_overlap_fraction_from_stored_foregrounds(tmp_path):
     assert roomrun._mask_overlap_fraction(store, shared, disjoint) == pytest.approx(0.0)
     subset = fg((4, 4, 14, 20))  # inside straw_shared
     assert roomrun._mask_overlap_fraction(store, shared, subset) == pytest.approx(1.0)
+def _hat_room_round2(tmp_path, monkeypatch, *, crop_plans=None, spend_probe=None):
+    """Round-2 acceptance shape in miniature.
+
+    Photo 0 is the still: it holds straw hat's primary (straw_big)
+    and black hat's fedora. Photo 2 is a frame where BOTH items cut
+    the same straw object (straw_shared): that sighting is black
+    hat's primary (320 px beats the fedora's 256) but only a
+    non-primary sighting of the straw hat, whose primary sits on
+    photo 0. No same-photo primary pair ever collides.
+    """
+    store = AssetStore(tmp_path)
+    still = _photo(tmp_path, "still.jpg")
+    frames = [
+        _photo(tmp_path, "frame1.jpg", (200, 90, 10)),
+        _photo(tmp_path, "frame2.jpg", (210, 95, 12)),
+        _photo(tmp_path, "frame3.jpg", (100, 100, 100)),
+    ]
+    _with_frames(monkeypatch, frames)
+    contents = {
+        (0, "straw hat"): "straw_big",
+        (1, "straw hat"): "straw_other",
+        (2, "straw hat"): "straw_shared",
+        (0, "black hat"): "fedora",
+        (1, "hat"): "straw_other",
+        (2, "hat"): "straw_shared",
+    }
+    fake = CollisionChain(
+        store,
+        plans=[
+            _plan("straw hat"),
+            _plan("straw hat"),
+            _plan("straw hat"),
+            _plan("gray storage box"),
+        ],
+        contents=contents,
+        crop_plans=crop_plans
+        if crop_plans is not None
+        else [
+            _plan("straw hat", title="Straw Sun Hat"),
+            _plan("black hat", title="Black Fedora Hat"),
+        ],
+    )
+    run_kwargs = {}
+    if spend_probe is not None:
+        run_kwargs["spend_probe"] = spend_probe(fake)
+    manifest = _run(
+        tmp_path,
+        [still],
+        fake,
+        videos=[tmp_path / "walk.mp4"],
+        item_names=["straw hat", "black hat"],
+        **run_kwargs,
+    )
+    return manifest, fake
+
+
+def test_sighting_level_collision_restages_displaced_from_its_still(tmp_path, monkeypatch):
+    manifest, fake = _hat_room_round2(tmp_path, monkeypatch)
+    items = {i["name"]: i for i in manifest["items"]}
+    straw, black = items["straw hat"], items["black hat"]
+
+    # The collision is visible only through straw's non-primary
+    # sighting on photo 2; the primaries sit on different photos.
+    assert straw["primary_photo_index"] == 0
+    assert black["status"] == "staged"
+    assert black["primary_photo_index"] == 0  # re-staged from the still (fedora)
+    assert black["also_seen_in"] == [1, 2]
+    assert black["verification"]["ok"] is True
+    assert black["receipt"]["opaque_pixels"] == 256  # the fedora
+    assert "primary_reselected_after_duplicate_collision" in black["flags"]
+    assert any("straw hat" in n and "black hat" in n for n in manifest["notes"])
+    # Listing recomputed from the new primary.
+    assert black["listing"]["source"] == "item_crop"
+    assert black["listing"]["title"] == "Black Fedora Hat"
+    # Sighting-level duplicate flags are mutual and persist after
+    # the successful re-selection.
+    assert "straw hat" in black["possible_duplicate_of"]
+    assert "black hat" in straw["possible_duplicate_of"]
+
+
+def test_keeper_whose_primary_is_elsewhere_is_not_moved(tmp_path, monkeypatch):
+    manifest, fake = _hat_room_round2(tmp_path, monkeypatch)
+    items = {i["name"]: i for i in manifest["items"]}
+    straw = items["straw hat"]
+    assert straw["status"] == "staged"
+    assert straw["primary_photo_index"] == 0
+    assert straw["listing"]["source"] == "photo_plan"
+    assert straw["receipt"]["opaque_pixels"] == 768  # straw_big, untouched
+    assert "primary_reselected_after_duplicate_collision" not in straw["flags"]
+    assert fake.draw_calls == 3  # straw once, black twice (stage + re-stage)
+
+
+def test_sighting_level_collision_with_ambiguous_evidence_flags_only(tmp_path, monkeypatch):
+    # Black hat's crop evidence names the black hat itself, so both
+    # items qualify as keeper and nobody is displaced.
+    crop_plans = [_plan("black hat", title="Black Fedora Hat")]
+    manifest, fake = _hat_room_round2(tmp_path, monkeypatch, crop_plans=crop_plans)
+    items = {i["name"]: i for i in manifest["items"]}
+    black = items["black hat"]
+    assert black["status"] == "staged"
+    assert black["primary_photo_index"] == 2  # original primary kept
+    assert "straw hat" in black["possible_duplicate_of"]
+    assert "black hat" in items["straw hat"]["possible_duplicate_of"]
+    assert "primary_reselected_after_duplicate_collision" not in black["flags"]
+    assert fake.draw_calls == 2
