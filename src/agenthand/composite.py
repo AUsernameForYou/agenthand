@@ -257,12 +257,23 @@ def draw_product(
     scene_prompt: str,
     *,
     plate_handle: str | None = None,
+    plate_kind: str | None = None,
+    backdrop: dict | None = None,
 ) -> tuple[str, dict]:
     """Composite a stored foreground into a scene; returns (handle, receipt).
 
     Enforces the Fidelity Lock before any pixels move: the asset must be
     a foreground_png, its lineage must end at a source_photo, and the
     stored bytes must match their recorded hashes.
+
+    The receipt records where the plate came from. ``plate_kind`` is
+    "code_rendered" for a plate rendered in code and stored as an
+    asset (its ``backdrop`` description rides along), "model_generated"
+    for a plate asset supplied by the model draw flow, and
+    "local_placeholder" for the deterministic placeholder used when no
+    plate asset is given. When ``plate_kind`` is omitted it is inferred
+    from the plate's presence: a supplied plate asset defaults to
+    "model_generated", no plate asset means "local_placeholder".
     """
     chain = validate_foreground(store, foreground_handle)
     record = chain[0]
@@ -300,6 +311,8 @@ def draw_product(
         plate_asset = plate_handle
         plate_sha256 = plate_record.sha256
         plate_pixel_sha256 = plate_record.pixel_sha256
+        if plate_kind is None:
+            plate_kind = "model_generated"
     else:
         plate = generate_background_plate(
             scene_prompt, foreground.width, foreground.height
@@ -308,6 +321,8 @@ def draw_product(
         plate_asset = None
         plate_sha256 = None
         plate_pixel_sha256 = None
+        if plate_kind is None:
+            plate_kind = "local_placeholder"
 
     composite, _in_memory_counts, transformations = composite_images(foreground, plate)
     if _in_memory_counts["opaque_pixels"] == 0:
@@ -392,6 +407,8 @@ def draw_product(
         "plate_asset": plate_asset,
         "plate_sha256": plate_sha256,
         "plate_pixel_sha256": plate_pixel_sha256,
+        "plate_kind": plate_kind,
+        "backdrop": backdrop,
         "claim": (
             "The stored extracted foreground reached the composite "
             "unchanged: every fully opaque foreground pixel in the "

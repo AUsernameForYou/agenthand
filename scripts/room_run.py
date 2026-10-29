@@ -10,6 +10,10 @@ Stages every named item found in the room's photos through the
 shipped chain (identify -> cut_out -> draw), one Fidelity Lock
 receipt per item, each item then re-verified independently from the
 stored files, and writes manifest.json + summary.txt to --out.
+--stage-mode wallpaper|studio_gray stages on code-rendered plates
+instead of a generated scene; --comps FILE prices every item from
+agent-supplied Marketplace comps and adds the priced table
+(priced-table.png, priced-table.html, pricing-notes.md) to --out.
 Items can also be named by the seller's voice: --narrated-video /
 --narrated-audio transcribe the walkthrough narration with one
 Baseten Muse Spark Open call (Baseten partner pool, accounted in

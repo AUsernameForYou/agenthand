@@ -55,11 +55,16 @@ Pipeline:
    primary masks on the same photo almost perfectly overlap, are
    flagged as possible duplicates of each other. NOTHING is ever
    silently merged away: a flag keeps both listings and says why.
-5. Stage. draw runs the primary foreground with ONE shared scene
-   prompt for the whole room (the room's plate style), so the set of
-   listings reads as one room's worth of staging. The per-item
-   fidelity receipt is the draw tool's own, persisted beside the
-   composite in the store and linked from the manifest.
+5. Stage. In the default "scene" stage mode, draw runs the primary
+   foreground with ONE shared scene prompt for the whole room (the
+   room's plate style), so the set of listings reads as one room's
+   worth of staging. In the "wallpaper" and "studio_gray" stage
+   modes the plate is rendered in code at the foreground's frame
+   size (no model call, no spend), stored as a plate asset, and
+   drawn through the same compositor, so the receipt pins the
+   plate's hashes and names it code-rendered. The per-item fidelity
+   receipt is the draw tool's own, persisted beside the composite
+   in the store and linked from the manifest.
 6. Verify. A staged item is not believed on draw's say-so: the
    repo's independent verifier (composite.verify_receipt_from_disk)
    re-reads the item's stored source, foreground, and composite
@@ -82,12 +87,17 @@ Pipeline:
 Honesty notes (v1 limits, stated rather than smoothed over):
 
 - identify plans ONE primary subject per photo. In a crowded room
-  photo its listing copy describes that subject, so per-item listing
-  copy is attached ONLY when the photo plan's concept matches the
-  item; otherwise the manifest says copy was not generated for the
-  item instead of dressing it in another item's words. Auto-enumerate
-  likewise surfaces one candidate per viewpoint; several viewpoints
-  of one room are what surface several items.
+  photo its listing copy describes that subject, so whole-photo
+  listing copy is attached ONLY when the photo plan's concept
+  matches the item. When it does not, the item-crop path runs
+  instead: the primary source photo is cropped to the item's own
+  foreground box (10% margin, clamped), the crop is stored as an
+  asset, and identify runs on the crop. Only a successful crop
+  identify attaches copy (source "item_crop"); any failure leaves
+  the manifest saying copy was not generated for the item instead
+  of dressing it in another item's words. Auto-enumerate likewise
+  surfaces one candidate per viewpoint; several viewpoints of one
+  room are what surface several items.
 - The seller's name is the segmentation concept. SAM sometimes wants
   a different phrasing than a human uses; the bounded variant list is
   the recovery, and a name no variant can segment is a failed item
@@ -119,6 +129,7 @@ import argparse
 import array
 import base64
 import json
+import math
 import mimetypes
 import os
 import re
@@ -131,8 +142,8 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import config, ingest, ledger
-from .assets import AssetStore
+from . import backdrop, config, ingest, ledger, market_pricing
+from .assets import KIND_CROP, KIND_PLATE, AssetStore
 
 # The shared plate style for a room run: one scene prompt for every
 # item, so a room's listings stage into the same visual world. draw
@@ -909,6 +920,37 @@ def _run_verification(ctx: "_RunContext", composite_handle: str) -> dict:
     }
 
 
+def draw_with_code_plate(store: AssetStore, foreground_handle: str, stage_mode: str) -> dict:
+    """Backdrop-mode draw: render the plate in code, store it, draw.
+
+    No model call and no billed call: the plate is rendered at the
+    foreground's frame size, stored as a plate asset, and passed to
+    composite.draw_product as the plate handle, so the Fidelity Lock
+    receipt pins the plate's hashes and carries the code-rendered
+    backdrop description. Returns the chain's draw-result shape.
+    """
+    from . import composite
+
+    foreground = store.read_image(foreground_handle)
+    plate = backdrop.render_plate(stage_mode, foreground.width, foreground.height)
+    plate_handle = store.put_image(plate, kind=KIND_PLATE)
+    handle, receipt = composite.draw_product(
+        store,
+        foreground_handle,
+        f"code-rendered {stage_mode} backdrop",
+        plate_handle=plate_handle,
+        plate_kind="code_rendered",
+        backdrop=backdrop.backdrop_info(stage_mode),
+    )
+    return {
+        "status": "ok",
+        "output_asset": handle,
+        "plate_asset": plate_handle,
+        "fidelity_receipt": receipt,
+        "cost_usd": 0.0,
+    }
+
+
 def _default_chain() -> dict:
     from . import server
 
@@ -922,7 +964,17 @@ def _default_chain() -> dict:
         result = server.draw(handle, scene)
         return result[0] if isinstance(result, list) else result
 
-    return {"identify": identify_fn, "cut_out": cut_out_fn, "draw": draw_fn}
+    def draw_backdrop_fn(handle: str, stage_mode: str) -> dict:
+        return draw_with_code_plate(
+            AssetStore(config.get_data_dir()), handle, stage_mode
+        )
+
+    return {
+        "identify": identify_fn,
+        "cut_out": cut_out_fn,
+        "draw": draw_fn,
+        "draw_backdrop": draw_backdrop_fn,
+    }
 
 
 def _data_uri(path: Path) -> str:
@@ -963,6 +1015,7 @@ class _RunContext:
     store: AssetStore
     chain: dict
     scene: str
+    stage_mode: str = "scene"
     verify_fn: object = None  # (store, composite_handle) -> report dict
     max_photos_per_item: int = MAX_PHOTOS_PER_ITEM
     max_sam_calls_per_item: int = MAX_SAM_CALLS_PER_ITEM
@@ -1124,6 +1177,90 @@ def _probe_item(
     return sightings
 
 
+_NO_COPY_NOTE = (
+    "the source photo's identify plan described a different "
+    "primary subject; per-item listing copy was not generated "
+    "rather than borrowed from another item"
+)
+
+
+def _none_listing(note: str) -> dict:
+    return {
+        "title": None,
+        "bullets": [],
+        "condition_notes": None,
+        "source": "none",
+        "note": note,
+        "crop_asset": None,
+    }
+
+
+def _crop_listing(
+    ctx: _RunContext, name: str, sources: list[PhotoSource], primary: dict
+) -> tuple[dict, float]:
+    """Listing copy from the item's own crop of its primary photo.
+
+    The whole-photo identify plan describes the photo's main subject,
+    which in a room photo is usually a different item. So when that
+    plan does not yield copy for this item, the PRIMARY SOURCE image
+    is cropped to this item's own foreground box in that photo (the
+    primary sighting's box, expanded by 10% on each side and clamped
+    to the frame), the crop is stored as an asset, and the chain's
+    identify runs on the crop alone. Copy is never borrowed from
+    another item or photo: the crop comes only from this item's own
+    primary sighting. Returns (listing record, identify cost). Any
+    failure (no recorded box, an unreadable source, a failed
+    identify) degrades to the honest "none" record.
+    """
+    source = sources[primary["photo_index"]]
+    bbox = primary.get("bbox_normalized")
+    if not bbox or source.handle is None:
+        return _none_listing(
+            _NO_COPY_NOTE + "; no foreground box was recorded for the item crop"
+        ), 0.0
+    try:
+        image = ctx.store.read_image(source.handle)
+    except Exception:
+        return _none_listing(
+            _NO_COPY_NOTE + "; the item crop could not be read from the source photo"
+        ), 0.0
+    width, height = image.width, image.height
+    box_w = (bbox[2] - bbox[0]) * width
+    box_h = (bbox[3] - bbox[1]) * height
+    x0 = max(0, math.floor(bbox[0] * width - 0.10 * box_w))
+    y0 = max(0, math.floor(bbox[1] * height - 0.10 * box_h))
+    x1 = min(width, math.ceil(bbox[2] * width + 0.10 * box_w))
+    y1 = min(height, math.ceil(bbox[3] * height + 0.10 * box_h))
+    if x1 <= x0 or y1 <= y0:
+        return _none_listing(_NO_COPY_NOTE + "; the item crop box was empty"), 0.0
+    crop = image.crop((x0, y0, x1, y1))
+    try:
+        crop_handle = ctx.store.put_image(
+            crop,
+            kind=KIND_CROP,
+            source_asset_id=AssetStore.parse_handle(source.handle),
+        )
+    except Exception:
+        return _none_listing(
+            _NO_COPY_NOTE + "; the item crop could not be stored"
+        ), 0.0
+    try:
+        result = ctx.chain["identify"](crop_handle)
+    except Exception:
+        return _none_listing(_NO_COPY_NOTE + "; the item-crop identify attempt failed"), 0.0
+    cost = _call_cost(result)
+    if result.get("status") == "ok" and result.get("suggested_title"):
+        return {
+            "title": result.get("suggested_title"),
+            "bullets": result.get("listing_bullets") or [],
+            "condition_notes": result.get("condition_notes"),
+            "source": "item_crop",
+            "note": None,
+            "crop_asset": crop_handle,
+        }, cost
+    return _none_listing(_NO_COPY_NOTE + "; the item-crop identify attempt failed"), cost
+
+
 def _process_item(
     ctx: _RunContext,
     item: dict,
@@ -1139,6 +1276,8 @@ def _process_item(
         "stage_reached": "probe",
         "failure": None,
         "narration": item.get("narration"),
+        "origin": item.get("origin", "named"),
+        "stage_mode": ctx.stage_mode,
         "sightings": [],
         "primary_photo_index": None,
         "also_seen_in": [],
@@ -1147,6 +1286,7 @@ def _process_item(
         "receipt_file": None,
         "verification": None,
         "listing": None,
+        "pricing": None,
         "possible_duplicate_of": [],
         "flags": list(item.get("flags", [])),
         "cost_usd": 0.0,
@@ -1166,9 +1306,15 @@ def _process_item(
     if not successes:
         errors = [s.get("error") or {} for s in sightings if s["status"] == "error"]
         first = errors[0] if errors else {}
+        code = first.get("code", "NO_MATCH")
+        if record["origin"] == "narration_mentioned":
+            # A mentioned item the photos refute is a NO_MATCH by
+            # definition: it was probed and not found. The underlying
+            # probe code stays visible in the sighting records.
+            code = "NO_MATCH"
         record["failure"] = {
             "stage": "cut_out",
-            "code": first.get("code", "NO_MATCH"),
+            "code": code,
             "message": (
                 f"no candidate photo yielded a cut-out for {name!r} "
                 f"({len(sightings)} photo(s) probed)"
@@ -1192,8 +1338,10 @@ def _process_item(
         s["photo_index"] for s in successes if s is not primary
     ]
 
-    # Listing copy only when the primary photo's plan was about this
-    # item (see the module docstring's honesty note).
+    # Listing copy: the primary photo's plan when that plan was about
+    # this item; otherwise the item-crop path (identify run on a crop
+    # of this item's own primary sighting). Copy is never borrowed
+    # from another item (see the module docstring's honesty note).
     plan = sources[primary["photo_index"]].plan
     if plan_matches_item(plan, name):
         record["listing"] = {
@@ -1202,22 +1350,33 @@ def _process_item(
             "condition_notes": plan.get("condition_notes"),
             "source": "photo_plan",
             "note": None,
+            "crop_asset": None,
         }
     else:
-        record["listing"] = {
-            "title": None,
-            "bullets": [],
-            "condition_notes": None,
-            "source": "none",
-            "note": (
-                "the source photo's identify plan described a different "
-                "primary subject; per-item listing copy was not generated "
-                "rather than borrowed from another item"
-            ),
-        }
+        listing, crop_cost = _crop_listing(ctx, name, sources, primary)
+        record["listing"] = listing
+        record["cost_usd"] += crop_cost
 
     record["stage_reached"] = "draw"
-    draw_result = ctx.chain["draw"](primary["foreground_asset"], ctx.scene)
+    if ctx.stage_mode in backdrop.BACKDROP_STAGE_MODES:
+        draw_backdrop_fn = ctx.chain.get("draw_backdrop")
+        if draw_backdrop_fn is not None:
+            draw_result = draw_backdrop_fn(primary["foreground_asset"], ctx.stage_mode)
+        else:
+            try:
+                draw_result = draw_with_code_plate(
+                    ctx.store, primary["foreground_asset"], ctx.stage_mode
+                )
+            except Exception as exc:  # noqa: BLE001 — a draw failure is a record
+                draw_result = {
+                    "status": "error",
+                    "error": {
+                        "code": "DRAW_FAILED",
+                        "message": f"backdrop draw failed: {type(exc).__name__}: {exc}",
+                    },
+                }
+    else:
+        draw_result = ctx.chain["draw"](primary["foreground_asset"], ctx.scene)
     record["cost_usd"] += _call_cost(draw_result)
     if draw_result.get("status") != "ok":
         error = draw_result.get("error") or {}
@@ -1236,6 +1395,8 @@ def _process_item(
         "opaque_pixels": receipt.get("opaque_pixels"),
         "changed_opaque_pixels": receipt.get("changed_opaque_pixels"),
         "color_profile_preserved": receipt.get("color_profile_preserved"),
+        "plate_kind": receipt.get("plate_kind"),
+        "backdrop": receipt.get("backdrop"),
         "cost_usd": draw_result.get("cost_usd"),
     }
     receipt_path = ctx.store.receipt_path(record["output_asset"])
@@ -1337,6 +1498,8 @@ def run_room(
     narrated_audios: list[Path] | None = None,
     narration_fn=None,
     narration_max_projected_usd: float = NARRATION_MAX_PROJECTED_USD,
+    stage_mode: str = "scene",
+    comps_data: dict | None = None,
 ) -> dict:
     """Run one room end to end and return (and write) its manifest.
 
@@ -1370,6 +1533,17 @@ def run_room(
     for the visual pipeline to confirm or refute. Narration spend is
     Baseten-pool only and lands in the manifest's narration section,
     never in total_cost_usd (the Meta ledger delta).
+
+    stage_mode: "scene" (default) stages through the model draw
+    chain; "wallpaper" / "studio_gray" stage on code-rendered
+    plates (see the module docstring). The manifest records the
+    mode at top level and on every item record.
+
+    comps_data: agent-supplied Marketplace comps (the parsed --comps
+    JSON). Every item record gains a deterministic pricing record
+    from market_pricing; when comps are supplied the run also
+    writes the priced table artifacts (priced-table.png,
+    priced-table.html, pricing-notes.md) into out_dir.
     """
     store = store if store is not None else AssetStore(config.get_data_dir())
     chain = chain if chain is not None else _default_chain()
@@ -1406,6 +1580,8 @@ def run_room(
             narrated_audios=list(narrated_audios or []),
             narration_fn=narration_fn,
             narration_max_projected_usd=narration_max_projected_usd,
+            stage_mode=stage_mode,
+            comps_data=comps_data,
         )
     finally:
         if previous_ledger_env is None:
@@ -1437,8 +1613,15 @@ def _run_room_body(
     narrated_audios: list[Path],
     narration_fn,
     narration_max_projected_usd: float,
+    stage_mode: str = "scene",
+    comps_data: dict | None = None,
 ) -> dict:
     from . import server  # local import: server pulls in the MCP SDK
+
+    if stage_mode not in backdrop.STAGE_MODES:
+        raise ValueError(
+            f"unknown stage_mode {stage_mode!r}; expected one of {backdrop.STAGE_MODES}"
+        )
 
     if spend_probe is None:
 
@@ -1608,6 +1791,7 @@ def _run_room_body(
                     "name": group["name"],
                     "candidate_photo_indices": group["photo_indices"],
                     "flags": group["flags"],
+                    "origin": "named",
                 }
             )
         mode = "auto"
@@ -1619,6 +1803,7 @@ def _run_room_body(
                     "name": name,
                     "candidate_photo_indices": _rank_photos(name, sources),
                     "flags": [],
+                    "origin": "named",
                 }
             )
     # Narration items join the work list. A narration name matching an
@@ -1636,12 +1821,15 @@ def _run_room_body(
                     current["kind"] == "mentioned" and kind == "named"
                 ):
                     existing["narration"] = {"kind": kind, "source": source_path}
+                    if existing.get("origin") == "narration_mentioned" and kind == "named":
+                        existing["origin"] = "narration_selling"
                 return
         entry: dict = {
             "name": name,
             "candidate_photo_indices": _rank_photos(name, sources),
             "flags": [],
             "narration": {"kind": kind, "source": source_path},
+            "origin": "narration_selling" if kind == "named" else "narration_mentioned",
         }
         if kind == "mentioned":
             entry["flags"].append(
@@ -1670,6 +1858,7 @@ def _run_room_body(
         store=store,
         chain=chain,
         scene=scene,
+        stage_mode=stage_mode,
         verify_fn=verify_fn,
         max_photos_per_item=max_photos_per_item,
     )
@@ -1694,6 +1883,8 @@ def _run_room_body(
                         ),
                     },
                     "narration": item.get("narration"),
+                    "origin": item.get("origin", "named"),
+                    "stage_mode": stage_mode,
                     "sightings": [],
                     "primary_photo_index": None,
                     "also_seen_in": [],
@@ -1702,6 +1893,7 @@ def _run_room_body(
                     "receipt_file": None,
                     "verification": None,
                     "listing": None,
+                    "pricing": None,
                     "possible_duplicate_of": [],
                     "flags": list(item.get("flags", [])),
                     "cost_usd": 0.0,
@@ -1713,6 +1905,11 @@ def _run_room_body(
         )
 
     _flag_cross_item_duplicates(records, sources)
+
+    # Pricing is a pure post-pass over the finished records: every
+    # item gains its pricing record, comps or no comps.
+    for record in records:
+        record["pricing"] = market_pricing.pricing_for_item(record["name"], comps_data)
 
     total_cost = round(spend_probe() - spend_before, 6)
     narration_section = None
@@ -1734,10 +1931,20 @@ def _run_room_body(
             "usage": usage_totals,
             "cost_usd_estimate": baseten_cost,
         }
+    pricing_source = None
+    if comps_data is not None:
+        pricing_source = {
+            "source": market_pricing.PRICING_SOURCE,
+            "area": comps_data.get("area") if isinstance(comps_data, dict) else None,
+            "radius_mi": comps_data.get("radius_mi") if isinstance(comps_data, dict) else None,
+            "pulled_at": comps_data.get("pulled_at") if isinstance(comps_data, dict) else None,
+        }
     manifest = {
         "room_id": room_id,
         "created_at": datetime.now(timezone.utc).isoformat(),
         "mode": mode,
+        "stage_mode": stage_mode,
+        "pricing_source": pricing_source,
         "room_style": scene,
         "budget_usd": budget_usd,
         "ledger_path": str(room_ledger),
@@ -1753,6 +1960,10 @@ def _run_room_body(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
     (out_dir / "summary.txt").write_text(summarize_manifest(manifest), encoding="utf-8")
+    if comps_data is not None:
+        from . import priced_table
+
+        priced_table.write_priced_table(out_dir, manifest, store, comps_data)
     return manifest
 
 
@@ -1824,6 +2035,25 @@ def summarize_manifest(manifest: dict) -> str:
                 f"{verification.get('opaque_pixels')} opaque px recounted from disk, "
                 f"{verification.get('changed_opaque_pixels')} changed"
             )
+            listing = item.get("listing") or {}
+            lines.append(
+                f"          listing title: {listing.get('title') or '—'}"
+            )
+            pricing = item.get("pricing") or {}
+            if pricing.get("status") == "priced":
+                price_range = pricing.get("range") or {}
+                lines.append(
+                    f"          pricing: ${price_range.get('quick')}–${price_range.get('premium')} "
+                    f"range, suggested ${pricing.get('suggested')} "
+                    f"({pricing.get('confidence')}, {pricing.get('comps_used')} comps)"
+                )
+            elif pricing.get("status") == "unpriced_thin_market":
+                lines.append(
+                    f"          pricing: not priced — thin market "
+                    f"({pricing.get('comps_used')} comps)"
+                )
+            else:
+                lines.append("          pricing: no comps supplied")
         elif item["status"] == "verify_failed":
             failure = item["failure"] or {}
             lines.append(
@@ -1905,6 +2135,27 @@ def main(argv: list[str] | None = None) -> int:
     )
     parser.add_argument("--scene", default=DEFAULT_SCENE, help="Shared room plate style.")
     parser.add_argument(
+        "--stage-mode",
+        choices=list(backdrop.STAGE_MODES),
+        default="scene",
+        help=(
+            "How items are staged: 'scene' (default) generates one shared "
+            "room plate with the image model; 'wallpaper' and 'studio_gray' "
+            "render the plate in code per item, with no model call."
+        ),
+    )
+    parser.add_argument(
+        "--comps",
+        type=Path,
+        default=None,
+        help=(
+            "Path to a comps JSON file (agent-supplied Facebook Marketplace "
+            "asking prices). Each item gains a pricing record, and the run "
+            "also writes priced-table.png, priced-table.html, and "
+            "pricing-notes.md into the output dir."
+        ),
+    )
+    parser.add_argument(
         "--out",
         type=Path,
         default=None,
@@ -1950,6 +2201,15 @@ def main(argv: list[str] | None = None) -> int:
     if not args.photos and not args.video:
         parser.error("give at least one --photos file/folder or --video")
 
+    comps_data = None
+    if args.comps is not None:
+        try:
+            comps_data = json.loads(Path(args.comps).read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            parser.error(f"could not read comps file {args.comps}: {exc}")
+        if not isinstance(comps_data, dict):
+            parser.error(f"comps file {args.comps} must contain a JSON object")
+
     room_id = args.room_id or f"room-{uuid.uuid4().hex[:8]}"
     out_dir = args.out or Path.cwd() / f"roomrun-{room_id}"
     try:
@@ -1960,6 +2220,8 @@ def main(argv: list[str] | None = None) -> int:
             item_names=item_names or None,
             auto=args.auto,
             scene=args.scene,
+            stage_mode=args.stage_mode,
+            comps_data=comps_data,
             room_id=room_id,
             budget_usd=args.budget_usd,
             frame_every_seconds=args.frame_every,

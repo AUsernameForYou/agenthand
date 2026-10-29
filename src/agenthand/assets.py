@@ -48,6 +48,7 @@ HANDLE_PREFIX = "asset://"
 
 # Asset kinds. draw only accepts KIND_FOREGROUND, chained to KIND_SOURCE.
 KIND_SOURCE = "source_photo"
+KIND_CROP = "item_crop"
 KIND_FOREGROUND = "foreground_png"
 KIND_MASK = "mask_png"
 KIND_PLATE = "background_plate"
