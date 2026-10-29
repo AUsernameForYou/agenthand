@@ -251,6 +251,99 @@ def test_verify_receipt_from_disk_loads_the_persisted_receipt(tmp_path):
     assert report["recomputed"]["changed_opaque_pixels"] == 0
 
 
+# -- mask provenance fields (decision 68): optional, validated when present --
+
+_PROVENANCE_NONE = {
+    "mask_source_width": 8,
+    "mask_source_height": 6,
+    "mask_sam_width": 8,
+    "mask_sam_height": 6,
+    "mask_scale_method": "none",
+}
+
+
+def test_verify_accepts_a_receipt_with_consistent_mask_provenance(tmp_path):
+    store, handle, receipt = _store_run(tmp_path)
+    report = composite.verify_receipt_from_disk(
+        store, handle, {**receipt, **_PROVENANCE_NONE}
+    )
+    assert report["ok"] is True, report["problems"]
+
+
+def test_verify_accepts_a_receipt_with_scaled_mask_provenance(tmp_path):
+    store, handle, receipt = _store_run(tmp_path)
+    scaled = {
+        **_PROVENANCE_NONE,
+        "mask_sam_width": 4,
+        "mask_sam_height": 3,
+        "mask_scale_method": "bilinear_threshold_128",
+    }
+    report = composite.verify_receipt_from_disk(store, handle, {**receipt, **scaled})
+    assert report["ok"] is True, report["problems"]
+
+
+def test_verify_rejects_a_receipt_with_a_bogus_scale_method(tmp_path):
+    store, handle, receipt = _store_run(tmp_path)
+    bad = {**receipt, **_PROVENANCE_NONE, "mask_scale_method": "nearest_magic"}
+    report = composite.verify_receipt_from_disk(store, handle, bad)
+    assert report["ok"] is False
+    assert report["checks"]["receipt_shape"] is False
+
+
+def test_verify_rejects_partial_mask_provenance(tmp_path):
+    store, handle, receipt = _store_run(tmp_path)
+    bad = {**receipt, "mask_sam_width": 4}
+    report = composite.verify_receipt_from_disk(store, handle, bad)
+    assert report["ok"] is False
+    assert report["checks"]["receipt_shape"] is False
+
+
+def test_verify_rejects_inconsistent_mask_provenance(tmp_path):
+    store, handle, receipt = _store_run(tmp_path)
+    # SAM frame larger than the source frame is impossible under the
+    # downscale-only rule, and "none" with differing dims contradicts
+    # itself; both must fail shape validation.
+    bigger = {
+        **receipt,
+        **_PROVENANCE_NONE,
+        "mask_sam_width": 16,
+        "mask_scale_method": "bilinear_threshold_128",
+    }
+    report = composite.verify_receipt_from_disk(store, handle, bigger)
+    assert report["ok"] is False
+    assert report["checks"]["receipt_shape"] is False
+    mismatched = {**receipt, **_PROVENANCE_NONE, "mask_sam_width": 4}
+    report = composite.verify_receipt_from_disk(store, handle, mismatched)
+    assert report["ok"] is False
+    assert report["checks"]["receipt_shape"] is False
+
+
+def test_verify_refuses_provenance_under_a_stripped_schema_marker(tmp_path):
+    store, handle, receipt = _store_run(tmp_path)
+    stripped = {
+        k: v
+        for k, v in receipt.items()
+        if k
+        not in {
+            "receipt_schema",
+            "color_profile_foreground_sha256",
+            "mask_sha256",
+            "mask_pixel_sha256",
+            "mask_source",
+            "opaque_alpha_threshold",
+            "pixel_tolerance",
+            "count_sample",
+            "product_layer_scaled",
+            "output_format",
+        }
+    }
+    stripped.update(_PROVENANCE_NONE)
+    report = composite.verify_receipt_from_disk(store, handle, stripped)
+    assert report["ok"] is False
+    assert report["checks"]["receipt_shape"] is False
+    assert any("current-schema fields" in p for p in report["problems"])
+
+
 def test_verify_receipt_from_disk_fails_on_a_tampered_output_file(tmp_path):
     store, handle, receipt = _store_run(tmp_path)
     # One pixel changed in the DELIVERED file, after the receipt was

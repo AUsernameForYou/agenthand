@@ -202,3 +202,93 @@ def test_extract_foreground_keeps_source_pixels_where_mask_is_on():
             assert fg[x, y] == (200, 30, 30, 255)  # byte-for-byte the source
         for x in range(4, 8):
             assert fg[x, y] == (0, 0, 0, 0)  # transparent elsewhere
+
+
+# -- SAM working-resolution scaling (decision 68) ------------------------------
+#
+# SAM is only ever sent a working-resolution copy once the source passes
+# the proven envelope; the returned mask is mapped back onto the full
+# frame before anything is cut. The cap-math and mapping tests below are
+# the geometry pins for that path.
+
+
+def test_sam_frame_size_keeps_the_proven_frame_unchanged():
+    # Every room run's stills were 1206x1608 and SAM accepted them all;
+    # a frame at the proven size must pass through untouched.
+    assert segmentation.sam_frame_size(1206, 1608) == (1206, 1608)
+    assert segmentation.sam_frame_size(720, 1280) == (720, 1280)
+
+
+def test_sam_frame_size_maps_the_24mp_original_to_the_proven_frame():
+    # IMG_1340's stored geometry (4284x5712, the photo whose full-size
+    # cut_out SAM refused with HTTP 413): the cap math lands exactly on
+    # the 1206x1608 frame the room runs proved.
+    assert segmentation.sam_frame_size(4284, 5712) == (1206, 1608)
+
+
+def test_sam_frame_size_respects_the_cap_for_other_aspects():
+    w, h = segmentation.sam_frame_size(6000, 2000, max_pixels=1_000_000)
+    assert w * h <= 1_000_000
+    assert abs(w / h - 3.0) < 0.01
+
+
+def _rect_mask(size, rect):
+    mask = Image.new("L", size, 0)
+    px = mask.load()
+    for y in range(rect[1], rect[3]):
+        for x in range(rect[0], rect[2]):
+            px[x, y] = 255
+    return mask
+
+
+def test_map_mask_to_frame_uniform_scale_lands_on_the_right_pixels():
+    # SAM-frame rect x in [50,100), y in [30,60) of a 200x150 frame maps
+    # onto x in [100,200), y in [60,120) of the 400x300 source frame.
+    mask = _rect_mask((200, 150), (50, 30, 100, 60))
+    mapped = segmentation.map_mask_to_frame(mask, 400, 300)
+    assert mapped.size == (400, 300)
+    mp = mapped.load()
+    assert mp[150, 90] == 255  # the rect's centre
+    assert mp[105, 65] == 255  # interior, clear of the edge band
+    assert mp[95, 55] == 0  # just outside the left/top edges
+    assert mp[205, 125] == 0  # just outside the right/bottom edges
+    assert mp[399, 299] == 0  # far corner stays off
+
+
+def test_map_mask_to_frame_nonuniform_scale_lands_on_the_right_pixels():
+    # x scales by 2, y by 3: the rect lands on x in [100,200),
+    # y in [90,180) of the 400x450 frame.
+    mask = _rect_mask((200, 150), (50, 30, 100, 60))
+    mapped = segmentation.map_mask_to_frame(mask, 400, 450)
+    mp = mapped.load()
+    assert mp[150, 135] == 255
+    assert mp[150, 60] == 0  # above the mapped rect
+    assert mp[60, 135] == 0  # left of the mapped rect
+
+
+def test_map_mask_to_frame_same_size_is_identity():
+    mask = _left_half_mask()
+    mapped = segmentation.map_mask_to_frame(mask, 8, 6)
+    assert mapped.tobytes() == mask.tobytes()
+
+
+def test_prepare_sam_png_passes_small_frames_through_byte_identical():
+    source = Image.new("RGBA", (8, 6), (10, 20, 30, 255))
+    stored = b"the stored bytes, untouched"
+    prepared = segmentation.prepare_sam_png(source, stored)
+    assert prepared["png_bytes"] is stored
+    assert (prepared["sam_width"], prepared["sam_height"]) == (8, 6)
+    assert prepared["scale_method"] == "none"
+
+
+def test_prepare_sam_png_scales_oversize_frames_to_the_cap():
+    source = Image.new("RGBA", (400, 300), (10, 20, 30, 255))
+    prepared = segmentation.prepare_sam_png(
+        source, b"unused", max_pixels=10_000
+    )
+    assert (prepared["sam_width"], prepared["sam_height"]) == (115, 86)
+    assert prepared["scale_method"] == "bilinear_threshold_128"
+    from io import BytesIO
+
+    sent = Image.open(BytesIO(prepared["png_bytes"]))
+    assert sent.size == (115, 86)

@@ -65,9 +65,11 @@ offline tests and no-key demos; live mode never substitutes it.
 
 from __future__ import annotations
 
+import json
 from io import BytesIO
 
 from mcp.server.mcpserver import Image, MCPServer
+from PIL.PngImagePlugin import PngInfo
 
 from . import composite, config, ingest, meta_client, segmentation
 from . import __version__ as _package_version
@@ -77,6 +79,7 @@ from .assets import (
     KIND_MASK,
     KIND_OVERLAY,
     KIND_SOURCE,
+    MASK_PROVENANCE_PNG_KEY,
     AssetStore,
 )
 
@@ -453,13 +456,27 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     projected = meta_client.project_cut_out_cost_usd(CUT_OUT_MODEL, len(phrases))
     outcome: dict = {}
 
+    # SAM working resolution (decision 68): past the proven cap, only
+    # the SAM-bound copy is downscaled; the stored photo keeps its full
+    # resolution and the returned mask is mapped back onto it below.
+    sam_payload = segmentation.prepare_sam_png(
+        source_image, store.read_bytes(handle)
+    )
+    mask_provenance = {
+        "source_width": source_image.width,
+        "source_height": source_image.height,
+        "sam_width": sam_payload["sam_width"],
+        "sam_height": sam_payload["sam_height"],
+        "scale_method": sam_payload["scale_method"],
+    }
+
     def _run_attempts() -> dict:
         result = segmentation.run_attempts(
-            store.read_bytes(handle),
+            sam_payload["png_bytes"],
             phrases,
             model=CUT_OUT_MODEL,
-            frame_width=source_image.width,
-            frame_height=source_image.height,
+            frame_width=sam_payload["sam_width"],
+            frame_height=sam_payload["sam_height"],
         )
         outcome.update(result)
         return result["usage"]
@@ -476,15 +493,27 @@ def cut_out(image: str, concept: str | None = None) -> dict:
             cost_counted_usd=projected,
         )
 
+    # The winning mask is in the SAM frame; map it onto the full source
+    # frame before anything is cut, reviewed, or stored, so every
+    # downstream artifact (mask asset, foreground, overlay) is at the
+    # photo's own resolution and the Fidelity Lock binds those pixels.
+    full_mask = segmentation.map_mask_to_frame(
+        outcome["mask_image"], source_image.width, source_image.height
+    )
     mask_buffer = BytesIO()
-    outcome["mask_image"].save(mask_buffer, format="PNG")
+    pnginfo = PngInfo()
+    pnginfo.add_text(
+        MASK_PROVENANCE_PNG_KEY,
+        json.dumps(mask_provenance, separators=(",", ":"), sort_keys=True),
+    )
+    full_mask.save(mask_buffer, format="PNG", pnginfo=pnginfo)
     mask_handle = store.put_bytes(
         mask_buffer.getvalue(),
         kind=KIND_MASK,
         suffix=".png",
         source_asset_id=source_record.asset_id,
     )
-    foreground = segmentation.extract_foreground(source_image, outcome["mask_image"])
+    foreground = segmentation.extract_foreground(source_image, full_mask)
     # The lineage is a chain: mask parented to the source photo,
     # foreground parented to the mask. draw walks the foreground's
     # ancestry for the mask, so this shape is what lets the fidelity
@@ -505,11 +534,11 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     # photo with the mask's outline drawn on it) and the mask's sanity
     # signals with any warnings flagged, never silently accepted.
     overlay_handle = store.put_image(
-        segmentation.mask_overlay_image(source_image, outcome["mask_image"]),
+        segmentation.mask_overlay_image(source_image, full_mask),
         kind=KIND_OVERLAY,
         source_asset_id=source_record.asset_id,
     )
-    mask_review = segmentation.review_mask(outcome["mask_image"])
+    mask_review = segmentation.review_mask(full_mask)
 
     return {
         "status": "ok",
@@ -525,6 +554,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         "mask_asset": mask_handle,
         "mask_overlay_asset": overlay_handle,
         "mask_review": mask_review,
+        "mask_provenance": mask_provenance,
         "hashes": {
             "source": {
                 "sha256": source_record.sha256,

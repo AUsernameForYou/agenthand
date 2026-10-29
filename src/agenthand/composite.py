@@ -28,6 +28,7 @@ offline with zero API calls.
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from io import BytesIO
 
@@ -42,6 +43,7 @@ from .assets import (
     KIND_MASK,
     KIND_PLATE,
     KIND_SOURCE,
+    MASK_PROVENANCE_PNG_KEY,
     AssetIntegrityError,
     AssetRecord,
     AssetStore,
@@ -50,6 +52,7 @@ from .assets import (
     describe_color_profile,
     icc_profile_of_image,
     pixel_hash_of_image,
+    png_text_of_bytes,
 )
 
 # A foreground pixel counts as product only at exactly this alpha. The
@@ -208,6 +211,47 @@ def composite_images(
     return out, _measure(fg, out), transformations
 
 
+# The mask scale methods cut_out can record (segmentation.MASK_SCALE_*;
+# the strings are receipt wire values, pinned here like "asset" /
+# "foreground_alpha" are for mask_source).
+_MASK_SCALE_METHODS = ("none", "bilinear_threshold_128")
+
+
+def mask_provenance_of(store: AssetStore, mask_handle: str) -> dict | None:
+    """The mask asset's recorded provenance, or None when absent.
+
+    cut_out writes the provenance (source frame, SAM frame, scale
+    method) as a PNG text chunk inside the mask file; draw republishes
+    it in the receipt as mask_source_width / mask_source_height /
+    mask_sam_width / mask_sam_height / mask_scale_method. Anything
+    missing or malformed reads as absent: provenance is evidence, not
+    a gate, and a mask written before it existed must still draw — the
+    receipt simply carries no provenance fields, which the verifier
+    accepts.
+    """
+    raw = png_text_of_bytes(store.read_bytes(mask_handle)).get(
+        MASK_PROVENANCE_PNG_KEY
+    )
+    if raw is None:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    provenance: dict = {}
+    for name in ("source_width", "source_height", "sam_width", "sam_height"):
+        value = parsed.get(name)
+        if not _is_count(value):
+            return None
+        provenance[name] = value
+    if parsed.get("scale_method") not in _MASK_SCALE_METHODS:
+        return None
+    provenance["scale_method"] = parsed["scale_method"]
+    return provenance
+
+
 def validate_foreground(store: AssetStore, foreground_handle: str) -> list[AssetRecord]:
     """Check an asset may be composited; returns its lineage chain.
 
@@ -287,6 +331,7 @@ def draw_product(
         mask_sha256 = mask_record.sha256
         mask_pixel_sha256 = mask_record.pixel_sha256
         mask_source = "asset"
+        mask_provenance = mask_provenance_of(store, mask_asset)
     else:
         # No separate mask asset in the chain: the foreground's own alpha
         # channel is the mask. Hash the derived mask so the receipt still
@@ -298,6 +343,7 @@ def draw_product(
         mask_sha256 = hashlib.sha256(buffer.getvalue()).hexdigest()
         mask_pixel_sha256 = pixel_hash_of_image(mask_image)
         mask_source = "foreground_alpha"
+        mask_provenance = None
 
     if plate_handle is not None:
         plate_record = store.get_record(plate_handle)
@@ -420,6 +466,20 @@ def draw_product(
             "change is a fidelity failure even when pixel values match."
         ),
     }
+    if mask_provenance is not None:
+        # Mask provenance (decision 68): the receipt states the frame
+        # the mask was cut from, the frame SAM actually saw, and how
+        # the mask was mapped between them — so a "0 changed" receipt
+        # never silently rests on a working-resolution selection.
+        receipt.update(
+            {
+                "mask_source_width": mask_provenance["source_width"],
+                "mask_source_height": mask_provenance["source_height"],
+                "mask_sam_width": mask_provenance["sam_width"],
+                "mask_sam_height": mask_provenance["sam_height"],
+                "mask_scale_method": mask_provenance["scale_method"],
+            }
+        )
     # Persist the receipt beside the composite (architecture Gauntlet,
     # Fable + GPT "adopt now, as a file"): a receipt that exists only
     # in the tool's return value is gone if the client drops it, and
@@ -505,10 +565,25 @@ _RECEIPT_FIELDS_V2 = {
     "output_format": lambda v: v == "PNG",
 }
 
+# Optional current-schema fields: mask provenance (decision 68).
+# Receipts carry them when the mask asset recorded provenance (every
+# cut_out since the SAM scaling change does); older receipts and
+# foreground_alpha receipts do not. Absence is accepted; presence is
+# validated as a complete, self-consistent set (see _validate_receipt).
+_RECEIPT_FIELDS_V2_OPTIONAL = {
+    "mask_source_width": _is_count,
+    "mask_source_height": _is_count,
+    "mask_sam_width": _is_count,
+    "mask_sam_height": _is_count,
+    "mask_scale_method": lambda v: v in _MASK_SCALE_METHODS,
+}
+
 # Fields that exist only in the current schema (used by the
 # downgrade guard in _validate_receipt). mask_asset is excluded: v1
 # receipts name the mask asset too, they just do not pin its hashes.
-_V2_ONLY_FIELDS = frozenset(_RECEIPT_FIELDS_V2) - {"mask_asset"}
+_V2_ONLY_FIELDS = (
+    frozenset(_RECEIPT_FIELDS_V2) | frozenset(_RECEIPT_FIELDS_V2_OPTIONAL)
+) - {"mask_asset"}
 
 # The contract terms, by field: a receipt is graded ONLY under these.
 _RECEIPT_TERMS = {
@@ -579,6 +654,14 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
                 f"field {name} has the wrong type or shape: "
                 f"{receipt[name]!r}"
             )
+    if strict:
+        # Optional provenance fields: validated when present.
+        for name, valid in _RECEIPT_FIELDS_V2_OPTIONAL.items():
+            if name in receipt and not valid(receipt[name]):
+                shape.append(
+                    f"field {name} has the wrong type or shape: "
+                    f"{receipt[name]!r}"
+                )
     if shape:
         return shape, terms
     # Internal consistency of the stated counts: a receipt whose own
@@ -615,6 +698,36 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
             shape.append(
                 "mask_source is 'foreground_alpha' but mask_asset is set"
             )
+    if strict and any(name in receipt for name in _RECEIPT_FIELDS_V2_OPTIONAL):
+        # Mask provenance is an all-or-nothing, self-consistent
+        # statement: a partial or contradictory set is a forged or
+        # torn receipt, not a weaker claim.
+        missing = [
+            name for name in _RECEIPT_FIELDS_V2_OPTIONAL if name not in receipt
+        ]
+        if missing:
+            shape.append(
+                "mask provenance is partial; missing fields: "
+                + ", ".join(sorted(missing))
+            )
+        else:
+            if (
+                receipt["mask_sam_width"] > receipt["mask_source_width"]
+                or receipt["mask_sam_height"] > receipt["mask_source_height"]
+            ):
+                shape.append(
+                    "mask SAM frame exceeds the mask source frame; the "
+                    "SAM-bound copy is only ever downscaled"
+                )
+            unscaled = (
+                receipt["mask_sam_width"] == receipt["mask_source_width"]
+                and receipt["mask_sam_height"] == receipt["mask_source_height"]
+            )
+            if (receipt["mask_scale_method"] == "none") != unscaled:
+                shape.append(
+                    "mask_scale_method disagrees with the recorded "
+                    "SAM and source frames"
+                )
     # Stated terms are law in every schema: present term fields must
     # equal the contract exactly; the current schema must state them.
     for name, expected in _RECEIPT_TERMS.items():

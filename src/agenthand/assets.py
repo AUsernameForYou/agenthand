@@ -101,6 +101,35 @@ def pixel_hash_of_image(image) -> str:
     return hashlib.sha256(image.convert("RGBA").tobytes()).hexdigest()
 
 
+# PNG text key carrying a mask asset's provenance JSON (source frame,
+# SAM frame, scale method), written by cut_out and read by draw's
+# receipt builder.
+MASK_PROVENANCE_PNG_KEY = "agenthand_mask_provenance"
+
+
+def png_text_of_bytes(data: bytes) -> dict[str, str]:
+    """The text chunks embedded in PNG bytes ({} when none / not a PNG).
+
+    Mask assets carry their provenance (source frame, SAM frame, scale
+    method) as a PNG text chunk written at cut_out time, inside the
+    file whose hashes the asset record pins — so the provenance is as
+    tamper-evident as the mask itself and travels with the file, no
+    sidecar to lose or desync. Reading is best-effort by design: a
+    mask written before provenance existed simply has no chunk.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(BytesIO(data)) as img:
+            if img.format != "PNG":
+                return {}
+            img.load()
+            text = getattr(img, "text", None) or {}
+            return {str(k): str(v) for k, v in dict(text).items()}
+    except Exception:
+        return {}
+
+
 def icc_profile_of_image(image) -> bytes | None:
     """The image's embedded ICC profile bytes, or None if it has none."""
     info = getattr(image, "info", None) or {}

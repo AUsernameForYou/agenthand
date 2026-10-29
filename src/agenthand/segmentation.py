@@ -22,7 +22,9 @@ asset store:
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
+from io import BytesIO
 
 import cv2
 import numpy as np
@@ -35,6 +37,117 @@ from .sam_masks import DecodedMask, SamOutputError, parse_sam_masks
 MIN_COVERAGE = 0.001  # below this the mask is effectively empty
 MAX_COVERAGE = 0.98  # at or above this the "mask" is ~the whole frame
 MIN_DOMINANT_FRACTION = 0.75  # largest component / mask pixels
+
+# The SAM working-resolution cap (decision 68). SAM is sent the stored
+# photo as-is up to this many pixels; past it, only the SAM-bound copy
+# is downscaled (prepare_sam_png) and the returned mask is mapped back
+# onto the full frame (map_mask_to_frame) before anything is cut.
+#
+# The number is the pipeline's proven envelope, not a guessed provider
+# limit: every still the room runs ever sent SAM was 1206x1608 =
+# 1,939,248 px (dozens of accepted calls across the v1/v2, narrated,
+# and acceptance runs in both builds, plus the M5 working-resolution
+# pass), and every video frame was 720x1280, below it. The failure this
+# cap answers is measured too: the 4284x5712 (24 MP) original of
+# IMG_1340 drew HTTP 413 from SAM's /responses endpoint (M5 live
+# proof). The cap math below maps that exact original back onto
+# 1206x1608, the frame size already proven live.
+SAM_MAX_PIXELS = 1_939_248  # 1206 * 1608
+
+# Mask provenance values recorded on the mask asset and in draw's
+# receipt. "none": SAM saw the source frame itself, the mask needed no
+# mapping. "bilinear_threshold_128": SAM saw a downscaled copy and its
+# mask was mapped back onto the source frame by a bilinear resize
+# thresholded at 128 (Fable's masking detail from the M5 junction
+# Gauntlet: bilinear on the soft mask + threshold, never nearest on
+# binary, so the mapped edge is a measured blend, not a guess).
+MASK_SCALE_NONE = "none"
+MASK_SCALE_BILINEAR_THRESHOLD = "bilinear_threshold_128"
+
+
+def sam_frame_size(
+    width: int, height: int, max_pixels: int | None = None
+) -> tuple[int, int]:
+    """The frame SAM sees for a source of (width, height).
+
+    Unchanged when the source fits the working cap; otherwise the
+    largest same-aspect frame that fits it. The decrement loop after
+    the float math keeps the result inside the cap even when rounding
+    lands a pixel over, and makes the answer an integer fact both
+    builds reproduce exactly. The cap default resolves at call time
+    (not def time) so the module constant stays the single knob.
+    """
+    if max_pixels is None:
+        max_pixels = SAM_MAX_PIXELS
+    if width * height <= max_pixels:
+        return width, height
+    scale = math.sqrt(max_pixels / (width * height))
+    w = max(1, int(width * scale))
+    h = max(1, int(height * scale))
+    while w * h > max_pixels:
+        if w >= h:
+            w -= 1
+        else:
+            h -= 1
+    return w, h
+
+
+def prepare_sam_png(
+    source_image: Image.Image,
+    stored_png_bytes: bytes,
+    max_pixels: int | None = None,
+) -> dict:
+    """The SAM-bound payload for one source photo.
+
+    Returns png_bytes (what segment_image sends), sam_width /
+    sam_height (the frame the returned masks will be decoded against),
+    and scale_method (the mask-provenance value for the receipt).
+    Inside the cap the stored bytes pass through byte-identical, so
+    the common path is exactly the pre-scaling pipeline; past it, a
+    Lanczos downscale of the decoded source becomes the SAM copy. The
+    stored photo itself is never resized — the downscale exists only
+    in this payload.
+    """
+    width, height = source_image.size
+    sam_width, sam_height = sam_frame_size(width, height, max_pixels)
+    if (sam_width, sam_height) == (width, height):
+        return {
+            "png_bytes": stored_png_bytes,
+            "sam_width": width,
+            "sam_height": height,
+            "scale_method": MASK_SCALE_NONE,
+        }
+    small = source_image.convert("RGBA").resize(
+        (sam_width, sam_height), Image.LANCZOS
+    )
+    buffer = BytesIO()
+    small.save(buffer, format="PNG")
+    return {
+        "png_bytes": buffer.getvalue(),
+        "sam_width": sam_width,
+        "sam_height": sam_height,
+        "scale_method": MASK_SCALE_BILINEAR_THRESHOLD,
+    }
+
+
+def map_mask_to_frame(
+    mask_image: Image.Image, frame_width: int, frame_height: int
+) -> Image.Image:
+    """Map a SAM-frame mask onto the full source frame.
+
+    Identity when the sizes already match. Otherwise a bilinear
+    upscale of the (binary) mask, thresholded at 128 back to binary:
+    a full-frame pixel is on exactly when its bilinear sample of the
+    SAM mask is at least half on. The foreground is then cut from the
+    full-resolution source through this mask, so the receipt binds
+    full-resolution pixels, not the working copy's.
+    """
+    if mask_image.size == (frame_width, frame_height):
+        return mask_image
+    soft = mask_image.convert("L").resize(
+        (frame_width, frame_height), Image.BILINEAR
+    )
+    return soft.point(lambda v: 255 if v >= 128 else 0)
 
 
 class CutOutResultError(RuntimeError):

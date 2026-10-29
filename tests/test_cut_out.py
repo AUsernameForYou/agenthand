@@ -399,3 +399,95 @@ def test_cut_out_refuses_over_cap_before_any_api_call(monkeypatch):
     with pytest.raises(ledger.SpendCapExceeded):
         server.cut_out(_photo_uri(), "brown leather wallet")
     assert client.responses.calls == []
+
+
+# -- SAM working-resolution scaling (decision 68) ------------------------------
+#
+# A source past the proven working envelope is downscaled for SAM only;
+# the mask comes back onto the full frame and the receipt records the
+# provenance. The fixture cap is shrunk to 12 px so the 8x6 test photo
+# takes the scaled path onto a 4x3 SAM frame.
+
+# Left half of a 4x3 frame (box-local 2x3 all-ones raster), encoded with
+# the official parser package's own raster encoder, like GOOD_TEXT.
+SCALED_TEXT = (
+    "<0f>0<|box;x1=0;y1=0;x2=1;y2=2;w=4;h=3|>"
+    "<|mask;x=0;y=0;data=3,2,!!!!!&w{Dcs|>\n"
+)
+
+
+def test_cut_out_scales_oversize_source_and_maps_the_mask_back(monkeypatch):
+    from agenthand import composite, segmentation
+
+    monkeypatch.setattr(segmentation, "SAM_MAX_PIXELS", 12)
+    client = _install_fake(
+        monkeypatch, _FakeClient(sam_responses=[_sam_response(SCALED_TEXT)])
+    )
+    result = server.cut_out(_photo_uri(), "brown leather wallet")
+    assert result["status"] == "ok"
+    assert result["mask_provenance"] == {
+        "source_width": 8,
+        "source_height": 6,
+        "sam_width": 4,
+        "sam_height": 3,
+        "scale_method": "bilinear_threshold_128",
+    }
+    # The image SAM received is the 4x3 working copy, not the 8x6 photo.
+    sent_uri = client.responses.calls[0]["input"][0]["content"][1]["image_url"]
+    sent = Image.open(BytesIO(base64.b64decode(sent_uri.split(",", 1)[1])))
+    assert sent.size == (4, 3)
+    # The foreground is still the full 8x6 frame: the mapped-back mask
+    # selects the left half, byte-identical source pixels there.
+    store = AssetStore(config.get_data_dir())
+    fg = store.read_image(result["output_asset"]).load()
+    for y in range(6):
+        for x in range(4):
+            assert fg[x, y] == (200, 30, 30, 255)
+        for x in range(4, 8):
+            assert fg[x, y] == (0, 0, 0, 0)
+    # The mask asset itself is full-frame and carries the provenance in
+    # its PNG text, where the receipt builder can read it back.
+    from agenthand.assets import png_text_of_bytes
+
+    text = png_text_of_bytes(store.read_bytes(result["mask_asset"]))
+    assert json.loads(text["agenthand_mask_provenance"]) == result["mask_provenance"]
+    mask_image = store.read_image(result["mask_asset"])
+    assert mask_image.size == (8, 6)
+
+    # draw's receipt records the provenance, and the receipt verifies.
+    monkeypatch.setenv("AGENTHAND_DRAW_PLACEHOLDER_PLATE", "1")
+    drawn, _preview = server.draw(result["output_asset"], "a bright room")
+    assert drawn["status"] == "ok"
+    receipt = store.load_receipt(drawn["output_asset"])
+    assert receipt["mask_source_width"] == 8
+    assert receipt["mask_source_height"] == 6
+    assert receipt["mask_sam_width"] == 4
+    assert receipt["mask_sam_height"] == 3
+    assert receipt["mask_scale_method"] == "bilinear_threshold_128"
+    report = composite.verify_receipt_from_disk(store, drawn["output_asset"])
+    assert report["ok"], report["problems"]
+
+
+def test_cut_out_unscaled_records_none_provenance(monkeypatch):
+    client = _install_fake(
+        monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)])
+    )
+    result = server.cut_out(_photo_uri(), "brown leather wallet")
+    assert result["status"] == "ok"
+    assert result["mask_provenance"] == {
+        "source_width": 8,
+        "source_height": 6,
+        "sam_width": 8,
+        "sam_height": 6,
+        "scale_method": "none",
+    }
+    monkeypatch.setenv("AGENTHAND_DRAW_PLACEHOLDER_PLATE", "1")
+    drawn, _preview = server.draw(result["output_asset"], "a bright room")
+    store = AssetStore(config.get_data_dir())
+    receipt = store.load_receipt(drawn["output_asset"])
+    assert receipt["mask_sam_width"] == 8
+    assert receipt["mask_scale_method"] == "none"
+    from agenthand import composite
+
+    report = composite.verify_receipt_from_disk(store, drawn["output_asset"])
+    assert report["ok"], report["problems"]
