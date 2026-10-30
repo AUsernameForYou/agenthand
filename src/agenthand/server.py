@@ -187,7 +187,7 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     # the mode branches — so a refused asset never reaches the gate,
     # never leaves a reservation, and is refused the same way in both
     # modes. Raises FidelityLockError / KeyError.
-    composite.validate_foreground(store, asset)
+    composite.preflight_cut(store, asset)
     foreground_record = store.get_record(asset)
 
     def _error(code: str, message: str, **extra) -> dict:
@@ -538,7 +538,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         kind=KIND_OVERLAY,
         source_asset_id=source_record.asset_id,
     )
-    mask_review = segmentation.review_mask(full_mask)
+    mask_review = segmentation.review_mask(full_mask, source_image)
 
     return {
         "status": "ok",

@@ -193,7 +193,7 @@ def test_feathered_edge_band_is_measured_not_hidden(tmp_path):
         for i, a in enumerate((51, 102, 153, 204)):
             px[4 + i, y] = (255, 0, 0, a)
     store = AssetStore(tmp_path)
-    photo = store.put_image(_photo(), kind="source_photo")
+    photo = store.put_image(img.convert("RGB").convert("RGBA"), kind="source_photo")
     fg = store.put_image(
         img, kind="foreground_png", source_asset_id=AssetStore.parse_handle(photo)
     )
@@ -256,7 +256,7 @@ def test_alpha_250_ring_is_published_as_excluded_not_covered(tmp_path):
         for x in range(2, 4):
             px[x, y] = (255, 0, 0, 255)  # the opaque core
     store = AssetStore(tmp_path)
-    photo = store.put_image(_photo(), kind="source_photo")
+    photo = store.put_image(img.convert("RGB").convert("RGBA"), kind="source_photo")
     fg = store.put_image(
         img, kind="foreground_png", source_asset_id=AssetStore.parse_handle(photo)
     )
@@ -281,7 +281,7 @@ def test_checkerboard_foreground_survives_exactly(tmp_path):
             if (x + y) % 2 == 0:
                 px[x, y] = (10 + x * 20, 10 + y * 20, 99, 255)
     store = AssetStore(tmp_path)
-    photo = store.put_image(_photo(), kind="source_photo")
+    photo = store.put_image(img.convert("RGB").convert("RGBA"), kind="source_photo")
     fg = store.put_image(
         img, kind="foreground_png", source_asset_id=AssetStore.parse_handle(photo)
     )

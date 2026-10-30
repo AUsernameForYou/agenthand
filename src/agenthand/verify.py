@@ -188,7 +188,11 @@ def verify_files(
                         "pixels outside the three layers are present"
                     )
 
+    from .cut_quality import grade_cut
+    quality = grade_cut(source, mask) if source.size == mask.size else None
+
     return {
+        "cut_quality": quality,
         "ok": not problems,
         "source": str(source_path),
         "final": str(final_path),

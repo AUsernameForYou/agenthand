@@ -348,6 +348,29 @@ def validate_foreground(store: AssetStore, foreground_handle: str) -> list[Asset
     return chain
 
 
+class StageabilityError(FidelityLockError):
+    """A measured cut cannot be staged; no plate should be purchased."""
+    code = "RESHOOT_REQUIRED"
+
+    def __init__(self, quality: dict):
+        self.quality = quality
+        super().__init__("Reshoot required: " + "; ".join(quality["instructions"]))
+
+
+def preflight_cut(store: AssetStore, foreground_handle: str) -> dict:
+    """Read current source/alpha evidence before any plate generation."""
+    from .cut_quality import grade_cut
+    chain = validate_foreground(store, foreground_handle)
+    fg = store.read_image(foreground_handle)
+    source = store.read_image(HANDLE_PREFIX + chain[-1].asset_id)
+    if source.size != fg.size:
+        raise FidelityLockError("source and foreground frames differ")
+    quality = grade_cut(source, fg.getchannel("A"))
+    if quality["grade"] == "RESHOOT":
+        raise StageabilityError(quality)
+    return quality
+
+
 def draw_product(
     store: AssetStore,
     foreground_handle: str,
@@ -375,6 +398,7 @@ def draw_product(
     from the plate's presence: a supplied plate asset defaults to
     "model_generated", no plate asset means "local_placeholder".
     """
+    preflight_cut(store, foreground_handle)
     chain = validate_foreground(store, foreground_handle)
     record = chain[0]
     source_record = chain[-1]
@@ -1340,6 +1364,9 @@ def verify_receipt_from_disk(
         check("files_decodable", False, f"{type(exc).__name__}: {exc}")
     if decoded is not None:
         foreground, composite_image, source_image = decoded
+        if foreground.size == source_image.size:
+            from .cut_quality import grade_cut
+            recomputed["cut_quality"] = grade_cut(source_image, foreground.getchannel("A"))
         check(
             "foreground_pixel_hash",
             pixel_hash_of_image(foreground)

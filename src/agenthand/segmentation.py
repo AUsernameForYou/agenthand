@@ -265,7 +265,7 @@ def mask_overlay_image(source: Image.Image, mask_image: Image.Image) -> Image.Im
     return source_rgba
 
 
-def review_mask(mask_image: Image.Image) -> dict:
+def review_mask(mask_image: Image.Image, source: Image.Image | None = None) -> dict:
     """Sanity signals for one accepted mask, for the cut_out result.
 
     A receipt can only prove the SELECTED pixels survived; whether the
@@ -312,7 +312,10 @@ def review_mask(mask_image: Image.Image) -> dict:
                 "the selection is scattered or frame-like, review the "
                 "overlay before listing"
             )
+    from .cut_quality import grade_cut
+
     return {
+        "cut_quality": grade_cut(source, mask),
         "mask_pixels": mask_pixels,
         "coverage": round(mask_pixels / (width * height), 6) if width * height else 0.0,
         "bbox": bbox,
