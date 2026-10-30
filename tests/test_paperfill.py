@@ -369,10 +369,9 @@ def test_painted_pixel_outside_layers_fails_verification(tmp_path):
     assert report["checks"]["layer_reproduction"] is False
 
 
-def test_v2_receipt_still_grades_and_v2_with_paper_fails(tmp_path):
-    # A schema-2 receipt (pre-paper shape) keeps grading under the
-    # compatibility policy; the same receipt carrying a paper block
-    # fails the downgrade guard.
+def test_new_output_cannot_downgrade_to_v2_with_or_without_paper(tmp_path):
+    # Legacy policy is reserved for legacy output files. A stamped v4
+    # output cannot shed its policy, even when all v4 fields are removed.
     alpha = _alpha_with([(20, 70, 30, 90)])
     store, _s, _m, fg = _store_with_cut(tmp_path, _frame(), alpha)
     result = roomrun.draw_with_code_plate(store, fg, "wallpaper", paper_fill=False)
@@ -384,7 +383,8 @@ def test_v2_receipt_still_grades_and_v2_with_paper_fails(tmp_path):
     v2.pop("cut_quality")
     v2.pop("plate_quality")
     report = composite.verify_receipt_from_disk(store, handle, receipt=v2)
-    assert report["ok"] is True, report["problems"]
+    assert report["ok"] is False
+    assert not report["checks"]["output_policy_stamp"]
     smuggled = dict(v2)
     smuggled["reconstruction"] = receipt["reconstruction"]
     report = composite.verify_receipt_from_disk(store, handle, receipt=smuggled)

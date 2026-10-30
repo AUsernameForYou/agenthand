@@ -435,7 +435,7 @@ def test_draw_receipt_plate_kinds_and_verifier_acceptance(tmp_path):
 
     report = composite.verify_receipt_from_disk(store, handle)
     assert report["ok"] is True
-    # Old-shape receipts (no plate_kind / backdrop) keep passing.
+    # Stripping fields from a stamped v4 output cannot select legacy policy.
     stripped = dict(rendered)
     stripped["receipt_schema"] = 3
     stripped.pop("cut_quality")
@@ -444,7 +444,8 @@ def test_draw_receipt_plate_kinds_and_verifier_acceptance(tmp_path):
     stripped.pop("plate_kind")
     stripped.pop("backdrop")
     report = composite.verify_receipt_from_disk(store, handle, receipt=stripped)
-    assert report["ok"] is True
+    assert report["ok"] is False
+    assert not report["checks"]["output_policy_stamp"]
 
     gray = roomrun.draw_with_code_plate(store, fg, "studio_gray")
     assert gray["fidelity_receipt"]["backdrop"] == {"kind": "studio_gray"}

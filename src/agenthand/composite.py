@@ -55,6 +55,7 @@ from .assets import (
     icc_profile_of_image,
     pixel_hash_of_image,
     png_text_of_bytes,
+    COMPOSITE_POLICY_PNG_KEY,
 )
 from .paperfill import REGION_CLASS_CODES
 
@@ -643,8 +644,14 @@ def draw_product(
             "refuses such receipts. Draw refuses under the same "
             "contract instead of issuing a receipt that cannot pass."
         )
+    from . import cut_quality
+
     composite_handle = store.put_image(
-        composite, kind=KIND_COMPOSITE, source_asset_id=record.asset_id
+        composite, kind=KIND_COMPOSITE, source_asset_id=record.asset_id,
+        png_text={COMPOSITE_POLICY_PNG_KEY: json.dumps({
+            "receipt_schema": RECEIPT_SCHEMA_VERSION,
+            "cut_quality_version": cut_quality.VERSION,
+        }, sort_keys=True)},
     )
     composite_record = store.get_record(composite_handle)
 
@@ -1366,6 +1373,31 @@ def verify_receipt_from_disk(
         return report()
 
     composite_record = store.get_record(composite_handle)
+    # The policy marker travels inside the hash-pinned delivered PNG, so
+    # deleting every v4 receipt field cannot opt that output into legacy rules.
+    text = png_text_of_bytes(store.read_bytes(composite_handle))
+    if COMPOSITE_POLICY_PNG_KEY in text:
+        try:
+            policy = json.loads(text[COMPOSITE_POLICY_PNG_KEY])
+            stamp_schema = policy["receipt_schema"]
+            supplied_schema = receipt.get("receipt_schema", 1)
+            valid = type(stamp_schema) is int and type(supplied_schema) is int and supplied_schema >= stamp_schema
+            if stamp_schema >= 4:
+                valid = valid and policy["cut_quality_version"] == receipt.get("cut_quality", {}).get("version")
+        except (TypeError, ValueError, KeyError):
+            valid = False
+        check("output_policy_stamp", valid, "receipt policy disagrees with the delivered PNG stamp")
+        if not valid:
+            return report()
+    persisted = store.load_receipt(composite_handle)
+    if persisted is not None:
+        stored_schema = persisted.get("receipt_schema", 1)
+        supplied_schema = receipt.get("receipt_schema", 1)
+        valid = type(stored_schema) is int and type(supplied_schema) is int and supplied_schema >= stored_schema
+        check("persisted_receipt_policy", valid, "supplied receipt downgrades the persisted policy")
+        if not valid:
+            return report()
+
     foreground_handle = receipt["foreground_asset"]
     source_handle = receipt["source_asset"]
 

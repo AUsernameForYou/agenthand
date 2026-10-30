@@ -112,6 +112,7 @@ def pixel_hash_of_image(image) -> str:
 # SAM frame, scale method), written by cut_out and read by draw's
 # receipt builder.
 MASK_PROVENANCE_PNG_KEY = "agenthand_mask_provenance"
+COMPOSITE_POLICY_PNG_KEY = "agenthand_composite_policy"
 
 
 def png_text_of_bytes(data: bytes) -> dict[str, str]:
@@ -331,6 +332,7 @@ class AssetStore:
         *,
         kind: str,
         source_asset_id: str | None = None,
+        png_text: dict[str, str] | None = None,
     ) -> str:
         """Store a PIL Image as a PNG asset; returns its asset:// handle.
 
@@ -341,11 +343,14 @@ class AssetStore:
         icc = icc_profile_of_image(image)
         converted = image.convert("RGBA")
         buffer = BytesIO()
+        from PIL.PngImagePlugin import PngInfo
+        metadata = PngInfo()
+        for key, value in (png_text or {}).items():
+            metadata.add_text(key, value)
+        kwargs = {"pnginfo": metadata} if png_text else {}
         if icc is not None:
-            converted.info["icc_profile"] = icc
-            converted.save(buffer, format="PNG", icc_profile=icc)
-        else:
-            converted.save(buffer, format="PNG")
+            kwargs["icc_profile"] = icc
+        converted.save(buffer, format="PNG", **kwargs)
         return self.put_bytes(
             buffer.getvalue(), kind=kind, suffix=".png", source_asset_id=source_asset_id
         )

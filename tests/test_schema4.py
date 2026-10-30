@@ -50,19 +50,49 @@ def test_schema4_downgrade_guard(tmp_path, schema):
 
 @pytest.mark.parametrize("version", [2, 3])
 def test_legacy_receipt_policies_still_verify(tmp_path, version):
-    store, h, r = _small_run(tmp_path)
-    r = deepcopy(r)
-    r["receipt_schema"] = version
-    r.pop("cut_quality")
-    r.pop("plate_quality")
-    if version == 2:
-        r.pop("reconstruction")
-    else:
-        for field in ("policy_version", "max_fraction", "attempted"):
-            r["reconstruction"].pop(field)
-    result = composite.verify_receipt_from_disk(store, h, r)
+    from pathlib import Path
+    import hashlib
+    import shutil
+    fixture = Path(__file__).parent / "fixtures" / "legacy" / f"schema{version}"
+    manifest = json.loads((fixture / "fixture.json").read_text())
+    shutil.copytree(fixture, tmp_path, dirs_exist_ok=True)
+    data = (tmp_path/manifest["receipt_file"]).read_bytes()
+    assert hashlib.sha256(data).hexdigest() == manifest["receipt_sha256"]
+    assert json.loads(data)["receipt_schema"] == version
+    store = AssetStore(tmp_path)
+    result = composite.verify_receipt_from_disk(store, manifest["output_asset"])
     assert result["ok"], result["problems"]
     assert "plate_quality_recomputed" not in result["checks"]
+
+
+@pytest.mark.parametrize("schema", [None, 1, 2, 3])
+@pytest.mark.parametrize("persisted", [False, True])
+def test_fully_stripped_v4_cannot_verify_under_legacy_policy(tmp_path, schema, persisted):
+    from agenthand.assets import COMPOSITE_POLICY_PNG_KEY, png_text_of_bytes
+    store, h, r = _small_run(tmp_path)
+    stamp = json.loads(png_text_of_bytes(store.read_bytes(h))[COMPOSITE_POLICY_PNG_KEY])
+    assert stamp["receipt_schema"] == 4
+    if not persisted:
+        store.receipt_path(h).unlink()
+    r = deepcopy(r)
+    r.pop("cut_quality")
+    r.pop("plate_quality")
+    if schema == 3:
+        for field in ("policy_version", "max_fraction", "attempted"):
+            r["reconstruction"].pop(field)
+    else:
+        r.pop("reconstruction")
+    if schema is None:
+        for field in composite._V2_ONLY_FIELDS:
+            r.pop(field, None)
+        r.pop("receipt_schema")
+    else:
+        r["receipt_schema"] = schema
+    result = composite.verify_receipt_from_disk(store, h, r)
+    assert not result["ok"]
+    if schema != 1:  # Explicit schema 1 is already invalid by contract.
+        assert result["checks"]["receipt_shape"]
+        assert result["checks"].get("output_policy_stamp") is False
 
 
 @pytest.mark.parametrize(
