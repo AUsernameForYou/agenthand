@@ -395,7 +395,14 @@ def test_backdrop_info_matches_the_contract():
 
 def _store_with_foreground(tmp_path):
     store = AssetStore(tmp_path)
-    photo = store.put_image(Image.new("RGBA", (48, 36), (90, 90, 90, 255)), kind="source_photo")
+    # The photo contains the object; the foreground is cut from it,
+    # so its opaque pixels are the photo's own (the verifier checks).
+    photo_img = Image.new("RGBA", (48, 36), (90, 90, 90, 255))
+    px = photo_img.load()
+    for y in range(36):
+        for x in range(20):
+            px[x, y] = (200, 30, 30, 255)
+    photo = store.put_image(photo_img, kind="source_photo")
     fg_img = Image.new("RGBA", (48, 36), (0, 0, 0, 0))
     px = fg_img.load()
     for y in range(36):
@@ -457,11 +464,15 @@ class RealBackdropChain:
                 "status": "error",
                 "error": {"code": "NO_MATCH", "message": "not here", "cost_counted_usd": 0.0},
             }
-        fg_img = Image.new("RGBA", (48, 36), (0, 0, 0, 0))
-        px = fg_img.load()
-        for y in range(36):
+        # Foreground cut from the ingested photo's own pixels.
+        source = self.store.read_image(handle).convert("RGBA")
+        fg_img = Image.new("RGBA", source.size, (0, 0, 0, 0))
+        spx = source.load()
+        fpx = fg_img.load()
+        for y in range(source.size[1]):
             for x in range(20):
-                px[x, y] = (200, 30, 30, 255)
+                r, g, b, _a = spx[x, y]
+                fpx[x, y] = (r, g, b, 255)
         fg = self.store.put_image(
             fg_img,
             kind="foreground_png",

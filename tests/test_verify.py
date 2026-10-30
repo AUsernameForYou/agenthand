@@ -704,3 +704,110 @@ def test_new_receipts_carry_the_schema_marker(tmp_path):
     assert receipt["opaque_alpha_threshold"] == 255
     assert receipt["pixel_tolerance"] == 0
     assert receipt["count_sample"] == "decoded_delivered_file"
+
+
+# -- verify_files: the paper-fill layer ----------------------------------
+
+
+def _export_paper_run(tmp_path):
+    """A run with a real paper layer through the production path.
+
+    The mask's product block has an enclosed hole; paperfill renders
+    the layer; composite_images stacks plate, paper, product.
+    """
+    import numpy as np
+
+    from agenthand import paperfill
+
+    photo = _pattern_photo(size=(48, 36))
+    mask = Image.new("L", (48, 36), 0)
+    px = mask.load()
+    for y in range(6, 30):
+        for x in range(8, 40):
+            px[x, y] = 255
+    for y in range(14, 22):
+        for x in range(20, 28):
+            px[x, y] = 0  # enclosed hole in the product block
+    foreground = segmentation.extract_foreground(photo, mask)
+    alpha = np.asarray(foreground.getchannel("A"))
+    src_rgb = np.asarray(photo.convert("RGB"))
+    regions, _refusals, _gaps = paperfill.detect_regions(src_rgb, alpha)
+    layer, _map, _u = paperfill.render_reconstruction(src_rgb, alpha, regions)
+    plate = Image.new("RGBA", photo.size, (245, 245, 245, 255))
+    final, _counts, _t = composite.composite_images(foreground, plate, layer)
+    paths = {}
+    for name, img in (
+        ("source", photo),
+        ("final", final),
+        ("mask", mask),
+        ("layer", layer),
+        ("plate", plate),
+    ):
+        path = tmp_path / f"{name}.png"
+        img.save(path, format="PNG")
+        paths[name] = path
+    return paths
+
+
+def test_verify_files_without_layer_reports_non_product_unverified(tmp_path):
+    paths, _checked = _export_run(tmp_path)
+    report = verify.verify_files(paths["source"], paths["final"], paths["mask"])
+    assert report["ok"] is True
+    # The three-file check vouches for product pixels only, and now
+    # says so instead of implying the whole frame was verified.
+    assert report["non_product_pixels_verified"] is False
+    assert report["reconstruction_pixels"] is None
+
+
+def test_verify_files_with_layer_and_plate_verifies_non_product(tmp_path):
+    paths = _export_paper_run(tmp_path)
+    report = verify.verify_files(
+        paths["source"],
+        paths["final"],
+        paths["mask"],
+        reconstruction_path=paths["layer"],
+        plate_path=paths["plate"],
+    )
+    assert report["ok"] is True, report["problems"]
+    assert report["non_product_pixels_verified"] is True
+    assert report["recomposite_identical"] is True
+    assert report["reconstruction_pixels"] > 0
+    assert report["reconstruction_overlap_product_pixels"] == 0
+
+
+def test_verify_files_detects_paper_on_the_product(tmp_path):
+    paths = _export_paper_run(tmp_path)
+
+    def paint(img):
+        px = img.load()
+        px[10, 10] = (0, 175, 225, 255)  # inside the mask block
+
+    _rewrite_png(paths["layer"], paint)
+    report = verify.verify_files(
+        paths["source"],
+        paths["final"],
+        paths["mask"],
+        reconstruction_path=paths["layer"],
+        plate_path=paths["plate"],
+    )
+    assert report["ok"] is False
+    assert report["reconstruction_overlap_product_pixels"] > 0
+
+
+def test_verify_files_detects_a_pixel_no_layer_explains(tmp_path):
+    paths = _export_paper_run(tmp_path)
+
+    def paint(img):
+        px = img.load()
+        px[0, 0] = (1, 2, 3, 255)  # outside the product entirely
+
+    _rewrite_png(paths["final"], paint)
+    report = verify.verify_files(
+        paths["source"],
+        paths["final"],
+        paths["mask"],
+        reconstruction_path=paths["layer"],
+        plate_path=paths["plate"],
+    )
+    assert report["ok"] is False
+    assert report["recomposite_identical"] is False

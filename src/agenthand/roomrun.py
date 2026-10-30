@@ -947,7 +947,14 @@ def _run_verification(ctx: "_RunContext", composite_handle: str) -> dict:
     }
 
 
-def draw_with_code_plate(store: AssetStore, foreground_handle: str, stage_mode: str) -> dict:
+def draw_with_code_plate(
+    store: AssetStore,
+    foreground_handle: str,
+    stage_mode: str,
+    *,
+    paper_fill: bool = True,
+    occluder_mask_handles: tuple[str, ...] = (),
+) -> dict:
     """Backdrop-mode draw: render the plate in code, store it, draw.
 
     No model call and no billed call: the plate is rendered at the
@@ -955,12 +962,32 @@ def draw_with_code_plate(store: AssetStore, foreground_handle: str, stage_mode: 
     composite.draw_product as the plate handle, so the Fidelity Lock
     receipt pins the plate's hashes and carries the code-rendered
     backdrop description. Returns the chain's draw-result shape.
+
+    Paper fill (decision 93) is on by default here: before the draw,
+    paperfill.build_reconstruction renders the motif-paper layer for
+    the cut's empty regions from the stored source and mask, and the
+    draw composites plate, paper, product. A receipt that comes back
+    with changed product pixels, paper overlapping the product, or a
+    broken colour profile is a FIDELITY_VIOLATION error result, not
+    a staged item — this path used to return ok unconditionally.
     """
     from . import composite
 
     foreground = store.read_image(foreground_handle)
     plate = backdrop.render_plate(stage_mode, foreground.width, foreground.height)
     plate_handle = store.put_image(plate, kind=KIND_PLATE)
+    recon_kwargs: dict = {}
+    if paper_fill:
+        from . import paperfill
+
+        report = paperfill.build_reconstruction(
+            store, foreground_handle, occluder_mask_handles=occluder_mask_handles
+        )
+        recon_kwargs = {
+            "reconstruction_handle": report.get("layer_handle"),
+            "region_map_handle": report.get("region_map_handle"),
+            "reconstruction_report": report,
+        }
     handle, receipt = composite.draw_product(
         store,
         foreground_handle,
@@ -968,12 +995,37 @@ def draw_with_code_plate(store: AssetStore, foreground_handle: str, stage_mode: 
         plate_handle=plate_handle,
         plate_kind="code_rendered",
         backdrop=backdrop.backdrop_info(stage_mode),
+        **recon_kwargs,
     )
+    recon = receipt.get("reconstruction") or {}
+    if (
+        receipt["changed_opaque_pixels"] != 0
+        or recon.get("reconstruction_overlap_product_pixels") != 0
+        or receipt["color_profile_preserved"] is not True
+    ):
+        return {
+            "status": "error",
+            "error": {
+                "code": "FIDELITY_VIOLATION",
+                "message": (
+                    "the backdrop draw's receipt does not hold: "
+                    f"changed_opaque_pixels={receipt['changed_opaque_pixels']}, "
+                    "reconstruction_overlap_product_pixels="
+                    f"{recon.get('reconstruction_overlap_product_pixels')}, "
+                    "color_profile_preserved="
+                    f"{receipt['color_profile_preserved']}"
+                ),
+                "fidelity_receipt": receipt,
+            },
+            "output_asset": handle,
+            "fidelity_receipt": receipt,
+        }
     return {
         "status": "ok",
         "output_asset": handle,
         "plate_asset": plate_handle,
         "fidelity_receipt": receipt,
+        "reconstruction": recon,
         "cost_usd": 0.0,
     }
 

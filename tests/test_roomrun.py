@@ -555,8 +555,8 @@ def test_verifier_that_cannot_run_fails_the_item_not_the_room(tmp_path):
 class RealDrawChain:
     """identify/cut_out faked, draw REAL (composite.draw_product).
 
-    The foreground is lineage-correct (parented to the ingested
-    source photo), so draw runs the production compositor and
+    The foreground is cut from the ingested photo's own pixels and
+    parented to it, so draw runs the production compositor and
     persists a production receipt — and run_room's DEFAULT verifier
     (composite.verify_receipt_from_disk) grades it from disk.
     """
@@ -574,12 +574,19 @@ class RealDrawChain:
                 "status": "error",
                 "error": {"code": "NO_MATCH", "message": "not here", "cost_counted_usd": 0.0},
             }
-        fg_img = Image.new("RGBA", (48, 36), (0, 0, 0, 0))
-        px = fg_img.load()
-        for y in range(36):
+        # The foreground is cut from the ingested photo's own pixels
+        # (left 20 columns opaque, one edge column at half alpha),
+        # as the real cut_out's foreground is.
+        source = self.store.read_image(handle).convert("RGBA")
+        fg_img = Image.new("RGBA", source.size, (0, 0, 0, 0))
+        spx = source.load()
+        fpx = fg_img.load()
+        for y in range(source.size[1]):
             for x in range(20):
-                px[x, y] = (200, 30, 30, 255)
-            px[20, y] = (0, 200, 30, 128)
+                r, g, b, _a = spx[x, y]
+                fpx[x, y] = (r, g, b, 255)
+            r, g, b, _a = spx[20, y]
+            fpx[20, y] = (r, g, b, 128)
         fg = self.store.put_image(
             fg_img,
             kind="foreground_png",

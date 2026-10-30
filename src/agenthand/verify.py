@@ -21,6 +21,14 @@ mismatch fails verification even when every compared pixel matches.
 
 Exit code 0 when verification passes, 1 when it fails; the JSON
 report prints either way.
+
+With --reconstruction LAYER (and --plate PLATE), the paper-fill
+layer is checked too: no paper pixel may sit under the product mask,
+and with the plate supplied the delivered file must equal plate,
+then paper, then product recomposited exactly — the only way the
+non-product pixels become verified rather than merely unexamined.
+The report's ``non_product_pixels_verified`` is true only when that
+recomposite identity was actually checked.
 """
 
 from __future__ import annotations
@@ -31,7 +39,7 @@ import sys
 from pathlib import Path
 
 import numpy as np
-from PIL import Image
+from PIL import Image, ImageOps
 
 from .assets import (
     color_profile_sha256_of_image,
@@ -51,7 +59,11 @@ def _load_rgba(path: str | Path) -> Image.Image:
 
 
 def verify_files(
-    source_path: str | Path, final_path: str | Path, mask_path: str | Path
+    source_path: str | Path,
+    final_path: str | Path,
+    mask_path: str | Path,
+    reconstruction_path: str | Path | None = None,
+    plate_path: str | Path | None = None,
 ) -> dict:
     """Verify an exported composite against its source photo and mask.
 
@@ -121,6 +133,61 @@ def verify_files(
             "identical pixel values would display as different colours"
         )
 
+    # Paper-fill layer checks (only when the layer file is supplied):
+    # the overlap count binds paper to the empty region, and the
+    # recomposite identity — plate, then paper, then the product cut
+    # from the source by the mask — is what promotes the rest of the
+    # frame from unexamined to verified.
+    reconstruction_pixels = None
+    reconstruction_overlap = None
+    recomposite_identical = None
+    non_product_pixels_verified = False
+    if reconstruction_path is not None:
+        recon = _load_rgba(reconstruction_path)
+        if recon.size != source.size:
+            problems.append(
+                f"reconstruction layer is {recon.size}, source is "
+                f"{source.size}; paper is rendered on the product's frame"
+            )
+        else:
+            recon_alpha = np.frombuffer(
+                recon.getchannel("A").tobytes(), dtype=np.uint8
+            )
+            mask_values = np.frombuffer(mask.tobytes(), dtype=np.uint8)
+            paper = recon_alpha > 0
+            reconstruction_pixels = int(np.count_nonzero(paper))
+            reconstruction_overlap = int(
+                np.count_nonzero(paper & (mask_values > 0))
+            )
+            if reconstruction_overlap:
+                problems.append(
+                    f"reconstruction places paper on "
+                    f"{reconstruction_overlap} pixels inside the "
+                    "product mask; paper may only fill where the cut "
+                    "is empty"
+                )
+            if plate_path is not None and not problems:
+                plate = _load_rgba(plate_path)
+                fitted = (
+                    plate
+                    if plate.size == source.size
+                    else ImageOps.fit(plate, source.size)
+                )
+                foreground = source.copy()
+                foreground.putalpha(mask)
+                rebuilt = Image.alpha_composite(
+                    Image.alpha_composite(fitted, recon), foreground
+                )
+                recomposite_identical = rebuilt.tobytes() == final.tobytes()
+                if recomposite_identical:
+                    non_product_pixels_verified = True
+                else:
+                    problems.append(
+                        "the final image is not the exact composite "
+                        "of plate, reconstruction layer, and product; "
+                        "pixels outside the three layers are present"
+                    )
+
     return {
         "ok": not problems,
         "source": str(source_path),
@@ -133,6 +200,10 @@ def verify_files(
         "color_profile_source_sha256": source_profile,
         "color_profile_output_sha256": output_profile,
         "color_profile_preserved": color_profile_preserved,
+        "reconstruction_pixels": reconstruction_pixels,
+        "reconstruction_overlap_product_pixels": reconstruction_overlap,
+        "recomposite_identical": recomposite_identical,
+        "non_product_pixels_verified": non_product_pixels_verified,
         "problems": problems,
     }
 
@@ -149,9 +220,26 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("source", help="the source product photo (exported asset)")
     parser.add_argument("final", help="the delivered composite image")
     parser.add_argument("mask", help="the cut_out mask PNG")
+    parser.add_argument(
+        "--reconstruction",
+        help="the paper-fill reconstruction layer PNG (optional); "
+        "when given, paper overlap with the product mask is checked",
+    )
+    parser.add_argument(
+        "--plate",
+        help="the background plate image (optional); with "
+        "--reconstruction, the final must recomposite exactly from "
+        "plate, paper, and product",
+    )
     args = parser.parse_args(argv)
 
-    report = verify_files(args.source, args.final, args.mask)
+    report = verify_files(
+        args.source,
+        args.final,
+        args.mask,
+        reconstruction_path=args.reconstruction,
+        plate_path=args.plate,
+    )
     print(json.dumps(report, indent=2, sort_keys=True))
     return 0 if report["ok"] else 1
 

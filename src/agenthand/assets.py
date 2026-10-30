@@ -54,6 +54,13 @@ KIND_MASK = "mask_png"
 KIND_PLATE = "background_plate"
 KIND_COMPOSITE = "composite"
 KIND_OVERLAY = "mask_overlay"
+# Paper-fill reconstruction (decision 93): a code-rendered paper layer
+# and its region map. Neither kind may ever appear in a foreground's
+# ancestry — validate_foreground's chain-shape rule refuses them as
+# product evidence, which is the point: reconstruction is disclosed,
+# never receipted as real.
+KIND_RECONSTRUCTION = "reconstruction_layer"
+KIND_REGION_MAP = "reconstruction_region_map"
 
 
 def _register_image_openers() -> None:

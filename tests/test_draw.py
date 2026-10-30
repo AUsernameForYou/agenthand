@@ -91,10 +91,17 @@ def _install_fake(monkeypatch, client: _FakeClient) -> _FakeClient:
 
 
 def _seed_foreground(store: AssetStore) -> str:
-    """A 6x4 foreground: opaque red block, one edge column, transparent rest."""
-    photo = store.put_image(
-        Image.new("RGBA", (6, 4), (90, 90, 90, 255)), kind="source_photo"
-    )
+    """A 6x4 foreground cut from its photo: opaque red block, one edge
+    column, transparent rest. The foreground's opaque pixels ARE the
+    photo's pixels, as a real cut_out foreground's are (the verifier
+    checks exactly that)."""
+    photo_img = Image.new("RGBA", (6, 4), (90, 90, 90, 255))
+    px = photo_img.load()
+    for y in range(4):
+        for x in range(3):
+            px[x, y] = (255, 0, 0, 255)
+        px[3, y] = (0, 255, 0, 255)
+    photo = store.put_image(photo_img, kind="source_photo")
     fg_img = Image.new("RGBA", (6, 4), (0, 0, 0, 0))
     px = fg_img.load()
     for y in range(4):

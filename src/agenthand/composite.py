@@ -42,6 +42,8 @@ from .assets import (
     KIND_FOREGROUND,
     KIND_MASK,
     KIND_PLATE,
+    KIND_RECONSTRUCTION,
+    KIND_REGION_MAP,
     KIND_SOURCE,
     MASK_PROVENANCE_PNG_KEY,
     AssetIntegrityError,
@@ -54,6 +56,7 @@ from .assets import (
     pixel_hash_of_image,
     png_text_of_bytes,
 )
+from .paperfill import REGION_CLASS_CODES
 
 # A foreground pixel counts as product only at exactly this alpha. The
 # threshold is named in every receipt so the claim's terms are pinned,
@@ -72,8 +75,11 @@ COUNT_SAMPLE = "decoded_delivered_file"
 # Receipt schema marker, stamped by draw_product. Receipts without it
 # are the historical v1 shape (the frozen 2026-10-26 replay package
 # is the live example) and are graded under the compatibility policy
-# documented in _validate_receipt.
-RECEIPT_SCHEMA_VERSION = 2
+# documented in _validate_receipt. Schema 3 adds the required
+# paper-fill reconstruction block (decision 93; the paper-fill
+# Gauntlet: a receipt that cannot account for its non-product pixels
+# does not pass).
+RECEIPT_SCHEMA_VERSION = 3
 
 
 class FidelityLockError(RuntimeError):
@@ -198,12 +204,59 @@ def _measure(foreground: Image.Image, composite: Image.Image) -> dict:
     }
 
 
+def _measure_reconstruction(foreground: Image.Image, layer: Image.Image) -> dict:
+    """Count paper pixels and their overlap with the product layer.
+
+    Paper is measured against EVERY foreground pixel with alpha > 0,
+    not just the opaque set: the edge band blends with whatever sits
+    under it, so paper under a partial-alpha pixel would change the
+    delivered product edge while the opaque recount stayed silent.
+    The overlap must be 0 for a receipt to hold.
+    """
+    fg_alpha = np.frombuffer(foreground.getchannel("A").tobytes(), dtype=np.uint8)
+    layer_alpha = np.frombuffer(layer.getchannel("A").tobytes(), dtype=np.uint8)
+    paper = layer_alpha > 0
+    return {
+        "reconstruction_pixels": int(np.count_nonzero(paper)),
+        "reconstruction_overlap_product_pixels": int(
+            np.count_nonzero(paper & (fg_alpha > 0))
+        ),
+    }
+
+
 def composite_images(
-    foreground: Image.Image, plate: Image.Image
+    foreground: Image.Image,
+    plate: Image.Image,
+    reconstruction: Image.Image | None = None,
 ) -> tuple[Image.Image, dict, list[str]]:
-    """Composite a foreground over a plate; returns (image, counts, transforms)."""
+    """Composite a foreground over a plate; returns (image, counts, transforms).
+
+    With a reconstruction layer the order is plate, then paper, then
+    the product: paper sits under the product layer and may only
+    occupy pixels the product leaves fully transparent. Any paper
+    pixel under any foreground alpha raises FidelityLockError —
+    the compositor enforces decision 93's line in code, independent
+    of how the layer was rendered.
+    """
     fg = foreground.convert("RGBA")
     fitted, transformations = _fit_plate(plate.convert("RGBA"), fg.size)
+    if reconstruction is not None:
+        layer = reconstruction.convert("RGBA")
+        if layer.size != fg.size:
+            raise FidelityLockError(
+                f"reconstruction layer is {layer.size}, foreground is "
+                f"{fg.size}; paper is rendered on the product's frame"
+            )
+        overlap = _measure_reconstruction(fg, layer)[
+            "reconstruction_overlap_product_pixels"
+        ]
+        if overlap:
+            raise FidelityLockError(
+                f"reconstruction layer places paper on {overlap} "
+                "pixels the foreground occupies; paper may only fill "
+                "where the cut is empty (decision 93)"
+            )
+        fitted = Image.alpha_composite(fitted, layer)
     out = Image.alpha_composite(fitted, fg)
     # alpha_composite drops the foreground's ICC profile; the composite
     # must carry the product's colour profile, not the plate's silence.
@@ -303,6 +356,9 @@ def draw_product(
     plate_handle: str | None = None,
     plate_kind: str | None = None,
     backdrop: dict | None = None,
+    reconstruction_handle: str | None = None,
+    region_map_handle: str | None = None,
+    reconstruction_report: dict | None = None,
 ) -> tuple[str, dict]:
     """Composite a stored foreground into a scene; returns (handle, receipt).
 
@@ -345,6 +401,51 @@ def draw_product(
         mask_source = "foreground_alpha"
         mask_provenance = None
 
+    # Paper-fill reconstruction (decision 93): the layer must be a
+    # reconstruction asset chained to THIS foreground's mask (or to
+    # the foreground itself when the mask is its own alpha), and the
+    # region map must be chained to the layer. Anything else — a
+    # layer from another product's cut, a map without its layer —
+    # refuses here, before any pixels move.
+    layer_image = None
+    layer_record = None
+    region_map_record = None
+    if reconstruction_handle is not None:
+        layer_record = store.get_record(reconstruction_handle)
+        if layer_record.kind != KIND_RECONSTRUCTION:
+            raise FidelityLockError(
+                f"Reconstruction {reconstruction_handle!r} is kind "
+                f"{layer_record.kind!r}, not {KIND_RECONSTRUCTION}."
+            )
+        expected_parent = (
+            mask_record.asset_id if mask_record is not None else record.asset_id
+        )
+        if layer_record.source_asset_id != expected_parent:
+            raise FidelityLockError(
+                f"Reconstruction {reconstruction_handle!r} is chained "
+                "to a different cut than this foreground; paper from "
+                "another product's evidence cannot fill this frame."
+            )
+        store.verify_integrity(reconstruction_handle)
+        layer_image = store.read_image(reconstruction_handle)
+        if region_map_handle is not None:
+            region_map_record = store.get_record(region_map_handle)
+            if region_map_record.kind != KIND_REGION_MAP:
+                raise FidelityLockError(
+                    f"Region map {region_map_handle!r} is kind "
+                    f"{region_map_record.kind!r}, not {KIND_REGION_MAP}."
+                )
+            if region_map_record.source_asset_id != layer_record.asset_id:
+                raise FidelityLockError(
+                    f"Region map {region_map_handle!r} is not chained "
+                    "to the reconstruction layer it describes."
+                )
+            store.verify_integrity(region_map_handle)
+    elif region_map_handle is not None:
+        raise FidelityLockError(
+            "a region map was supplied without its reconstruction layer"
+        )
+
     if plate_handle is not None:
         plate_record = store.get_record(plate_handle)
         if plate_record.kind != KIND_PLATE:
@@ -370,7 +471,9 @@ def draw_product(
         if plate_kind is None:
             plate_kind = "local_placeholder"
 
-    composite, _in_memory_counts, transformations = composite_images(foreground, plate)
+    composite, _in_memory_counts, transformations = composite_images(
+        foreground, plate, layer_image
+    )
     if _in_memory_counts["opaque_pixels"] == 0:
         # Draw and verify share one contract (badass Gauntlet defect
         # 4): the verifier refuses a receipt covering zero opaque
@@ -398,6 +501,57 @@ def draw_product(
     counts = _measure(
         store.read_image(foreground_handle), store.read_image(composite_handle)
     )
+
+    # The reconstruction block, measured on the stored files like
+    # every other count: the layer's own pixels and their overlap
+    # with the product, recounted from disk. The report (regions,
+    # refusals, renderer) comes from the paper-fill builder; the
+    # numbers the claim rests on are measured here.
+    report = reconstruction_report or {}
+    if layer_record is not None:
+        recon_counts = _measure_reconstruction(
+            store.read_image(foreground_handle),
+            store.read_image(reconstruction_handle),
+        )
+        recon_pixels = recon_counts["reconstruction_pixels"]
+        recon_overlap = recon_counts["reconstruction_overlap_product_pixels"]
+        recon_status = "applied"
+    else:
+        if report.get("status") == "applied":
+            raise FidelityLockError(
+                "the reconstruction report claims applied paper but "
+                "no reconstruction layer was supplied"
+            )
+        recon_pixels = 0
+        recon_overlap = 0
+        recon_status = report.get("status", "none")
+        if recon_status not in ("none", "refused"):
+            raise FidelityLockError(
+                f"unknown reconstruction status {recon_status!r}"
+            )
+    recon_total = recon_pixels + counts["opaque_pixels"]
+    reconstruction_block = {
+        "status": recon_status,
+        "renderer": report.get("renderer"),
+        "layer_asset": reconstruction_handle,
+        "layer_sha256": layer_record.sha256 if layer_record else None,
+        "layer_pixel_sha256": layer_record.pixel_sha256 if layer_record else None,
+        "region_map_asset": region_map_handle,
+        "region_map_sha256": region_map_record.sha256 if region_map_record else None,
+        "region_map_pixel_sha256": (
+            region_map_record.pixel_sha256 if region_map_record else None
+        ),
+        "reconstruction_pixels": recon_pixels,
+        "reconstruction_overlap_product_pixels": recon_overlap,
+        "reconstruction_fraction": (
+            round(recon_pixels / recon_total, 6) if recon_total else 0.0
+        ),
+        "guard_ring_px": report.get("guard_ring_px"),
+        "motif": report.get("motif"),
+        "regions": report.get("regions", []),
+        "refusals": report.get("refusals", []),
+        "unfilled_gap_pixels": report.get("unfilled_gap_pixels", 0),
+    }
 
     # Colour-profile identity, source photo vs delivered composite.
     # Pixel hashes cannot see a profile change (identical values,
@@ -464,8 +618,13 @@ def draw_product(
             "The composite carries the source photo's colour profile "
             "unchanged (color_profile_preserved above); a profile "
             "change is a fidelity failure even when pixel values match."
+            " The reconstruction block accounts for every generated "
+            "paper pixel in the frame: paper is placed only where "
+            "the product layer is fully transparent, is counted "
+            "separately, and is not product evidence."
         ),
     }
+    receipt["reconstruction"] = reconstruction_block
     if mask_provenance is not None:
         # Mask provenance (decision 68): the receipt states the frame
         # the mask was cut from, the frame SAM actually saw, and how
@@ -578,6 +737,112 @@ _RECEIPT_FIELDS_V2_OPTIONAL = {
     "mask_scale_method": lambda v: v in _MASK_SCALE_METHODS,
 }
 
+# The reconstruction block's required keys (schema 3): the paper-fill
+# disclosure. Extra keys are tolerated (server enrichment adds fields
+# to receipts); every key below must be present and well-typed.
+_RECONSTRUCTION_BLOCK_KEYS = {
+    "status",
+    "renderer",
+    "layer_asset",
+    "layer_sha256",
+    "layer_pixel_sha256",
+    "region_map_asset",
+    "region_map_sha256",
+    "region_map_pixel_sha256",
+    "reconstruction_pixels",
+    "reconstruction_overlap_product_pixels",
+    "reconstruction_fraction",
+    "guard_ring_px",
+    "motif",
+    "regions",
+    "refusals",
+    "unfilled_gap_pixels",
+}
+
+
+def _is_reconstruction_block(value: object) -> bool:
+    if not isinstance(value, dict):
+        return False
+    if not _RECONSTRUCTION_BLOCK_KEYS.issubset(value):
+        return False
+    if value["status"] not in ("none", "applied", "refused"):
+        return False
+    if not (value["renderer"] is None or isinstance(value["renderer"], str)):
+        return False
+    for name in ("layer_asset", "region_map_asset"):
+        if not (value[name] is None or _is_handle(value[name])):
+            return False
+    for name in (
+        "layer_sha256",
+        "layer_pixel_sha256",
+        "region_map_sha256",
+        "region_map_pixel_sha256",
+    ):
+        if not _is_hash_or_none(value[name]):
+            return False
+    for name in (
+        "reconstruction_pixels",
+        "reconstruction_overlap_product_pixels",
+        "unfilled_gap_pixels",
+    ):
+        if not _is_count(value[name]):
+            return False
+    if not _is_fraction(value["reconstruction_fraction"]):
+        return False
+    if not (value["guard_ring_px"] is None or _is_count(value["guard_ring_px"])):
+        return False
+    motif = value["motif"]
+    if motif is not None:
+        if not isinstance(motif, dict):
+            return False
+        if not _is_count(motif.get("diameter_px")):
+            return False
+        opacity = motif.get("opacity")
+        if not isinstance(opacity, (int, float)) or isinstance(opacity, bool):
+            return False
+        if not isinstance(motif.get("color"), str):
+            return False
+    regions = value["regions"]
+    if not isinstance(regions, list):
+        return False
+    for region in regions:
+        if not isinstance(region, dict):
+            return False
+        if not _is_count(region.get("id")):
+            return False
+        if region.get("class") not in ("hole", "support", "occluder"):
+            return False
+        if not _is_count(region.get("pixels")):
+            return False
+        bbox = region.get("bbox")
+        if not (
+            isinstance(bbox, list)
+            and len(bbox) == 4
+            and all(_is_count(v) for v in bbox)
+        ):
+            return False
+        if not isinstance(region.get("provenance"), dict):
+            return False
+    refusals = value["refusals"]
+    if not isinstance(refusals, list):
+        return False
+    for refusal in refusals:
+        if not isinstance(refusal, dict):
+            return False
+        if not isinstance(refusal.get("code"), str):
+            return False
+        if not isinstance(refusal.get("detail"), str):
+            return False
+        if not _is_count(refusal.get("pixels")):
+            return False
+    return True
+
+
+# Additional fields schema 3 requires: the reconstruction block.
+_RECEIPT_FIELDS_V3 = {
+    "reconstruction": _is_reconstruction_block,
+}
+
 # Fields that exist only in the current schema (used by the
 # downgrade guard in _validate_receipt). mask_asset is excluded: v1
 # receipts name the mask asset too, they just do not pin its hashes.
@@ -625,14 +890,19 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
             terms,
         )
     schema = receipt.get("receipt_schema")
-    strict = type(schema) is int and schema == RECEIPT_SCHEMA_VERSION
-    if schema is not None and not strict:
+    if schema is None:
+        version = 1
+    elif type(schema) is int and schema in (2, RECEIPT_SCHEMA_VERSION):
+        version = schema
+    else:
+        version = 0
         shape.append(
             f"unsupported receipt_schema {schema!r}; this verifier "
-            f"grades schema {RECEIPT_SCHEMA_VERSION} receipts and "
-            "unmarked v1 receipts"
+            f"grades schema 2 and {RECEIPT_SCHEMA_VERSION} receipts "
+            "and unmarked v1 receipts"
         )
-    if not strict and any(name in receipt for name in _V2_ONLY_FIELDS):
+    strict = version >= 2
+    if version == 1 and any(name in receipt for name in _V2_ONLY_FIELDS):
         # Downgrade guard: dropping or nulling the schema marker of
         # a current receipt must not buy it the legacy policy. A
         # genuine v1 receipt carries none of the v2-only fields
@@ -643,9 +913,21 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
             "receipt_schema marker; refusing to grade it under the "
             "legacy v1 policy"
         )
+    if 0 < version < 3 and "reconstruction" in receipt:
+        # The same guard one schema up: paper disclosed on a receipt
+        # graded under the v2 policy would be carried as an ignored
+        # extra field, which is exactly the blind spot schema 3
+        # exists to close.
+        shape.append(
+            "receipt carries a reconstruction block but is not "
+            "marked schema 3; refusing to grade reconstruction "
+            "under an older policy"
+        )
     fields = dict(_RECEIPT_FIELDS_ANY_SCHEMA)
-    if strict:
+    if version >= 2:
         fields.update(_RECEIPT_FIELDS_V2)
+    if version >= 3:
+        fields.update(_RECEIPT_FIELDS_V3)
     for name, valid in fields.items():
         if name not in receipt:
             shape.append(f"missing field: {name}")
@@ -688,6 +970,51 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
         shape.append(
             "opaque_fraction is nonzero while mask_pixels_total is 0"
         )
+    if version >= 3:
+        # The reconstruction block's own arithmetic: status, assets,
+        # region counts, and the fraction must tell one story.
+        block = receipt["reconstruction"]
+        region_sum = sum(r["pixels"] for r in block["regions"])
+        if block["reconstruction_overlap_product_pixels"] != 0:
+            shape.append(
+                "reconstruction_overlap_product_pixels must be 0; "
+                "paper on product pixels is not a weaker claim, it "
+                "is a broken one"
+            )
+        if region_sum != block["reconstruction_pixels"]:
+            shape.append(
+                "reconstruction regions do not sum to "
+                "reconstruction_pixels"
+            )
+        if block["status"] == "applied":
+            if (
+                block["layer_asset"] is None
+                or block["reconstruction_pixels"] == 0
+            ):
+                shape.append(
+                    "reconstruction status is 'applied' but no "
+                    "layer asset or no paper pixels are claimed"
+                )
+            recon_total = block["reconstruction_pixels"] + receipt["opaque_pixels"]
+            expected_recon = (
+                round(block["reconstruction_pixels"] / recon_total, 6)
+                if recon_total
+                else 0.0
+            )
+            if abs(float(block["reconstruction_fraction"]) - expected_recon) > 1e-9:
+                shape.append(
+                    "reconstruction_fraction disagrees with "
+                    "reconstruction_pixels / (reconstruction_pixels "
+                    "+ opaque_pixels)"
+                )
+        elif (
+            block["layer_asset"] is not None
+            or block["reconstruction_pixels"] != 0
+        ):
+            shape.append(
+                f"reconstruction status is {block['status']!r} but "
+                "a layer asset or paper pixels are claimed"
+            )
     if strict:
         if receipt["mask_source"] == "asset" and receipt["mask_asset"] is None:
             shape.append("mask_source is 'asset' but mask_asset is null")
@@ -867,6 +1194,17 @@ def verify_receipt_from_disk(
     ]
     if receipt.get("mask_asset"):
         integrity_targets.append(("mask", receipt["mask_asset"]))
+    recon_block = receipt.get("reconstruction")
+    if not isinstance(recon_block, dict):
+        recon_block = None
+    if recon_block and recon_block.get("layer_asset"):
+        integrity_targets.append(
+            ("reconstruction_layer", recon_block["layer_asset"])
+        )
+    if recon_block and recon_block.get("region_map_asset"):
+        integrity_targets.append(
+            ("reconstruction_region_map", recon_block["region_map_asset"])
+        )
     for label, handle in integrity_targets:
         try:
             store.verify_integrity(handle)
@@ -944,6 +1282,45 @@ def verify_receipt_from_disk(
                 checks.get("mask_file_integrity", False),
                 "the mask file does not match its asset record",
             )
+
+    if recon_block and recon_block.get("layer_asset"):
+        try:
+            layer_record = store.get_record(recon_block["layer_asset"])
+            check(
+                "reconstruction_hash_matches_receipt",
+                recon_block.get("layer_sha256") == layer_record.sha256
+                and recon_block.get("layer_pixel_sha256")
+                == layer_record.pixel_sha256,
+                "the receipt's reconstruction layer hashes match the "
+                "layer asset's sidecar record"
+                if recon_block.get("layer_sha256") == layer_record.sha256
+                and recon_block.get("layer_pixel_sha256")
+                == layer_record.pixel_sha256
+                else "the receipt's reconstruction layer hashes do "
+                "not match the layer asset's sidecar record",
+            )
+        except KeyError as exc:
+            check("reconstruction_hash_matches_receipt", False, str(exc))
+        store.verify_integrity(recon_block["layer_asset"])
+    if recon_block and recon_block.get("region_map_asset"):
+        try:
+            map_record = store.get_record(recon_block["region_map_asset"])
+            check(
+                "region_map_hash_matches_receipt",
+                recon_block.get("region_map_sha256") == map_record.sha256
+                and recon_block.get("region_map_pixel_sha256")
+                == map_record.pixel_sha256,
+                "the receipt's region map hashes match the map "
+                "asset's sidecar record"
+                if recon_block.get("region_map_sha256") == map_record.sha256
+                and recon_block.get("region_map_pixel_sha256")
+                == map_record.pixel_sha256
+                else "the receipt's region map hashes do not match "
+                "the map asset's sidecar record",
+            )
+        except KeyError as exc:
+            check("region_map_hash_matches_receipt", False, str(exc))
+        store.verify_integrity(recon_block["region_map_asset"])
 
     # 2. Decode the stored files fresh from disk and recount — the
     #    receipt's numbers must reproduce. A file that cannot be
@@ -1033,6 +1410,125 @@ def verify_receipt_from_disk(
             "there is no product evidence to verify",
         )
 
+        # The stored foreground must BE the source image wherever
+        # it is fully opaque. A foreground that differs from its
+        # source, fabricated product pixels under a valid lineage,
+        # otherwise passes every check: its own hashes are
+        # self-consistent, the server-side ancestry guard reads the
+        # mask's pixels rather than the foreground's, and the
+        # composite-versus-foreground recount still reads 0 changed.
+        if foreground.size != source_image.size:
+            check(
+                "foreground_matches_source",
+                False,
+                f"foreground is {foreground.size} but the source "
+                f"photo is {source_image.size}",
+            )
+        else:
+            fg_arr = np.frombuffer(
+                foreground.tobytes(), dtype=np.uint8
+            ).reshape(-1, 4)
+            src_arr = np.frombuffer(
+                source_image.tobytes(), dtype=np.uint8
+            ).reshape(-1, 4)
+            solid = fg_arr[:, 3] == 255
+            same = bool(np.array_equal(fg_arr[solid], src_arr[solid]))
+            check(
+                "foreground_matches_source",
+                same,
+                "every fully opaque foreground pixel matches the "
+                "source photo"
+                if same
+                else "the foreground differs from the source photo "
+                "on fully opaque pixels; the product layer is not "
+                "the photograph it claims to be",
+            )
+
+        # Paper recounts: the layer's pixels and their overlap with
+        # the product, measured on the stored files, plus the region
+        # map partition: the map must cover exactly the paper, and
+        # each class's pixels must equal the receipt's per-region
+        # counts.
+        if recon_block and recon_block.get("layer_asset"):
+            try:
+                layer_image = store.read_image(recon_block["layer_asset"])
+                recounts = _measure_reconstruction(foreground, layer_image)
+                recomputed["reconstruction_pixels"] = recounts[
+                    "reconstruction_pixels"
+                ]
+                recomputed["reconstruction_overlap_product_pixels"] = (
+                    recounts["reconstruction_overlap_product_pixels"]
+                )
+                check(
+                    "recount_reconstruction_pixels",
+                    recounts["reconstruction_pixels"]
+                    == recon_block["reconstruction_pixels"],
+                    f"stored layer holds "
+                    f"{recounts['reconstruction_pixels']} paper "
+                    f"pixels; receipt says "
+                    f"{recon_block['reconstruction_pixels']}",
+                )
+                check(
+                    "recount_overlap_zero",
+                    recounts["reconstruction_overlap_product_pixels"] == 0,
+                    "no paper pixel sits under any foreground alpha"
+                    if recounts["reconstruction_overlap_product_pixels"] == 0
+                    else f"{recounts['reconstruction_overlap_product_pixels']} "
+                    "paper pixels sit under foreground alpha; paper "
+                    "there changes the delivered product edge",
+                )
+                if recon_block.get("region_map_asset"):
+                    map_values = np.frombuffer(
+                        store.read_image(recon_block["region_map_asset"])
+                        .convert("L")
+                        .tobytes(),
+                        dtype=np.uint8,
+                    )
+                    layer_alpha = np.frombuffer(
+                        layer_image.getchannel("A").tobytes(), dtype=np.uint8
+                    )
+                    partition_ok = bool(
+                        np.array_equal(map_values > 0, layer_alpha > 0)
+                    )
+                    # Per-class totals: several regions can share a
+                    # class (two legs are both supports), so the map
+                    # count for a code is graded against the SUM of
+                    # that class's region counts, and any code
+                    # outside the known set fails the partition.
+                    known_codes = list(REGION_CLASS_CODES.values())
+                    class_ok = not bool(
+                        np.count_nonzero(
+                            (map_values != 0)
+                            & ~np.isin(map_values, known_codes)
+                        )
+                    )
+                    for cls, code in REGION_CLASS_CODES.items():
+                        expected = sum(
+                            r["pixels"]
+                            for r in recon_block["regions"]
+                            if r["class"] == cls
+                        )
+                        if (
+                            int(np.count_nonzero(map_values == code))
+                            != expected
+                        ):
+                            class_ok = False
+                    check(
+                        "region_map_partition",
+                        partition_ok and class_ok,
+                        "the region map covers exactly the paper "
+                        "pixels and each class count matches"
+                        if partition_ok and class_ok
+                        else "the region map disagrees with the "
+                        "layer's paper pixels or the per-class counts",
+                    )
+            except Exception as exc:  # noqa: BLE001
+                check(
+                    "reconstruction_files_decodable",
+                    False,
+                    f"reconstruction assets could not be decoded: {exc}",
+                )
+
         # 3. Colour-profile identity, re-derived from the files: the
         #    profile the receipt names must be the profile in the
         #    files, and source and output profiles must be identical.
@@ -1056,5 +1552,48 @@ def verify_receipt_from_disk(
             "the source photo's; identical pixel values would "
             "display as different colours",
         )
+
+        # 4. Whole-delivery reproduction: rebuilding the composite
+        #    from the stored plate, the stored paper layer, and the
+        #    stored foreground must reproduce the delivered file
+        #    pixel for pixel. This is the check that makes the whole
+        #    frame accountable: any pixel painted onto the delivery
+        #    outside the three stored layers breaks the identity.
+        #    Asset plates only; a local placeholder plate carries no
+        #    asset, so the check is recorded as a named skip in the
+        #    recomputed values, never silently as a pass.
+        if receipt.get("plate_asset"):
+            try:
+                plate_image = store.read_image(receipt["plate_asset"])
+                layer_for_rebuild = (
+                    store.read_image(recon_block["layer_asset"])
+                    if recon_block and recon_block.get("layer_asset")
+                    else None
+                )
+                rebuilt, _, _ = composite_images(
+                    foreground, plate_image, layer_for_rebuild
+                )
+                reproduced = rebuilt.tobytes() == composite_image.tobytes()
+                check(
+                    "layer_reproduction",
+                    reproduced,
+                    "the delivered file equals plate, then paper, "
+                    "then product, composited from the stored layers"
+                    if reproduced
+                    else "the delivered file is not the composite of "
+                    "its stored plate, paper layer, and foreground; "
+                    "pixels outside the three layers are present",
+                )
+            except Exception as exc:  # noqa: BLE001
+                check(
+                    "layer_reproduction",
+                    False,
+                    f"rebuild from stored layers raised "
+                    f"{type(exc).__name__}: {exc}",
+                )
+        else:
+            recomputed["layer_reproduction"] = (
+                "skipped: no plate asset (local placeholder plate)"
+            )
 
     return report()
