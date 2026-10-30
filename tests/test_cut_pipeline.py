@@ -63,7 +63,9 @@ def test_ensemble_tiles_preserve_records_and_recover_observed_legs(monkeypatch):
     out = np.asarray(result["mask_image"])
     assert np.array_equal(out, truth)
     assert any(
-        c["role"] == "occluder" for r in result["records"] for c in r["components"]
+        c["role"] == "top_band_candidate"
+        for r in result["records"]
+        for c in r["components"]
     )
     assert any(
         c["role"] == "support" for r in result["records"] for c in r["components"]

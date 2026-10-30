@@ -103,9 +103,7 @@ def prepare_sam_png(
             "sam_height": height,
             "scale_method": MASK_SCALE_NONE,
         }
-    small = source_image.convert("RGBA").resize(
-        (sam_width, sam_height), Image.LANCZOS
-    )
+    small = source_image.convert("RGBA").resize((sam_width, sam_height), Image.LANCZOS)
     buffer = BytesIO()
     small.save(buffer, format="PNG")
     return {
@@ -130,9 +128,7 @@ def map_mask_to_frame(
     """
     if mask_image.size == (frame_width, frame_height):
         return mask_image
-    soft = mask_image.convert("L").resize(
-        (frame_width, frame_height), Image.BILINEAR
-    )
+    soft = mask_image.convert("L").resize((frame_width, frame_height), Image.BILINEAR)
     return soft.point(lambda v: 255 if v >= 128 else 0)
 
 
@@ -147,7 +143,14 @@ class CutOutResultError(RuntimeError):
         attempts: The full attempt trace (see run_attempts).
     """
 
-    def __init__(self, message: str, *, code: str, attempts: list[dict], records: list[dict] | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: str,
+        attempts: list[dict],
+        records: list[dict] | None = None,
+    ):
         super().__init__(message)
         self.code = code
         self.attempts = attempts
@@ -232,22 +235,15 @@ def mask_overlay_image(source: Image.Image, mask_image: Image.Image) -> Image.Im
             f"Mask {mask.size} does not cover the source frame {source_rgba.size}."
         )
     width, height = mask.size
-    on = (
-        np.frombuffer(mask.tobytes(), dtype=np.uint8).reshape(height, width) != 0
-    )
+    on = np.frombuffer(mask.tobytes(), dtype=np.uint8).reshape(height, width) != 0
     # Outline = on-pixels with a 4-neighbour off or outside the frame
     # (the zero padding stands in for "outside").
     padded = np.pad(on, 1, constant_values=False)
     surrounded = (
-        padded[:-2, 1:-1]
-        & padded[2:, 1:-1]
-        & padded[1:-1, :-2]
-        & padded[1:-1, 2:]
+        padded[:-2, 1:-1] & padded[2:, 1:-1] & padded[1:-1, :-2] & padded[1:-1, 2:]
     )
     outline = on & ~surrounded
-    outline_image = Image.fromarray(
-        (outline * 255).astype(np.uint8), mode="L"
-    )
+    outline_image = Image.fromarray((outline * 255).astype(np.uint8), mode="L")
     source_rgba.paste(OVERLAY_OUTLINE_RGBA, (0, 0), outline_image)
     return source_rgba
 
@@ -348,7 +344,7 @@ def extract_foreground(source: Image.Image, mask_image: Image.Image) -> Image.Im
     )
 
 
-PIPELINE_VERSION = 'agenthand.cut-pipeline/1'
+PIPELINE_VERSION = "agenthand.cut-pipeline/2"
 MIN_TILE_FRAME_SIDE = 128  # sub-thumbnail controls contain no native thin detail
 
 
@@ -425,7 +421,7 @@ def _classify_component(
     if overlap / area > 0.5:
         return "body"
     if cy1 <= y0 + 0.35 * bh:
-        return "occluder"
+        return "top_band_candidate"
     height = cy1 - cy0
     mean_width = area / max(1, height)
     touching = (
@@ -437,8 +433,10 @@ def _classify_component(
         and cx0 >= x0 - 0.05 * bw
         and cx1 <= x1 + 0.05 * bw
     )
-    floor = source_rgb[min(y1, body.shape[0]-1):, x0:x1]
-    observed = float(floor_contrast(source_rgb, floor.reshape(-1, 3))[binary].mean()) >= 0.65
+    floor = source_rgb[min(y1, body.shape[0] - 1) :, x0:x1]
+    observed = (
+        float(floor_contrast(source_rgb, floor.reshape(-1, 3))[binary].mean()) >= 0.65
+    )
     if (
         kind == "support"
         and in_zone

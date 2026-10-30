@@ -25,7 +25,10 @@ SUPPORT_MIN_HEIGHT_FRACTION = 0.08
 
 
 def support_min_height(body_height):
-    return max(SUPPORT_MIN_HEIGHT_PX, int(np.ceil(SUPPORT_MIN_HEIGHT_FRACTION * body_height)))
+    return max(
+        SUPPORT_MIN_HEIGHT_PX, int(np.ceil(SUPPORT_MIN_HEIGHT_FRACTION * body_height))
+    )
+
 
 # Receipt hygiene: support refusals below this size merge into one
 # record per code with summed pixels, so a noisy photo cannot flood
@@ -94,7 +97,7 @@ def repaired_alpha(alpha, paper):
     bridged = cv2.dilate(paper.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
     top = np.flatnonzero((alpha > 0).any(axis=1))
     if len(top):
-        bridged[:int(top[0])] = False
+        bridged[: int(top[0])] = False
     return ((alpha > 0) | bridged).astype(np.uint8) * 255
 
 
@@ -107,13 +110,19 @@ def floor_contrast(rgb, floor_samples):
     if not len(floor_samples):
         return np.zeros(rgb.shape[:2], bool)
     colour = np.median(floor_samples.reshape(-1, 3), axis=0)
-    values = rgb.astype(np.float32)
-    weights = np.array([0.2126, 0.7152, 0.0722])
-    luma = values @ weights
+    colour = colour.astype(np.float32)
+    weights = np.array([0.2126, 0.7152, 0.0722], dtype=np.float32)
     floor_luma = float(colour @ weights)
-    chroma = values - values.mean(axis=-1, keepdims=True)
     floor_chroma = colour - colour.mean()
-    return (np.abs(luma-floor_luma) > max(30, 0.45*floor_luma)) | (np.linalg.norm(chroma-floor_chroma, axis=-1) > 60)
+    result = np.zeros(rgb.shape[:2], bool)
+    for start in range(0, rgb.shape[0], 128):
+        values = rgb[start : start + 128].astype(np.float32)
+        luma = values @ weights
+        chroma = values - values.mean(axis=-1, keepdims=True)
+        result[start : start + 128] = (
+            np.abs(luma - floor_luma) > max(30, 0.45 * floor_luma)
+        ) | (np.linalg.norm(chroma - floor_chroma, axis=-1) > 60)
+    return result
 
 
 def resembles_product(source_rgb, product, bbox, local) -> bool:
@@ -126,13 +135,15 @@ def resembles_product(source_rgb, product, bbox, local) -> bool:
         return False
     x0, y0, x1, y1 = bbox
     pad = max(4, int(0.05 * max(product.shape)))
-    xa, ya = max(0, x0-pad), max(0, y0-pad)
-    xb, yb = min(product.shape[1], x1+pad), min(product.shape[0], y1+pad)
+    xa, ya = max(0, x0 - pad), max(0, y0 - pad)
+    xb, yb = min(product.shape[1], x1 + pad), min(product.shape[0], y1 + pad)
     samples = source_rgb[ya:yb, xa:xb][product[ya:yb, xa:xb]]
     if not len(samples):
         samples = source_rgb[product]
     colour = np.median(samples, axis=0)
-    distance = np.linalg.norm(source_rgb[y0:y1, x0:x1][local].astype(float)-colour, axis=1)
+    distance = np.linalg.norm(
+        source_rgb[y0:y1, x0:x1][local].astype(float) - colour, axis=1
+    )
     return float(np.mean(distance <= PRODUCT_COLOUR_DISTANCE)) >= PRODUCT_MATCH_FRACTION
 
 
@@ -142,7 +153,7 @@ def gap_evidence(source_rgb, alpha, body, gaps):
     h, w = body.shape
     for box, local in _components(alpha == 0):
         if box[0] and box[1] and box[2] < w and box[3] < h:
-            holes[box[1]:box[3], box[0]:box[2]] |= local
+            holes[box[1] : box[3], box[0] : box[2]] |= local
     proven = []
     for kind, candidates in (("hole", holes), ("concavity", gaps)):
         for box, local in _components(candidates):
@@ -430,32 +441,64 @@ class TypedMask:
     provenance: dict = field(default_factory=dict)
 
 
-def top_footprints(alpha: np.ndarray, occluders: list[TypedMask]) -> list[Region]:
-    """Only a bounded upper hull gap overlapped by foreign-object evidence."""
+def top_footprints(
+    alpha: np.ndarray, occluders: list[TypedMask], source_rgb=None
+) -> list[Region]:
+    """Bounded top gaps require overlapping, appearance-distinct foreign evidence.
+
+    A product-phrase top-band candidate never authorizes paper. Explicit foreign
+    masks also need source appearance at the footprint distinct from the body.
+    """
+    if source_rgb is None:
+        return []
     metrics, body, gaps = geometry(alpha)
     bx0, by0, bx1, by1 = metrics["body_bbox"]
+    holes, _ = gap_evidence(None, alpha, body, gaps)
+    holes[by0 + max(1, int(0.35 * (by1 - by0))) :] = False
     output = []
-    for box, local in _components(gaps):
-        x0, y0, x1, y1 = box
-        area = int(local.sum())
-        if (
-            area < max(12, 0.005 * metrics["mask_pixels"])
-            or area > 0.4 * metrics["mask_pixels"]
-        ):
-            continue
-        # Require real product on both flanks, not just the convex hull.
-        left = body[y0:y1, max(bx0, x0 - 4) : x0].any()
-        right = body[y0:y1, x1 : min(bx1, x1 + 4)].any()
-        if not (left and right):
-            continue
-        for occ in occluders:
-            overlap = local & occ.silhouette[y0:y1, x0:x1]
-            if int(overlap.sum()) >= 0.5 * area:
+    for kind, candidates in (("concavity", gaps), ("hole", holes)):
+        for box, local in _components(candidates):
+            x0, y0, x1, y1 = box
+            area = int(local.sum())
+            minimum = (
+                max(4, 0.0005 * metrics["mask_pixels"])
+                if kind == "hole"
+                else max(12, 0.005 * metrics["mask_pixels"])
+            )
+            if area < minimum:
+                continue
+            left = body[y0:y1, max(bx0, x0 - 4) : x0].any()
+            right = body[y0:y1, x1 : min(bx1, x1 + 4)].any()
+            if not (left and right):
+                continue
+            pad = max(4, int(0.05 * max(body.shape)))
+            xa, ya = max(0, x0 - pad), max(0, y0 - pad)
+            xb, yb = min(body.shape[1], x1 + pad), min(body.shape[0], y1 + pad)
+            samples = source_rgb[ya:yb, xa:xb][body[ya:yb, xa:xb]]
+            if not len(samples):
+                continue
+            colour = np.median(samples, axis=0)
+            for occ in occluders:
+                if occ.kind != "occluder":
+                    continue
+                overlap = local & occ.silhouette[y0:y1, x0:x1]
+                if int(overlap.sum()) < 0.5 * area:
+                    continue
+                distances = np.linalg.norm(
+                    source_rgb[y0:y1, x0:x1][local].astype(float) - colour, axis=1
+                )
+                if float(np.mean(distances > 60)) < PRODUCT_MATCH_FRACTION:
+                    continue
                 output.append(
                     Region(
                         "occluder",
                         local.copy(),
-                        {"basis": "bounded_top_footprint", "evidence": occ.provenance},
+                        {
+                            "basis": "bounded_top_footprint",
+                            "topology_kind": kind,
+                            "appearance": "distinct_from_body",
+                            "evidence": occ.provenance,
+                        },
                         bbox=box,
                     )
                 )
@@ -529,7 +572,7 @@ def typed_regions(
     touch = (
         cv2.dilate(body.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=3) > 0
     )
-    floor = source_rgb[min(by1, alpha.shape[0]-1):, bx0:bx1]
+    floor = source_rgb[min(by1, alpha.shape[0] - 1) :, bx0:bx1]
     observed_pixels = floor_contrast(source_rgb, floor.reshape(-1, 3))
     for item in supports:
         for box, local in _components(item.silhouette & (alpha == 0)):
@@ -567,7 +610,7 @@ def typed_regions(
                 )
                 unfilled += area
     regions.extend(skeleton_support_cores(source_rgb, alpha))
-    footprints = top_footprints(alpha, occluders)
+    footprints = top_footprints(alpha, occluders, source_rgb)
     regions.extend(footprints)
     for occ in occluders:
         matched = any(

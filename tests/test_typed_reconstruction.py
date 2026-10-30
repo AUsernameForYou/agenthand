@@ -24,11 +24,12 @@ def test_top_concavity_requires_foreign_evidence_and_product_flanks(tmp_path):
     a[20:38, 55:80] = 0
     occ = np.zeros_like(a, bool)
     occ[15:38, 55:80] = True
+    src[occ] = 10
     assert not top_footprints(a, [])
-    assert len(top_footprints(a, [TypedMask("occluder", occ)])) == 1
+    assert len(top_footprints(a, [TypedMask("occluder", occ)], src)) == 1
     side = np.zeros_like(a, bool)
     side[20:38, 10:25] = True
-    assert not top_footprints(a, [TypedMask("occluder", side)])
+    assert not top_footprints(a, [TypedMask("occluder", side)], src)
     store, sh, mh, fh = _store_with_cut(tmp_path, src, a)
     oh = store.put_bytes(
         _png_bytes(Image.fromarray(occ.astype("uint8") * 255)),
@@ -42,8 +43,11 @@ def test_top_concavity_requires_foreign_evidence_and_product_flanks(tmp_path):
     on = np.asarray(layer.getchannel("A")) > 0
     assert not on[:20].any()  # the foreign object above the top is not papered
     assert report["regions"][0]["provenance"]["basis"] == "bounded_top_footprint"
-    with pytest.raises(composite.StageabilityError):
-        composite.preflight_cut(store, fh)
+    assert composite.preflight_cut(store, fh)["grade"] == "PASS"
+    assert (
+        composite.preflight_cut(store, fh, occluder_mask_handles=(oh,))["grade"]
+        == "REPAIRABLE"
+    )
     assert (
         composite.preflight_cut(
             store,
@@ -116,3 +120,48 @@ def test_typed_evidence_cannot_bypass_support_count_cap():
     regions, refusals, _ = typed_regions(src, a, [TypedMask("support", support)], [])
     assert not any(r.cls == "support" for r in regions)
     assert any(r.code == "SUPPORT_COUNT_OUT_OF_RANGE" for r in refusals)
+
+
+def test_product_piece_cannot_authorize_foreign_footprint():
+    from agenthand.cut_quality import grade_cut
+    from agenthand.segmentation import _classify_component
+
+    src, a = setup_scene()
+    a[20:38, 55:80] = 0
+    piece = np.zeros_like(a, bool)
+    piece[15:38, 55:80] = True
+    body = a > 0
+    role = _classify_component(piece, body, src, (25, 20, 115, 75), "top")
+    assert role == "top_band_candidate"
+    assert not top_footprints(a, [TypedMask("occluder", piece)], src)
+    quality = grade_cut(src, a, occluders=[TypedMask("occluder", piece)])
+    assert quality["grade"] == "RESHOOT", quality
+    src[piece] = 10
+    assert not top_footprints(a, [TypedMask(role, piece)], src)
+
+
+def test_foreign_top_hole_is_a_perforation_with_bounded_paper():
+    from agenthand.cut_quality import grade_cut
+
+    src, a = setup_scene()
+    a[25:35, 55:80] = 0
+    foreign = np.zeros_like(a, bool)
+    foreign[25:35, 55:80] = True
+    src[foreign] = 10
+    evidence = [TypedMask("occluder", foreign)]
+    q = grade_cut(src, a, occluders=evidence)
+    assert q["grade"] == "REPAIRABLE" and q["codes"] == ["TOP_PERFORATED"], q
+    regions, _, _ = typed_regions(src, a, [], evidence)
+    layer, _, _ = paperfill.render_reconstruction(src, a, regions)
+    paper = np.asarray(layer.getchannel("A")) > 0
+    assert paper.any() and not (paper & ~foreign).any()
+    assert not (paper & (a > 0)).any()
+
+
+def test_partial_foreign_record_does_not_paper_product_coloured_majority():
+    src, a = setup_scene()
+    a[20:38, 55:80] = 0
+    foreign = np.zeros_like(a, bool)
+    foreign[20:38, 55:80] = True
+    src[20:38, 55:63] = 10
+    assert not top_footprints(a, [TypedMask("occluder", foreign)], src)
