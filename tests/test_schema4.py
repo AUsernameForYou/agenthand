@@ -53,10 +53,11 @@ def test_legacy_receipt_policies_still_verify(tmp_path, version):
     from pathlib import Path
     import hashlib
     import shutil
+
     fixture = Path(__file__).parent / "fixtures" / "legacy" / f"schema{version}"
     manifest = json.loads((fixture / "fixture.json").read_text())
     shutil.copytree(fixture, tmp_path, dirs_exist_ok=True)
-    data = (tmp_path/manifest["receipt_file"]).read_bytes()
+    data = (tmp_path / manifest["receipt_file"]).read_bytes()
     assert hashlib.sha256(data).hexdigest() == manifest["receipt_sha256"]
     assert json.loads(data)["receipt_schema"] == version
     store = AssetStore(tmp_path)
@@ -67,8 +68,11 @@ def test_legacy_receipt_policies_still_verify(tmp_path, version):
 
 @pytest.mark.parametrize("schema", [None, 1, 2, 3])
 @pytest.mark.parametrize("persisted", [False, True])
-def test_fully_stripped_v4_cannot_verify_under_legacy_policy(tmp_path, schema, persisted):
+def test_fully_stripped_v4_cannot_verify_under_legacy_policy(
+    tmp_path, schema, persisted
+):
     from agenthand.assets import COMPOSITE_POLICY_PNG_KEY, png_text_of_bytes
+
     store, h, r = _small_run(tmp_path)
     stamp = json.loads(png_text_of_bytes(store.read_bytes(h))[COMPOSITE_POLICY_PNG_KEY])
     assert stamp["receipt_schema"] == 4

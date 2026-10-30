@@ -139,6 +139,7 @@ def billed_call(
     # The call_id rides a context var while fn runs so nested code can
     # correlate its debug artifacts with this call's ledger records.
     from .segmentation import CutOutResultError
+
     cut_failure = None
     token = _current_call_id.set(call_id)
     try:
@@ -165,9 +166,7 @@ def billed_call(
     # counted, and the settled receipt's note says why. A $0
     # reservation (the placeholder-plate stub path) is exempt: it
     # reserved nothing, so there is nothing to preserve.
-    usage_missing = bool(
-        model is not None and projected_usd > 0 and actual_usd == 0.0
-    )
+    usage_missing = bool(model is not None and projected_usd > 0 and actual_usd == 0.0)
     settle_note = note
     if usage_missing:
         actual_usd = float(projected_usd)
@@ -518,9 +517,22 @@ def _rewrite_frame_phrase(phrase: str) -> str | None:
 # has been named once one of these shows up.
 _DESCRIPTION_CUT_TOKENS = frozenset(
     {
-        "on", "in", "against", "with", "beside", "near", "showing",
-        "displaying", "featuring", "sits", "sitting", "placed", "lying",
-        "standing", "resting", "of",
+        "on",
+        "in",
+        "against",
+        "with",
+        "beside",
+        "near",
+        "showing",
+        "displaying",
+        "featuring",
+        "sits",
+        "sitting",
+        "placed",
+        "lying",
+        "standing",
+        "resting",
+        "of",
     }
 )
 
@@ -629,9 +641,7 @@ def _parse_identify_payload(content: str) -> dict:
     concept = payload["concept"].strip()
     raw_alternates = payload.get("alternates")
     if not isinstance(raw_alternates, list):
-        raise IdentifyResultError(
-            "ALTERNATES_SHORTFALL: 'alternates' is not a list."
-        )
+        raise IdentifyResultError("ALTERNATES_SHORTFALL: 'alternates' is not a list.")
     cleaned: list[str] = []
     for item in raw_alternates:
         if isinstance(item, str):
@@ -1047,9 +1057,7 @@ def _plate_bytes_from_response(response) -> bytes:
     """
     data = getattr(response, "data", None) or []
     if not data:
-        refusal = getattr(response, "refusal", None) or getattr(
-            response, "error", None
-        )
+        refusal = getattr(response, "refusal", None) or getattr(response, "error", None)
         if refusal:
             raise ImageResultError(
                 "IMAGE_REFUSED",
@@ -1223,7 +1231,9 @@ def generate_background_plate(
         try:
             billing = billed_call("draw", model, projected, _call)
         except ImageResultError as exc:
-            exc.cost_counted_usd = round(sum(b["actual_usd"] for b in billings) + projected, 10)
+            exc.cost_counted_usd = round(
+                sum(b["actual_usd"] for b in billings) + projected, 10
+            )
             raise
         billings.append(billing)
         handle = outcome["handle"]
@@ -1238,7 +1248,10 @@ def generate_background_plate(
                 "call_id": billing["call_id"],
             }
         )
-        if quality["grade"] == "PASS" or "WALL_FLOOR_LINE_IN_PLACEMENT" in quality["codes"]:
+        if (
+            quality["grade"] == "PASS"
+            or "WALL_FLOOR_LINE_IN_PLACEMENT" in quality["codes"]
+        ):
             # The fixed template cannot move this architectural line. Do not
             # purchase an identical second attempt for an incompatible framing.
             break
@@ -1265,8 +1278,11 @@ def generate_background_plate(
             "fallback": fallback,
             "fallback_reason": (
                 "placement_horizon_mismatch"
-                if fallback and "WALL_FLOOR_LINE_IN_PLACEMENT" in attempts[-1]["quality"]["codes"]
-                else "two_rejected_plates" if fallback else None
+                if fallback
+                and "WALL_FLOOR_LINE_IN_PLACEMENT" in attempts[-1]["quality"]["codes"]
+                else "two_rejected_plates"
+                if fallback
+                else None
             ),
             "stage_spec": asdict(spec),
         },

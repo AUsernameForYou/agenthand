@@ -269,9 +269,7 @@ class AssetStore:
         self.assets_dir.mkdir(parents=True, exist_ok=True)
         path = self.receipt_path(handle)
         tmp = path.with_suffix(f".json.tmp-{uuid.uuid4().hex}")
-        tmp.write_text(
-            json.dumps(receipt, indent=2, sort_keys=True), encoding="utf-8"
-        )
+        tmp.write_text(json.dumps(receipt, indent=2, sort_keys=True), encoding="utf-8")
         os.replace(tmp, path)
         return path
 
@@ -288,7 +286,7 @@ class AssetStore:
     def parse_handle(handle: str) -> str:
         if not isinstance(handle, str) or not handle.startswith(HANDLE_PREFIX):
             raise ValueError(f"Not an asset handle: {handle!r}")
-        asset_id = handle[len(HANDLE_PREFIX):].strip()
+        asset_id = handle[len(HANDLE_PREFIX) :].strip()
         if not asset_id:
             raise ValueError(f"Empty asset id in handle: {handle!r}")
         return asset_id
@@ -344,6 +342,7 @@ class AssetStore:
         converted = image.convert("RGBA")
         buffer = BytesIO()
         from PIL.PngImagePlugin import PngInfo
+
         metadata = PngInfo()
         for key, value in (png_text or {}).items():
             metadata.add_text(key, value)
@@ -422,10 +421,7 @@ class AssetStore:
             )
         if record.pixel_sha256 is not None or record.color_profile_sha256 is not None:
             pixel_sha256, _, _, color_profile_sha256 = _image_facts(data)
-            if (
-                record.pixel_sha256 is not None
-                and pixel_sha256 != record.pixel_sha256
-            ):
+            if record.pixel_sha256 is not None and pixel_sha256 != record.pixel_sha256:
                 raise AssetIntegrityError(
                     f"Asset {handle!r} pixel hash mismatch: recorded "
                     f"{record.pixel_sha256}, actual {pixel_sha256}. The "

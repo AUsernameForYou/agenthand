@@ -274,7 +274,9 @@ def _wav_file(path: Path, *, seconds: float = 1.0, rate: int = 8000) -> Path:
         wav.setframerate(rate)
         wav.writeframes(
             b"".join(
-                struct.pack("<h", int(0.5 * 32767 * math.sin(2 * math.pi * 440 * i / rate)))
+                struct.pack(
+                    "<h", int(0.5 * 32767 * math.sin(2 * math.pi * 440 * i / rate))
+                )
                 for i in range(int(seconds * rate))
             )
         )
@@ -290,7 +292,11 @@ class FakeNarration:
         self.calls.append(Path(audio_path))
         return {
             "reply": self.reply,
-            "usage": {"prompt_tokens": 100, "completion_tokens": 50, "total_tokens": 150},
+            "usage": {
+                "prompt_tokens": 100,
+                "completion_tokens": 50,
+                "total_tokens": 150,
+            },
             "latency_ms": 10,
             "model": roomrun.NARRATION_MODEL,
         }
@@ -298,7 +304,10 @@ class FakeNarration:
 
 def test_narration_merge_selling_mentioned_and_origins(tmp_path):
     store = AssetStore(tmp_path)
-    photos = [_photo(tmp_path, "purifier.jpg"), _photo(tmp_path, "case.jpg", (200, 90, 10))]
+    photos = [
+        _photo(tmp_path, "purifier.jpg"),
+        _photo(tmp_path, "case.jpg", (200, 90, 10)),
+    ]
     fake = CropChain(
         store,
         plans=[_plan("air purifier"), _plan("orange suitcase")],
@@ -421,7 +430,9 @@ def test_draw_receipt_plate_kinds_and_verifier_acceptance(tmp_path):
     assert placeholder["plate_kind"] == "local_placeholder"
     assert placeholder["backdrop"] is None
 
-    plate = store.put_image(Image.new("RGBA", (48, 36), (0, 0, 255, 255)), kind="background_plate")
+    plate = store.put_image(
+        Image.new("RGBA", (48, 36), (0, 0, 255, 255)), kind="background_plate"
+    )
     _h, model = composite.draw_product(store, fg, "ignored", plate_handle=plate)
     assert model["plate_kind"] == "model_generated"
     assert model["backdrop"] is None
@@ -440,7 +451,11 @@ def test_draw_receipt_plate_kinds_and_verifier_acceptance(tmp_path):
     stripped["receipt_schema"] = 3
     stripped.pop("cut_quality")
     stripped.pop("plate_quality")
-    stripped["reconstruction"] = {k:v for k,v in rendered["reconstruction"].items() if k not in ("policy_version","max_fraction","attempted")}
+    stripped["reconstruction"] = {
+        k: v
+        for k, v in rendered["reconstruction"].items()
+        if k not in ("policy_version", "max_fraction", "attempted")
+    }
     stripped.pop("plate_kind")
     stripped.pop("backdrop")
     report = composite.verify_receipt_from_disk(store, handle, receipt=stripped)
@@ -467,7 +482,11 @@ class RealBackdropChain:
         if concept != "straw hat":
             return {
                 "status": "error",
-                "error": {"code": "NO_MATCH", "message": "not here", "cost_counted_usd": 0.0},
+                "error": {
+                    "code": "NO_MATCH",
+                    "message": "not here",
+                    "cost_counted_usd": 0.0,
+                },
             }
         # Foreground cut from the ingested photo's own pixels.
         source = self.store.read_image(handle).convert("RGBA")
@@ -494,7 +513,12 @@ class RealBackdropChain:
 
     def draw(self, fg_handle: str, scene: str) -> dict:
         handle, receipt = composite.draw_product(self.store, fg_handle, scene)
-        return {"status": "ok", "output_asset": handle, "fidelity_receipt": receipt, "cost_usd": 0.0}
+        return {
+            "status": "ok",
+            "output_asset": handle,
+            "fidelity_receipt": receipt,
+            "cost_usd": 0.0,
+        }
 
     def draw_backdrop(self, fg_handle: str, stage_mode: str) -> dict:
         return roomrun.draw_with_code_plate(self.store, fg_handle, stage_mode)
@@ -550,8 +574,14 @@ WINIX_PRICES = [40, 50, 50, 50, 60, 60, 65, 75, 85, 100]
 
 def _comps_data(prices, *, name="winix filter", extra=()):
     comps = [
-        {"title": f"comp {i}", "price_usd": p, "condition": "used",
-         "distance_mi": 5.0, "age_days": 3, "is_new": False}
+        {
+            "title": f"comp {i}",
+            "price_usd": p,
+            "condition": "used",
+            "distance_mi": 5.0,
+            "age_days": 3,
+            "is_new": False,
+        }
         for i, p in enumerate(prices)
     ]
     comps.extend(extra)
@@ -584,8 +614,16 @@ def test_market_pricing_excludes_new_and_matches_case_insensitively():
     data = _comps_data(
         WINIX_PRICES,
         name="  WINIX Filter ",
-        extra=[{"title": "new one", "price_usd": 999, "condition": None,
-                "distance_mi": None, "age_days": None, "is_new": True}],
+        extra=[
+            {
+                "title": "new one",
+                "price_usd": 999,
+                "condition": None,
+                "distance_mi": None,
+                "age_days": None,
+                "is_new": True,
+            }
+        ],
     )
     record = market_pricing.pricing_for_item("winix filter", data)
     assert record["comps_used"] == 10  # the new comp never counts
@@ -610,8 +648,15 @@ def test_market_pricing_thin_and_no_comps_cases():
 
 
 def test_market_pricing_confidence_bands_and_rounding():
-    assert market_pricing.pricing_for_item("x", _comps_data([10, 20], name="x"))["confidence"] == "low"
-    five = market_pricing.pricing_for_item("x", _comps_data([10, 20, 30, 40, 50], name="x"))
+    assert (
+        market_pricing.pricing_for_item("x", _comps_data([10, 20], name="x"))[
+            "confidence"
+        ]
+        == "low"
+    )
+    five = market_pricing.pricing_for_item(
+        "x", _comps_data([10, 20, 30, 40, 50], name="x")
+    )
     assert five["confidence"] == "low-moderate"
     assert market_pricing.round_to_nearest_5(72.5) == 75  # half away from zero
     assert market_pricing.round_to_nearest_5(12.5) == 15
@@ -634,16 +679,25 @@ def test_priced_table_artifacts_from_a_run(tmp_path):
         "items": {
             "orange suitcase": {
                 "comps": [
-                    {"title": f"used suitcase {i}", "price_usd": p, "condition": "used",
-                     "distance_mi": 4.0, "age_days": 2, "is_new": False}
+                    {
+                        "title": f"used suitcase {i}",
+                        "price_usd": p,
+                        "condition": "used",
+                        "distance_mi": 4.0,
+                        "age_days": 2,
+                        "is_new": False,
+                    }
                     for i, p in enumerate(WINIX_PRICES)
                 ]
             }
         },
     }
     manifest = _run(
-        tmp_path, photos, fake,
-        item_names=["orange suitcase", "ghost item"], comps_data=comps,
+        tmp_path,
+        photos,
+        fake,
+        item_names=["orange suitcase", "ghost item"],
+        comps_data=comps,
     )
     items = {i["name"]: i for i in manifest["items"]}
     assert items["orange suitcase"]["pricing"]["status"] == "priced"
@@ -700,13 +754,20 @@ def test_cli_passes_stage_mode_and_comps(tmp_path, monkeypatch):
     comps_path.write_text(json.dumps(_comps_data(WINIX_PRICES)), encoding="utf-8")
     rc = roomrun.main(
         [
-            "--photos", str(photo),
-            "--items", "winix filter",
-            "--out", str(tmp_path / "out"),
-            "--stage-mode", "studio_gray",
-            "--comps", str(comps_path),
+            "--photos",
+            str(photo),
+            "--items",
+            "winix filter",
+            "--out",
+            str(tmp_path / "out"),
+            "--stage-mode",
+            "studio_gray",
+            "--comps",
+            str(comps_path),
         ]
     )
     assert rc == 0
     assert captured["stage_mode"] == "studio_gray"
-    assert captured["comps_data"]["items"]["winix filter"]["comps"][0]["price_usd"] == 40
+    assert (
+        captured["comps_data"]["items"]["winix filter"]["comps"][0]["price_usd"] == 40
+    )

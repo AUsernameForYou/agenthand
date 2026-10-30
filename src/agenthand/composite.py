@@ -108,7 +108,9 @@ def generate_background_plate(prompt: str, width: int, height: int) -> Image.Ima
     return plate
 
 
-def _fit_plate(plate: Image.Image, size: tuple[int, int]) -> tuple[Image.Image, list[str]]:
+def _fit_plate(
+    plate: Image.Image, size: tuple[int, int]
+) -> tuple[Image.Image, list[str]]:
     """Resize/crop the PLATE to the product's dimensions. Never the reverse."""
     if plate.size == size:
         return plate, []
@@ -116,9 +118,7 @@ def _fit_plate(plate: Image.Image, size: tuple[int, int]) -> tuple[Image.Image, 
     return fitted, [f"plate_resized_and_center_cropped_to_{size[0]}x{size[1]}"]
 
 
-def _distance_to_class(
-    alpha: bytes, width: int, height: int, target
-) -> np.ndarray:
+def _distance_to_class(alpha: bytes, width: int, height: int, target) -> np.ndarray:
     """Manhattan distance from every pixel to the nearest target pixel.
 
     Returns a (height, width) int64 array. Computed with OpenCV's L1
@@ -281,9 +281,7 @@ def mask_provenance_of(store: AssetStore, mask_handle: str) -> dict | None:
     receipt simply carries no provenance fields, which the verifier
     accepts.
     """
-    raw = png_text_of_bytes(store.read_bytes(mask_handle)).get(
-        MASK_PROVENANCE_PNG_KEY
-    )
+    raw = png_text_of_bytes(store.read_bytes(mask_handle)).get(MASK_PROVENANCE_PNG_KEY)
     if raw is None:
         return None
     try:
@@ -429,6 +427,7 @@ def preflight_cut(
         # Guard pixels remain plate pixels in the delivered image. Dilation
         # bridges that one-pixel safety seam for stageability geometry only.
         from .mask_evidence import repaired_alpha
+
         quality = grade_cut(source, repaired_alpha(alpha, paper))
     if require_pass and quality["grade"] != "PASS":
         quality = {**quality, "grade": "RESHOOT"}
@@ -647,11 +646,18 @@ def draw_product(
     from . import cut_quality
 
     composite_handle = store.put_image(
-        composite, kind=KIND_COMPOSITE, source_asset_id=record.asset_id,
-        png_text={COMPOSITE_POLICY_PNG_KEY: json.dumps({
-            "receipt_schema": RECEIPT_SCHEMA_VERSION,
-            "cut_quality_version": cut_quality.VERSION,
-        }, sort_keys=True)},
+        composite,
+        kind=KIND_COMPOSITE,
+        source_asset_id=record.asset_id,
+        png_text={
+            COMPOSITE_POLICY_PNG_KEY: json.dumps(
+                {
+                    "receipt_schema": RECEIPT_SCHEMA_VERSION,
+                    "cut_quality_version": cut_quality.VERSION,
+                },
+                sort_keys=True,
+            )
+        },
     )
     composite_record = store.get_record(composite_handle)
 
@@ -1027,14 +1033,18 @@ from .quality_receipt import is_cut_block, is_plate_block, is_reconstruction_pol
 _RECEIPT_FIELDS_V4 = {
     "cut_quality": is_cut_block,
     "plate_quality": is_plate_block,
-    "reconstruction": lambda v: _is_reconstruction_block(v) and is_reconstruction_policy(v),
-    "scene_prompt": lambda v: isinstance(v,str),
-    "plate_kind": lambda v: v in ("model_generated", "code_rendered", "local_placeholder"),
+    "reconstruction": lambda v: (
+        _is_reconstruction_block(v) and is_reconstruction_policy(v)
+    ),
+    "scene_prompt": lambda v: isinstance(v, str),
+    "plate_kind": lambda v: (
+        v in ("model_generated", "code_rendered", "local_placeholder")
+    ),
     "plate_asset": lambda v: v is None or _is_handle(v),
     "plate_sha256": _is_hash_or_none,
     "plate_pixel_sha256": _is_hash_or_none,
-    "backdrop": lambda v: v is None or isinstance(v,dict),
-    "plate_source": lambda v: v in ("asset","local_placeholder"),
+    "backdrop": lambda v: v is None or isinstance(v, dict),
+    "plate_source": lambda v: v in ("asset", "local_placeholder"),
 }
 
 # Fields that exist only in the current schema (used by the
@@ -1118,8 +1128,12 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
             "under an older policy"
         )
     recon_policy = receipt.get("reconstruction")
-    v4_reconstruction = isinstance(recon_policy,dict) and any(k in recon_policy for k in ("policy_version", "max_fraction", "attempted"))
-    if 0 < version < 4 and (any(k in receipt for k in ("cut_quality", "plate_quality")) or v4_reconstruction):
+    v4_reconstruction = isinstance(recon_policy, dict) and any(
+        k in recon_policy for k in ("policy_version", "max_fraction", "attempted")
+    )
+    if 0 < version < 4 and (
+        any(k in receipt for k in ("cut_quality", "plate_quality")) or v4_reconstruction
+    ):
         shape.append("receipt carries schema-4 quality fields under an older policy")
     fields = dict(_RECEIPT_FIELDS_ANY_SCHEMA)
     if version >= 2:
@@ -1132,31 +1146,42 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
         if name not in receipt:
             shape.append(f"missing field: {name}")
         elif not valid(receipt[name]):
-            shape.append(
-                f"field {name} has the wrong type or shape: "
-                f"{receipt[name]!r}"
-            )
+            shape.append(f"field {name} has the wrong type or shape: {receipt[name]!r}")
     if strict:
         # Optional provenance fields: validated when present.
         for name, valid in _RECEIPT_FIELDS_V2_OPTIONAL.items():
             if name in receipt and not valid(receipt[name]):
                 shape.append(
-                    f"field {name} has the wrong type or shape: "
-                    f"{receipt[name]!r}"
+                    f"field {name} has the wrong type or shape: {receipt[name]!r}"
                 )
     if shape:
         return shape, terms
     if version >= 4:
         if receipt["plate_kind"] == "local_placeholder":
-            if receipt["plate_source"] != "local_placeholder" or receipt["plate_asset"] is not None or receipt["plate_sha256"] is not None or receipt["plate_pixel_sha256"] is not None or receipt["backdrop"] is not None:
+            if (
+                receipt["plate_source"] != "local_placeholder"
+                or receipt["plate_asset"] is not None
+                or receipt["plate_sha256"] is not None
+                or receipt["plate_pixel_sha256"] is not None
+                or receipt["backdrop"] is not None
+            ):
                 shape.append("local placeholder provenance is inconsistent")
-        elif receipt["plate_source"] != "asset" or not receipt["plate_asset"] or not receipt["plate_sha256"] or not receipt["plate_pixel_sha256"]:
+        elif (
+            receipt["plate_source"] != "asset"
+            or not receipt["plate_asset"]
+            or not receipt["plate_sha256"]
+            or not receipt["plate_pixel_sha256"]
+        ):
             shape.append("asset plate provenance is incomplete")
         if receipt["plate_kind"] == "code_rendered" and not receipt["backdrop"]:
             shape.append("code-rendered plate requires its backdrop specification")
-        if receipt["plate_kind"] == "model_generated" and receipt["backdrop"] is not None:
+        if (
+            receipt["plate_kind"] == "model_generated"
+            and receipt["backdrop"] is not None
+        ):
             shape.append("model plate cannot claim a code backdrop")
-        if shape: return shape, terms
+        if shape:
+            return shape, terms
     # Internal consistency of the stated counts: a receipt whose own
     # numbers disagree with each other is forged or torn, whatever
     # the files say.
@@ -1164,9 +1189,7 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
         receipt["mask_pixels_total"]
         != receipt["opaque_pixels"] + receipt["edge_band_pixels"]
     ):
-        shape.append(
-            "mask_pixels_total != opaque_pixels + edge_band_pixels"
-        )
+        shape.append("mask_pixels_total != opaque_pixels + edge_band_pixels")
     if receipt["changed_opaque_pixels"] > receipt["opaque_pixels"]:
         shape.append("changed_opaque_pixels exceeds opaque_pixels")
     total = receipt["mask_pixels_total"]
@@ -1174,13 +1197,10 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
         expected_fraction = round(receipt["opaque_pixels"] / total, 6)
         if abs(float(receipt["opaque_fraction"]) - expected_fraction) > 1e-9:
             shape.append(
-                "opaque_fraction disagrees with opaque_pixels / "
-                "mask_pixels_total"
+                "opaque_fraction disagrees with opaque_pixels / mask_pixels_total"
             )
     elif float(receipt["opaque_fraction"]) != 0.0:
-        shape.append(
-            "opaque_fraction is nonzero while mask_pixels_total is 0"
-        )
+        shape.append("opaque_fraction is nonzero while mask_pixels_total is 0")
     if version >= 3:
         # The reconstruction block's own arithmetic: status, assets,
         # region counts, and the fraction must tell one story.
@@ -1193,15 +1213,9 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
                 "is a broken one"
             )
         if region_sum != block["reconstruction_pixels"]:
-            shape.append(
-                "reconstruction regions do not sum to "
-                "reconstruction_pixels"
-            )
+            shape.append("reconstruction regions do not sum to reconstruction_pixels")
         if block["status"] == "applied":
-            if (
-                block["layer_asset"] is None
-                or block["reconstruction_pixels"] == 0
-            ):
+            if block["layer_asset"] is None or block["reconstruction_pixels"] == 0:
                 shape.append(
                     "reconstruction status is 'applied' but no "
                     "layer asset or no paper pixels are claimed"
@@ -1218,10 +1232,7 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
                     "reconstruction_pixels / (reconstruction_pixels "
                     "+ opaque_pixels)"
                 )
-        elif (
-            block["layer_asset"] is not None
-            or block["reconstruction_pixels"] != 0
-        ):
+        elif block["layer_asset"] is not None or block["reconstruction_pixels"] != 0:
             shape.append(
                 f"reconstruction status is {block['status']!r} but "
                 "a layer asset or paper pixels are claimed"
@@ -1233,16 +1244,12 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
             receipt["mask_source"] == "foreground_alpha"
             and receipt["mask_asset"] is not None
         ):
-            shape.append(
-                "mask_source is 'foreground_alpha' but mask_asset is set"
-            )
+            shape.append("mask_source is 'foreground_alpha' but mask_asset is set")
     if strict and any(name in receipt for name in _RECEIPT_FIELDS_V2_OPTIONAL):
         # Mask provenance is an all-or-nothing, self-consistent
         # statement: a partial or contradictory set is a forged or
         # torn receipt, not a weaker claim.
-        missing = [
-            name for name in _RECEIPT_FIELDS_V2_OPTIONAL if name not in receipt
-        ]
+        missing = [name for name in _RECEIPT_FIELDS_V2_OPTIONAL if name not in receipt]
         if missing:
             shape.append(
                 "mask provenance is partial; missing fields: "
@@ -1355,9 +1362,7 @@ def verify_receipt_from_disk(
             "recomputed": recomputed,
             "composite_asset": composite_handle,
             "foreground_asset": (
-                receipt.get("foreground_asset")
-                if isinstance(receipt, dict)
-                else None
+                receipt.get("foreground_asset") if isinstance(receipt, dict) else None
             ),
             "source_asset": (
                 receipt.get("source_asset") if isinstance(receipt, dict) else None
@@ -1381,20 +1386,38 @@ def verify_receipt_from_disk(
             policy = json.loads(text[COMPOSITE_POLICY_PNG_KEY])
             stamp_schema = policy["receipt_schema"]
             supplied_schema = receipt.get("receipt_schema", 1)
-            valid = type(stamp_schema) is int and type(supplied_schema) is int and supplied_schema >= stamp_schema
+            valid = (
+                type(stamp_schema) is int
+                and type(supplied_schema) is int
+                and supplied_schema >= stamp_schema
+            )
             if stamp_schema >= 4:
-                valid = valid and policy["cut_quality_version"] == receipt.get("cut_quality", {}).get("version")
+                valid = valid and policy["cut_quality_version"] == receipt.get(
+                    "cut_quality", {}
+                ).get("version")
         except (TypeError, ValueError, KeyError):
             valid = False
-        check("output_policy_stamp", valid, "receipt policy disagrees with the delivered PNG stamp")
+        check(
+            "output_policy_stamp",
+            valid,
+            "receipt policy disagrees with the delivered PNG stamp",
+        )
         if not valid:
             return report()
     persisted = store.load_receipt(composite_handle)
     if persisted is not None:
         stored_schema = persisted.get("receipt_schema", 1)
         supplied_schema = receipt.get("receipt_schema", 1)
-        valid = type(stored_schema) is int and type(supplied_schema) is int and supplied_schema >= stored_schema
-        check("persisted_receipt_policy", valid, "supplied receipt downgrades the persisted policy")
+        valid = (
+            type(stored_schema) is int
+            and type(supplied_schema) is int
+            and supplied_schema >= stored_schema
+        )
+        check(
+            "persisted_receipt_policy",
+            valid,
+            "supplied receipt downgrades the persisted policy",
+        )
         if not valid:
             return report()
 
@@ -1434,9 +1457,7 @@ def verify_receipt_from_disk(
     if not isinstance(recon_block, dict):
         recon_block = None
     if recon_block and recon_block.get("layer_asset"):
-        integrity_targets.append(
-            ("reconstruction_layer", recon_block["layer_asset"])
-        )
+        integrity_targets.append(("reconstruction_layer", recon_block["layer_asset"]))
     if recon_block and recon_block.get("region_map_asset"):
         integrity_targets.append(
             ("reconstruction_region_map", recon_block["region_map_asset"])
@@ -1464,8 +1485,7 @@ def verify_receipt_from_disk(
     check(
         "foreground_hash_matches_receipt",
         receipt.get("foreground_sha256") == foreground_record.sha256
-        and receipt.get("foreground_pixel_sha256")
-        == foreground_record.pixel_sha256,
+        and receipt.get("foreground_pixel_sha256") == foreground_record.pixel_sha256,
         "the receipt's foreground hashes do not match the foreground "
         "asset's recorded hashes",
     )
@@ -1496,8 +1516,7 @@ def verify_receipt_from_disk(
                 check(
                     "mask_hash_matches_receipt",
                     receipt.get("mask_sha256") == mask_record.sha256
-                    and receipt.get("mask_pixel_sha256")
-                    == mask_record.pixel_sha256,
+                    and receipt.get("mask_pixel_sha256") == mask_record.pixel_sha256,
                     "the receipt's mask hashes do not match the mask "
                     "asset's recorded hashes",
                 )
@@ -1525,13 +1544,11 @@ def verify_receipt_from_disk(
             check(
                 "reconstruction_hash_matches_receipt",
                 recon_block.get("layer_sha256") == layer_record.sha256
-                and recon_block.get("layer_pixel_sha256")
-                == layer_record.pixel_sha256,
+                and recon_block.get("layer_pixel_sha256") == layer_record.pixel_sha256,
                 "the receipt's reconstruction layer hashes match the "
                 "layer asset's sidecar record"
                 if recon_block.get("layer_sha256") == layer_record.sha256
-                and recon_block.get("layer_pixel_sha256")
-                == layer_record.pixel_sha256
+                and recon_block.get("layer_pixel_sha256") == layer_record.pixel_sha256
                 else "the receipt's reconstruction layer hashes do "
                 "not match the layer asset's sidecar record",
             )
@@ -1546,8 +1563,7 @@ def verify_receipt_from_disk(
                 recon_block.get("region_map_sha256") == map_record.sha256
                 and recon_block.get("region_map_pixel_sha256")
                 == map_record.pixel_sha256,
-                "the receipt's region map hashes match the map "
-                "asset's sidecar record"
+                "the receipt's region map hashes match the map asset's sidecar record"
                 if recon_block.get("region_map_sha256") == map_record.sha256
                 and recon_block.get("region_map_pixel_sha256")
                 == map_record.pixel_sha256
@@ -1578,20 +1594,19 @@ def verify_receipt_from_disk(
         foreground, composite_image, source_image = decoded
         if foreground.size == source_image.size:
             from .cut_quality import grade_cut
-            recomputed["cut_quality"] = grade_cut(source_image, foreground.getchannel("A"))
+
+            recomputed["cut_quality"] = grade_cut(
+                source_image, foreground.getchannel("A")
+            )
         check(
             "foreground_pixel_hash",
-            pixel_hash_of_image(foreground)
-            == receipt["foreground_pixel_sha256"],
-            "decoded foreground pixels do not match the receipt's "
-            "pinned hash",
+            pixel_hash_of_image(foreground) == receipt["foreground_pixel_sha256"],
+            "decoded foreground pixels do not match the receipt's pinned hash",
         )
         check(
             "composite_pixel_hash",
-            pixel_hash_of_image(composite_image)
-            == composite_record.pixel_sha256,
-            "decoded composite pixels do not match the stored asset "
-            "record",
+            pixel_hash_of_image(composite_image) == composite_record.pixel_sha256,
+            "decoded composite pixels do not match the stored asset record",
         )
         if foreground.size != composite_image.size:
             check(
@@ -1619,8 +1634,7 @@ def verify_receipt_from_disk(
                 )
             check(
                 "recount_opaque_fraction",
-                abs(counts["opaque_fraction"] - receipt["opaque_fraction"])
-                < 1e-9,
+                abs(counts["opaque_fraction"] - receipt["opaque_fraction"]) < 1e-9,
                 f"receipt says {receipt['opaque_fraction']}, recount "
                 f"from disk finds {counts['opaque_fraction']}",
             )
@@ -1664,19 +1678,16 @@ def verify_receipt_from_disk(
                 f"photo is {source_image.size}",
             )
         else:
-            fg_arr = np.frombuffer(
-                foreground.tobytes(), dtype=np.uint8
-            ).reshape(-1, 4)
-            src_arr = np.frombuffer(
-                source_image.tobytes(), dtype=np.uint8
-            ).reshape(-1, 4)
+            fg_arr = np.frombuffer(foreground.tobytes(), dtype=np.uint8).reshape(-1, 4)
+            src_arr = np.frombuffer(source_image.tobytes(), dtype=np.uint8).reshape(
+                -1, 4
+            )
             solid = fg_arr[:, 3] == 255
             same = bool(np.array_equal(fg_arr[solid], src_arr[solid]))
             check(
                 "foreground_matches_source",
                 same,
-                "every fully opaque foreground pixel matches the "
-                "source photo"
+                "every fully opaque foreground pixel matches the source photo"
                 if same
                 else "the foreground differs from the source photo "
                 "on fully opaque pixels; the product layer is not "
@@ -1692,12 +1703,10 @@ def verify_receipt_from_disk(
             try:
                 layer_image = store.read_image(recon_block["layer_asset"])
                 recounts = _measure_reconstruction(foreground, layer_image)
-                recomputed["reconstruction_pixels"] = recounts[
-                    "reconstruction_pixels"
+                recomputed["reconstruction_pixels"] = recounts["reconstruction_pixels"]
+                recomputed["reconstruction_overlap_product_pixels"] = recounts[
+                    "reconstruction_overlap_product_pixels"
                 ]
-                recomputed["reconstruction_overlap_product_pixels"] = (
-                    recounts["reconstruction_overlap_product_pixels"]
-                )
                 check(
                     "recount_reconstruction_pixels",
                     recounts["reconstruction_pixels"]
@@ -1726,9 +1735,7 @@ def verify_receipt_from_disk(
                     layer_alpha = np.frombuffer(
                         layer_image.getchannel("A").tobytes(), dtype=np.uint8
                     )
-                    partition_ok = bool(
-                        np.array_equal(map_values > 0, layer_alpha > 0)
-                    )
+                    partition_ok = bool(np.array_equal(map_values > 0, layer_alpha > 0))
                     # Per-class totals: several regions can share a
                     # class (two legs are both supports), so the map
                     # count for a code is graded against the SUM of
@@ -1737,8 +1744,7 @@ def verify_receipt_from_disk(
                     known_codes = list(REGION_CLASS_CODES.values())
                     class_ok = not bool(
                         np.count_nonzero(
-                            (map_values != 0)
-                            & ~np.isin(map_values, known_codes)
+                            (map_values != 0) & ~np.isin(map_values, known_codes)
                         )
                     )
                     for cls, code in REGION_CLASS_CODES.items():
@@ -1747,10 +1753,7 @@ def verify_receipt_from_disk(
                             for r in recon_block["regions"]
                             if r["class"] == cls
                         )
-                        if (
-                            int(np.count_nonzero(map_values == code))
-                            != expected
-                        ):
+                        if int(np.count_nonzero(map_values == code)) != expected:
                             class_ok = False
                     check(
                         "region_map_partition",
@@ -1827,8 +1830,7 @@ def verify_receipt_from_disk(
                 check(
                     "layer_reproduction",
                     False,
-                    f"rebuild from stored layers raised "
-                    f"{type(exc).__name__}: {exc}",
+                    f"rebuild from stored layers raised {type(exc).__name__}: {exc}",
                 )
         else:
             recomputed["layer_reproduction"] = (
@@ -1838,10 +1840,14 @@ def verify_receipt_from_disk(
     if receipt.get("receipt_schema") == 4 and decoded is not None:
         try:
             from .quality_receipt import verify_quality
-            quality_data, quality_checks = verify_quality(store, foreground_handle, receipt)
+
+            quality_data, quality_checks = verify_quality(
+                store, foreground_handle, receipt
+            )
             recomputed.update(quality_data)
-            for name,(ok,detail) in quality_checks.items(): check(name,ok,detail)
+            for name, (ok, detail) in quality_checks.items():
+                check(name, ok, detail)
         except Exception as exc:
-            check("schema4_quality_recomputed",False,f"{type(exc).__name__}: {exc}")
+            check("schema4_quality_recomputed", False, f"{type(exc).__name__}: {exc}")
 
     return report()

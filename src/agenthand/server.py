@@ -120,6 +120,7 @@ def _persist_full_receipt(
     store.save_receipt(handle, full)
     return full
 
+
 # Model assignments (priced in pricing.py). identify starts on Spark; a
 # Spark-vs-Wonder A/B during the build decides whether it stays there.
 IDENTIFY_MODEL = "muse-spark-1.3"
@@ -224,7 +225,11 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
             foreground_bbox=store.read_image(asset).getbbox(),
         )
     except meta_client.ImageResultError as exc:
-        return _error(exc.code, str(exc), cost_counted_usd=getattr(exc, "cost_counted_usd", projected))
+        return _error(
+            exc.code,
+            str(exc),
+            cost_counted_usd=getattr(exc, "cost_counted_usd", projected),
+        )
 
     quality = billing["plate_quality"]
     fallback_kwargs = {}
@@ -301,7 +306,9 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     return [result, preview]
 
 
-def _draw_with_placeholder_plate(store: AssetStore, asset: str, scene_prompt: str, prepared: dict) -> list:
+def _draw_with_placeholder_plate(
+    store: AssetStore, asset: str, scene_prompt: str, prepared: dict
+) -> list:
     """draw's offline dev mode (AGENTHAND_DRAW_PLACEHOLDER_PLATE=1).
 
     The full Fidelity Lock pipeline (validation, compositing, receipt)
@@ -565,7 +572,11 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     pnginfo.add_text(
         "agenthand_cut_pipeline",
         json.dumps(
-            {"version": outcome["pipeline_version"], "records": evidence_records, "dropped_component_pixels": outcome["dropped_component_pixels"]},
+            {
+                "version": outcome["pipeline_version"],
+                "records": evidence_records,
+                "dropped_component_pixels": outcome["dropped_component_pixels"],
+            },
             sort_keys=True,
         ),
     )
@@ -605,7 +616,11 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         kind=KIND_OVERLAY,
         source_asset_id=source_record.asset_id,
     )
-    mask_review = segmentation.review_mask(full_mask, source_image, dropped_component_pixels=outcome["dropped_component_pixels"])
+    mask_review = segmentation.review_mask(
+        full_mask,
+        source_image,
+        dropped_component_pixels=outcome["dropped_component_pixels"],
+    )
 
     return {
         "status": "ok",
@@ -695,9 +710,7 @@ def _run_identify(store: AssetStore, handle: str) -> dict:
         outcome: dict = {}
 
         def _call() -> dict:
-            plan, usage = meta_client.vision_identify(
-                png_bytes, model=IDENTIFY_MODEL
-            )
+            plan, usage = meta_client.vision_identify(png_bytes, model=IDENTIFY_MODEL)
             outcome["plan"] = plan
             return usage
 

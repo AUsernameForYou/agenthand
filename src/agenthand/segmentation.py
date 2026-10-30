@@ -249,7 +249,12 @@ def mask_overlay_image(source: Image.Image, mask_image: Image.Image) -> Image.Im
     return source_rgba
 
 
-def review_mask(mask_image: Image.Image, source: Image.Image | None = None, *, dropped_component_pixels: int = 0) -> dict:
+def review_mask(
+    mask_image: Image.Image,
+    source: Image.Image | None = None,
+    *,
+    dropped_component_pixels: int = 0,
+) -> dict:
     """Sanity signals for one accepted mask, for the cut_out result.
 
     A receipt can only prove the SELECTED pixels survived; whether the
@@ -270,7 +275,9 @@ def review_mask(mask_image: Image.Image, source: Image.Image | None = None, *, d
     mask_pixels = int(np.count_nonzero(on))
     warnings: list[str] = []
     if dropped_component_pixels:
-        warnings.append(f"{dropped_component_pixels} pixels in non-body SAM components were omitted; inspect product completeness in the overlay")
+        warnings.append(
+            f"{dropped_component_pixels} pixels in non-body SAM components were omitted; inspect product completeness in the overlay"
+        )
     bbox = None
     bbox_fill = None
     touches: list[str] = []
@@ -555,7 +562,9 @@ def run_cut_pipeline(
     selected = max(usable, key=lambda r: _body_score(r, usable))
     metrics, body, _ = geometry(np.asarray(selected["image"]))
     bbox = tuple(metrics["body_bbox"])
-    for tile in band_tiles(source.size, bbox, meta_client.SAM_MAX_ATTEMPTS - len(attempts)):
+    for tile in band_tiles(
+        source.size, bbox, meta_client.SAM_MAX_ATTEMPTS - len(attempts)
+    ):
         crop = source.crop(tuple(tile["bbox"]))
         b = BytesIO()
         crop.save(b, format="PNG")
@@ -605,7 +614,9 @@ def run_cut_pipeline(
         "mask_image": mask,
         # Count unique omitted pixels in the selected global record. Do not
         # sum overlapping alternatives or imply ownership of discarded parts.
-        "dropped_component_pixels": int(((np.asarray(selected["image"]) > 0) & ~merged).sum()),
+        "dropped_component_pixels": int(
+            ((np.asarray(selected["image"]) > 0) & ~merged).sum()
+        ),
         "phrase": selected["phrase"],
         "attempts": attempts,
         "records": records,

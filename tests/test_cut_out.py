@@ -113,7 +113,9 @@ def _install_fake(monkeypatch, client: _FakeClient) -> _FakeClient:
 
 
 def test_cut_out_success_with_provided_concept(monkeypatch):
-    client = _install_fake(monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)]))
+    client = _install_fake(
+        monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)])
+    )
     result = server.cut_out(_photo_uri(), "brown leather wallet")
 
     assert result["status"] == "ok"
@@ -179,9 +181,7 @@ def test_cut_out_ships_the_mask_overlay_and_review(monkeypatch):
     # J2 item 6: the selection itself gets a review surface — an
     # overlay asset a human/agent can look at, plus the mask's sanity
     # signals — because the receipt can only vouch for selected pixels.
-    _install_fake(
-        monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)])
-    )
+    _install_fake(monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)]))
     result = server.cut_out(_photo_uri(), "brown leather wallet")
     assert result["status"] == "ok"
 
@@ -229,7 +229,11 @@ def test_cut_out_recovers_with_first_alternate_after_zero_match(monkeypatch):
         monkeypatch,
         _FakeClient(
             chat_responses=[_chat_response(IDENTIFY_PAYLOAD)],
-            sam_responses=[_sam_response(""), _sam_response(GOOD_TEXT), _sam_response("")],
+            sam_responses=[
+                _sam_response(""),
+                _sam_response(GOOD_TEXT),
+                _sam_response(""),
+            ],
         ),
     )
     result = server.cut_out(_photo_uri())
@@ -238,7 +242,11 @@ def test_cut_out_recovers_with_first_alternate_after_zero_match(monkeypatch):
     assert result["concept_source"] == "identify_internal"
     # The winning phrase is the first alternate; the trace shows both tries.
     assert result["concept"] == "leather bifold wallet"
-    assert [a["outcome"] for a in result["attempts"]] == ["no_match", "accepted", "no_match"]
+    assert [a["outcome"] for a in result["attempts"]] == [
+        "no_match",
+        "accepted",
+        "no_match",
+    ]
     assert [a["phrase"] for a in result["attempts"]] == [
         "brown leather wallet",
         "leather bifold wallet",
@@ -247,7 +255,11 @@ def test_cut_out_recovers_with_first_alternate_after_zero_match(monkeypatch):
     phrases_sent = [
         call["input"][0]["content"][0]["text"] for call in client.responses.calls
     ]
-    assert phrases_sent == ["brown leather wallet", "leather bifold wallet", IDENTIFY_PAYLOAD["alternates"][1]]
+    assert phrases_sent == [
+        "brown leather wallet",
+        "leather bifold wallet",
+        IDENTIFY_PAYLOAD["alternates"][1],
+    ]
 
     # Both attempts billed: settled at two images; identify billed on its own.
     assert result["usage"]["images"] == 3
@@ -298,7 +310,11 @@ def test_cut_out_recovery_exhausted_counts_spend_once_per_attempt(monkeypatch):
         monkeypatch,
         _FakeClient(
             chat_responses=[_chat_response(IDENTIFY_PAYLOAD)],
-            sam_responses=[_sam_response(""), _sam_response(FRAG_TEXT), _sam_response("")],
+            sam_responses=[
+                _sam_response(""),
+                _sam_response(FRAG_TEXT),
+                _sam_response(""),
+            ],
         ),
     )
     result = server.cut_out(_photo_uri())
@@ -349,9 +365,7 @@ def test_production_chain_draw_receipt_pins_the_stored_mask(monkeypatch):
     from agenthand import composite
 
     monkeypatch.setenv("AGENTHAND_DRAW_PLACEHOLDER_PLATE", "1")
-    _install_fake(
-        monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)])
-    )
+    _install_fake(monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)]))
     cut = server.cut_out(_photo_uri(), "brown leather wallet")
     assert cut["status"] == "ok"
 
@@ -418,8 +432,7 @@ def test_cut_out_refuses_over_cap_before_any_api_call(monkeypatch):
 # Left half of a 4x3 frame (box-local 2x3 all-ones raster), encoded with
 # the official parser package's own raster encoder, like GOOD_TEXT.
 SCALED_TEXT = (
-    "<0f>0<|box;x1=0;y1=0;x2=1;y2=2;w=4;h=3|>"
-    "<|mask;x=0;y=0;data=3,2,!!!!!&w{Dcs|>\n"
+    "<0f>0<|box;x1=0;y1=0;x2=1;y2=2;w=4;h=3|><|mask;x=0;y=0;data=3,2,!!!!!&w{Dcs|>\n"
 )
 
 
@@ -441,7 +454,12 @@ def test_cut_out_scales_oversize_source_and_maps_the_mask_back(monkeypatch):
     }
     assert result["mask_review"]["dropped_component_pixels"] == 0
     import agenthand.assets as assets
-    pipeline = json.loads(assets.png_text_of_bytes(AssetStore(config.get_data_dir()).read_bytes(result["mask_asset"]))["agenthand_cut_pipeline"])
+
+    pipeline = json.loads(
+        assets.png_text_of_bytes(
+            AssetStore(config.get_data_dir()).read_bytes(result["mask_asset"])
+        )["agenthand_cut_pipeline"]
+    )
     assert pipeline["dropped_component_pixels"] == 0
     # The image SAM received is the 4x3 working copy, not the 8x6 photo.
     sent_uri = client.responses.calls[0]["input"][0]["content"][1]["image_url"]
@@ -509,23 +527,26 @@ def test_failed_large_cut_settles_only_completed_images(monkeypatch, failure):
     from agenthand import segmentation
     from agenthand.sam_masks import DecodedMask, SamOutputError
     import numpy as np
+
     response = _sam_response("not-used")
-    client = _install_fake(monkeypatch, _FakeClient(sam_responses=[response]*3))
-    def parse(text,w,h):
+    client = _install_fake(monkeypatch, _FakeClient(sam_responses=[response] * 3))
+
+    def parse(text, w, h):
         if failure == "unparseable":
             raise SamOutputError("unparseable SAM record")
         if failure == "no_match":
             return []
-        a = np.full((h,w),255,np.uint8)
-        return [DecodedMask("full",(0,0,w,h),int(a.size),Image.fromarray(a))]
-    monkeypatch.setattr(segmentation,"parse_sam_masks",parse)
-    result = server.cut_out(_photo_uri(size=(200,200)), "box")
+        a = np.full((h, w), 255, np.uint8)
+        return [DecodedMask("full", (0, 0, w, h), int(a.size), Image.fromarray(a))]
+
+    monkeypatch.setattr(segmentation, "parse_sam_masks", parse)
+    result = server.cut_out(_photo_uri(size=(200, 200)), "box")
     expected = 1
     assert result["status"] == "error"
     records = _records("cut_out")
-    assert records[0]["images"] == 0 and records[0]["usd_estimate"] == 8*0.0025
+    assert records[0]["images"] == 0 and records[0]["usd_estimate"] == 8 * 0.0025
     assert records[-1]["phase"] == "settled" and records[-1]["images"] == expected
     assert records[-1]["status"] == "error" and "fail-closed" in records[-1]["note"]
     assert len(client.responses.calls) == expected
-    assert result["error"]["cost_counted_usd"] == expected*0.0025
-    assert ledger.ledger_total_usd(config.get_ledger_path()) == expected*0.0025
+    assert result["error"]["cost_counted_usd"] == expected * 0.0025
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == expected * 0.0025

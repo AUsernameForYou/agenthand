@@ -160,7 +160,9 @@ def _render_region(
                 lats = rel_x[sel]
                 half[sel] = max((lats.max() - lats.min()) / 2.0, 0.5)
                 centre_off[sel] = (lats.max() + lats.min()) / 2.0
-        ratio = np.divide(rel_x - centre_off, half, out=np.zeros_like(half), where=half > 0)
+        ratio = np.divide(
+            rel_x - centre_off, half, out=np.zeros_like(half), where=half > 0
+        )
         s = np.clip(ratio, -1.0, 1.0)
         theta = np.arcsin(s)
         u = half * theta
@@ -212,11 +214,14 @@ def render_reconstruction(
     height, width = fg_alpha.shape
     allowed = fg_alpha == 0
     if GUARD_RING_PX:
-        near_product = cv2.dilate(
-            (fg_alpha > 0).astype(np.uint8),
-            np.ones((3, 3), np.uint8),
-            iterations=GUARD_RING_PX,
-        ) > 0
+        near_product = (
+            cv2.dilate(
+                (fg_alpha > 0).astype(np.uint8),
+                np.ones((3, 3), np.uint8),
+                iterations=GUARD_RING_PX,
+            )
+            > 0
+        )
         allowed &= ~near_product
     tile = _motif_tile()
     # The flat-region light envelope is a full-frame blur; compute
@@ -241,11 +246,7 @@ def render_reconstruction(
     for region in sorted(regions, key=lambda r: order[r.cls]):
         rendered = _render_region(region, source_rgb, tile, blurred_luma)
         x0, y0, x1, y1 = region.bbox
-        take = (
-            (rendered[:, :, 3] > 0)
-            & allowed[y0:y1, x0:x1]
-            & ~claimed[y0:y1, x0:x1]
-        )
+        take = (rendered[:, :, 3] > 0) & allowed[y0:y1, x0:x1] & ~claimed[y0:y1, x0:x1]
         want = int(np.count_nonzero(rendered[:, :, 3] > 0))
         got = int(np.count_nonzero(take))
         unfilled += want - got

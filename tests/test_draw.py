@@ -153,7 +153,9 @@ def test_draw_live_plate_is_priced_settled_and_pinned_in_the_receipt(monkeypatch
     assert call["model"] == "muse-image-1.0"
     assert call["n"] == 1
     assert call["size"] == "1536x1024"
-    assert call["prompt"] == meta_client.wrap_plate_prompt(meta_client.StageSpec.from_scene("a regal, warmly lit reading room"))
+    assert call["prompt"] == meta_client.wrap_plate_prompt(
+        meta_client.StageSpec.from_scene("a regal, warmly lit reading room")
+    )
     assert "where an object will be placed" not in call["prompt"]
     assert "EMPTY" in call["prompt"] and "no product" in call["prompt"]
 
@@ -189,9 +191,7 @@ def test_draw_live_composite_keeps_opaque_product_pixels_identical(monkeypatch):
 
 
 def test_generate_background_plate_stores_a_plate_asset(monkeypatch):
-    _install_fake(
-        monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())])
-    )
+    _install_fake(monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())]))
     store = AssetStore(config.get_data_dir())
     handle, billing = meta_client.generate_background_plate(
         "an empty warehouse", 800, 600, store=store
@@ -318,9 +318,7 @@ def test_draw_live_profiled_chain_stays_ok_and_receipt_records_it(monkeypatch):
 
     from agenthand import segmentation
 
-    _install_fake(
-        monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())])
-    )
+    _install_fake(monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())]))
     store = AssetStore(config.get_data_dir())
     profile = _profile_bytes()
     photo_img = Image.new("RGBA", (6, 4), (90, 90, 90, 255))
@@ -349,14 +347,12 @@ def test_draw_live_profiled_chain_stays_ok_and_receipt_records_it(monkeypatch):
 
 
 def test_draw_live_profile_break_is_a_fidelity_violation(monkeypatch):
-    _install_fake(
-        monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())])
-    )
+    _install_fake(monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())]))
     store = AssetStore(config.get_data_dir())
     photo_img = Image.new("RGBA", (6, 4), (90, 90, 90, 255))
     for y in range(4):
         for x in range(3):
-            photo_img.putpixel((x,y),(255,0,0,255))
+            photo_img.putpixel((x, y), (255, 0, 0, 255))
     photo_img.info["icc_profile"] = _profile_bytes()
     photo = store.put_image(photo_img, kind="source_photo")
     # The foreground was stored WITHOUT the source's profile (an older
@@ -385,9 +381,7 @@ def test_draw_live_profile_break_is_a_fidelity_violation(monkeypatch):
 
 
 def test_draw_persists_the_full_receipt_beside_the_composite(monkeypatch):
-    _install_fake(
-        monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())])
-    )
+    _install_fake(monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())]))
     store = AssetStore(config.get_data_dir())
     fg = _seed_foreground(store)
 
@@ -433,9 +427,7 @@ def test_draw_persists_the_full_receipt_beside_the_composite(monkeypatch):
 
 def test_mocked_draw_never_touches_the_real_ledger(monkeypatch):
     before = REAL_LEDGER.read_bytes() if REAL_LEDGER.exists() else None
-    _install_fake(
-        monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())])
-    )
+    _install_fake(monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())]))
     store = AssetStore(config.get_data_dir())
     fg = _seed_foreground(store)
 
@@ -449,10 +441,14 @@ def test_mocked_draw_never_touches_the_real_ledger(monkeypatch):
 @pytest.mark.parametrize("scene", ["a regal warmly lit reading room", "a beach house"])
 def test_draw_discloses_compiled_scene_and_dropped_words(monkeypatch, scene):
     from dataclasses import asdict
+
     _install_fake(monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())]))
     store = AssetStore(config.get_data_dir())
     fg = _seed_foreground(store)
     result, _ = server.draw(fg, scene)
     assert result["stage_spec"] == asdict(meta_client.StageSpec.from_scene(scene))
     assert "unmatched words were dropped" in result["scene_prompt_note"]
-    assert result["stage_spec"] == result["fidelity_receipt"]["plate_quality"]["stage_spec"]
+    assert (
+        result["stage_spec"]
+        == result["fidelity_receipt"]["plate_quality"]["stage_spec"]
+    )

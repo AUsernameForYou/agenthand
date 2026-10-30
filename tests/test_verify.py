@@ -367,9 +367,7 @@ def test_verify_files_refuses_an_empty_mask(tmp_path):
     # that selects nothing verify "ok" today, because 0 of 0 checked
     # pixels changed. A pass that checked nothing proves nothing.
     paths, _ = _export_run(tmp_path)
-    Image.new("RGBA", (8, 6), (250, 250, 250, 255)).save(
-        paths["final"], format="PNG"
-    )
+    Image.new("RGBA", (8, 6), (250, 250, 250, 255)).save(paths["final"], format="PNG")
     Image.new("L", (8, 6), 0).save(paths["mask"], format="PNG")
 
     report = verify.verify_files(paths["source"], paths["final"], paths["mask"])
@@ -640,9 +638,7 @@ def test_malformed_receipts_fail_structured_never_raise(tmp_path):
 
         retyped_receipt = dict(receipt)
         retyped_receipt[field] = retyped(receipt[field])
-        report = composite.verify_receipt_from_disk(
-            store, handle, retyped_receipt
-        )
+        report = composite.verify_receipt_from_disk(store, handle, retyped_receipt)
         assert report["ok"] is False, f"retyping {field} passed"
 
 

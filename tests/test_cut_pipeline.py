@@ -88,40 +88,56 @@ def test_tile_budget_covers_both_bands_with_cap():
         assert all(a["bbox"][2] >= b["bbox"][0] for a, b in zip(band, band[1:]))
 
 
-
 def test_mask_review_discloses_omitted_component_area():
-    mask = Image.new("L", (100,100))
-    mask.paste(255,(20,20,80,80))
+    mask = Image.new("L", (100, 100))
+    mask.paste(255, (20, 20, 80, 80))
     result = seg.review_mask(mask, dropped_component_pixels=300)
     assert result["dropped_component_pixels"] == 300
-    assert any("300 pixels" in warning and "completeness" in warning for warning in result["warnings"])
-
+    assert any(
+        "300 pixels" in warning and "completeness" in warning
+        for warning in result["warnings"]
+    )
 
 
 def test_tiles_use_successful_body_phrase_when_alternates_no_match(monkeypatch):
-    body = np.zeros((400,600), np.uint8)
-    body[100:300,100:500] = 255
-    tiles = seg.band_tiles((600,400),(100,100,500,300),5)
+    body = np.zeros((400, 600), np.uint8)
+    body[100:300, 100:500] = 255
+    tiles = seg.band_tiles((600, 400), (100, 100, 500, 300), 5)
     calls = []
-    def segment(data,phrase,**kwargs):
+
+    def segment(data, phrase, **kwargs):
         calls.append(phrase)
-        return str(len(calls)-1), {}
-    def parse(text,w,h):
-        i=int(text)
+        return str(len(calls) - 1), {}
+
+    def parse(text, w, h):
+        i = int(text)
         if i < 3 and i != 1:
             return []
         if i < 3:
-            a=body
+            a = body
         else:
-            x0,y0,x1,y1=tiles[i-3]["bbox"]
-            a=body[y0:y1,x0:x1]
-        return [DecodedMask(str(i),(0,0,w,h),int((a>0).sum()),Image.fromarray(a))]
-    monkeypatch.setattr(meta_client,"segment_image",segment)
-    monkeypatch.setattr(seg,"parse_sam_masks",parse)
-    source=Image.new("RGB",(600,400),(180,180,180))
-    data=BytesIO(); source.save(data,format="PNG")
-    result=seg.run_cut_pipeline(source,data.getvalue(),["failed concept","successful body","failed alternate"],model="sam-3.1")
+            x0, y0, x1, y1 = tiles[i - 3]["bbox"]
+            a = body[y0:y1, x0:x1]
+        return [
+            DecodedMask(str(i), (0, 0, w, h), int((a > 0).sum()), Image.fromarray(a))
+        ]
+
+    monkeypatch.setattr(meta_client, "segment_image", segment)
+    monkeypatch.setattr(seg, "parse_sam_masks", parse)
+    source = Image.new("RGB", (600, 400), (180, 180, 180))
+    data = BytesIO()
+    source.save(data, format="PNG")
+    result = seg.run_cut_pipeline(
+        source,
+        data.getvalue(),
+        ["failed concept", "successful body", "failed alternate"],
+        model="sam-3.1",
+    )
     assert result["phrase"] == "successful body"
-    assert len(calls)>3 and set(calls[3:]) == {"successful body"}
+    assert len(calls) > 3 and set(calls[3:]) == {"successful body"}
     assert result["usage"]["images"] == len(calls) <= 8
-    assert [trace["outcome"] for trace in result["attempts"][:3]] == ["no_match","accepted","no_match"]
+    assert [trace["outcome"] for trace in result["attempts"][:3]] == [
+        "no_match",
+        "accepted",
+        "no_match",
+    ]

@@ -180,9 +180,7 @@ def test_verify_files_counts_match_the_oracle(tmp_path, size, data):
     # Binary-alpha fixtures: the "foreground" IS the source photo
     # here, the mask is its alpha channel read as 255-or-nothing,
     # and the clean composite must verify with the oracle's counts.
-    foreground, plate = _pair(
-        data, size, st.sampled_from([0, 255]), st.just(255)
-    )
+    foreground, plate = _pair(data, size, st.sampled_from([0, 255]), st.just(255))
     mask = foreground.getchannel("A").point(lambda a: 255 if a == 255 else 0)
     final, _counts, _t = composite.composite_images(foreground, plate)
     paths = {}

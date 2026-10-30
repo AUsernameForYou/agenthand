@@ -55,9 +55,7 @@ def _store_with_cut(tmp_path, source_rgb, alpha, mask=True):
         mask_handle = None
         parent = AssetStore.parse_handle(source)
     fg = segmentation.extract_foreground(source_img, mask_img)
-    fg_handle = store.put_image(
-        fg, kind="foreground_png", source_asset_id=parent
-    )
+    fg_handle = store.put_image(fg, kind="foreground_png", source_asset_id=parent)
     return store, source, mask_handle, fg_handle
 
 
@@ -269,9 +267,7 @@ def test_occluder_from_another_source_is_refused(tmp_path):
         source_asset_id=AssetStore.parse_handle(other),
     )
     with pytest.raises(Exception):
-        paperfill.build_reconstruction(
-            store, fg, occluder_mask_handles=(occ_handle,)
-        )
+        paperfill.build_reconstruction(store, fg, occluder_mask_handles=(occ_handle,))
 
 
 # -- wiring: draw + receipt + verifier -------------------------------------
@@ -291,17 +287,15 @@ def test_draw_with_paper_fill_receipt_verifies(tmp_path):
     assert block["reconstruction_overlap_product_pixels"] == 0
     assert block["layer_asset"] is not None
     assert block["region_map_asset"] is not None
-    assert sum(r["pixels"] for r in block["regions"]) == block[
-        "reconstruction_pixels"
-    ]
+    assert sum(r["pixels"] for r in block["regions"]) == block["reconstruction_pixels"]
     assert receipt["changed_opaque_pixels"] == 0
     report = composite.verify_receipt_from_disk(store, result["output_asset"])
     assert report["ok"] is True, report["problems"]
     assert report["checks"]["layer_reproduction"] is True
     assert report["checks"]["foreground_matches_source"] is True
-    assert report["recomputed"]["reconstruction_pixels"] == block[
-        "reconstruction_pixels"
-    ]
+    assert (
+        report["recomputed"]["reconstruction_pixels"] == block["reconstruction_pixels"]
+    )
 
 
 def test_draw_without_paper_records_status_none(tmp_path):
@@ -398,8 +392,7 @@ def test_tiny_dark_dash_is_too_short_to_be_a_support():
     regions, refusals, _gaps = paperfill.detect_regions(src, alpha)
     assert [r for r in regions if r.cls == "support"] == []
     assert any(
-        r.code == "SUPPORT_REJECTED" and "too short" in r.detail
-        for r in refusals
+        r.code == "SUPPORT_REJECTED" and "too short" in r.detail for r in refusals
     )
 
 

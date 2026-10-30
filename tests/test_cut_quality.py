@@ -149,13 +149,12 @@ def test_outer_taper_and_unbounded_dark_background_are_not_top_or_support_defect
     ), q
 
 
-@pytest.mark.parametrize("shape", ["ladder_back", "stretcher_table", "two_post_chair", "planter_handles", "mug_handle"])
-def test_real_openings_pass_without_paper(tmp_path, shape):
+def opening_scene(shape):
     a = np.zeros((300, 360), np.uint8)
     if shape == "ladder_back":
         a[30:240, 60:78] = a[30:240, 282:300] = 255
         for y in (30, 75, 120, 190):
-            a[y:y+18, 60:300] = 255
+            a[y : y + 18, 60:300] = 255
     elif shape == "stretcher_table":
         a[30:65, 40:320] = 255
         a[65:250, 60:80] = a[65:250, 280:300] = 255
@@ -172,13 +171,31 @@ def test_real_openings_pass_without_paper(tmp_path, shape):
         a[80:210, 280:305] = 255
     src = np.full((*a.shape, 3), 205, np.uint8)
     src[a > 0] = (95, 65, 40)
+    return src, a
+
+
+@pytest.mark.parametrize(
+    "shape",
+    [
+        "ladder_back",
+        "stretcher_table",
+        "two_post_chair",
+        "planter_handles",
+        "mug_handle",
+    ],
+)
+def test_real_openings_pass_without_paper(tmp_path, shape):
+    src, a = opening_scene(shape)
     quality = grade_cut(src, a)
     assert quality["grade"] == "PASS", quality
     assert quality["metrics"]["open_geometry_pixels"] > 0
     from test_paperfill import _store_with_cut
     from agenthand import paperfill
+
     store, _, _, fh = _store_with_cut(tmp_path, src, a)
-    assert composite.prepare_draw(store, fh)["reconstruction_report"]["status"] == "none"
+    assert (
+        composite.prepare_draw(store, fh)["reconstruction_report"]["status"] == "none"
+    )
     report = paperfill.build_reconstruction(store, fh)
     assert report["reconstruction_pixels"] == 0, report
 
@@ -211,33 +228,45 @@ def test_box_contact_shadow_passes_at_multiple_resolutions(scale):
     assert grade_cut(src, a)["grade"] == "PASS"
 
 
-@pytest.mark.parametrize("floor,leg", [((200,200,200),(15,15,15)), ((40,40,40),(230,230,230)), ((150,100,70),(70,110,200))])
+@pytest.mark.parametrize(
+    "floor,leg",
+    [
+        ((200, 200, 200), (15, 15, 15)),
+        ((40, 40, 40), (230, 230, 230)),
+        ((150, 100, 70), (70, 110, 200)),
+    ],
+)
 def test_missing_supports_detect_both_contrast_directions_and_chroma(floor, leg):
     src, a = scene()
     src[:] = floor
     for x in (35, 100):
-        src[65:87, x:x+4] = leg
+        src[65:87, x : x + 4] = leg
     q = grade_cut(src, a)
     assert q["grade"] == "REPAIRABLE", q
     assert "SUPPORT_NOT_CAPTURED" in q["codes"]
     from agenthand.mask_evidence import TypedMask, typed_regions
     from agenthand.segmentation import _classify_component
+
     support = np.zeros_like(a, bool)
     support[65:87, 35:39] = True
-    assert _classify_component(support, a>0, src, (25,20,115,65), "support") == "support"
+    assert (
+        _classify_component(support, a > 0, src, (25, 20, 115, 65), "support")
+        == "support"
+    )
     regions, _, _ = typed_regions(src, a, [TypedMask("support", support)], [])
     assert any(r.provenance.get("basis") == "typed_support_mask" for r in regions)
     for x in (35, 100):
-        a[65:87, x:x+4] = 255
+        a[65:87, x : x + 4] = 255
     assert grade_cut(src, a)["grade"] == "PASS"
 
 
 def test_export_verifier_fails_reshoot_even_when_fidelity_holds(tmp_path, capsys):
     import json
     from agenthand.verify import main
+
     src, a = scene()
     a[20:40, 50:80] = 0
-    paths = [tmp_path/n for n in ("source.png", "final.png", "mask.png")]
+    paths = [tmp_path / n for n in ("source.png", "final.png", "mask.png")]
     for path, pixels in zip(paths, (src, src, a)):
         Image.fromarray(pixels).save(path)
     assert main([str(p) for p in paths]) == 1
@@ -250,15 +279,23 @@ def test_export_verifier_regrades_paper_like_preflight(tmp_path):
     from agenthand import paperfill
     from agenthand.verify import verify_files
     from test_paperfill import _store_with_cut
+
     src, a = scene()
     a[27:35, 50:65] = 0
     store, sh, mh, fh = _store_with_cut(tmp_path, src, a)
     report = paperfill.build_reconstruction(store, fh)
     assert report["reconstruction_pixels"] > 0
-    final = tmp_path/"final.png"
+    final = tmp_path / "final.png"
     Image.fromarray(src).save(final)
-    checked = verify_files(store.resolve(sh), final, store.resolve(mh), reconstruction_path=store.resolve(report["layer_handle"]))
+    checked = verify_files(
+        store.resolve(sh),
+        final,
+        store.resolve(mh),
+        reconstruction_path=store.resolve(report["layer_handle"]),
+    )
     assert checked["ok"], checked
     assert checked["cut_quality_before"]["grade"] == "REPAIRABLE"
-    assert checked["cut_quality"] == composite.preflight_cut(store, fh, reconstruction_handle=report["layer_handle"], require_pass=True)
+    assert checked["cut_quality"] == composite.preflight_cut(
+        store, fh, reconstruction_handle=report["layer_handle"], require_pass=True
+    )
     assert checked["cut_quality"]["grade"] == "PASS"

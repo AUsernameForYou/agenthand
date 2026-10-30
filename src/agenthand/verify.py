@@ -153,15 +153,11 @@ def verify_files(
                 f"{source.size}; paper is rendered on the product's frame"
             )
         elif mask.size == source.size:
-            recon_alpha = np.frombuffer(
-                recon.getchannel("A").tobytes(), dtype=np.uint8
-            )
+            recon_alpha = np.frombuffer(recon.getchannel("A").tobytes(), dtype=np.uint8)
             mask_values = np.frombuffer(mask.tobytes(), dtype=np.uint8)
             paper = recon_alpha > 0
             reconstruction_pixels = int(np.count_nonzero(paper))
-            reconstruction_overlap = int(
-                np.count_nonzero(paper & (mask_values > 0))
-            )
+            reconstruction_overlap = int(np.count_nonzero(paper & (mask_values > 0)))
             if reconstruction_overlap:
                 problems.append(
                     f"reconstruction places paper on "
@@ -201,10 +197,19 @@ def verify_files(
     if paper is not None:
         alpha = np.asarray(mask)
         paper = paper.reshape(alpha.shape)
-        near = cv2.dilate((alpha > 0).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=GUARD_RING_PX) > 0
+        near = (
+            cv2.dilate(
+                (alpha > 0).astype(np.uint8),
+                np.ones((3, 3), np.uint8),
+                iterations=GUARD_RING_PX,
+            )
+            > 0
+        )
         if (paper & near).any():
             problems.append("paper violates foreground guard ring")
-        fraction = int(paper.sum()) / max(1, int(paper.sum()) + int((alpha == 255).sum()))
+        fraction = int(paper.sum()) / max(
+            1, int(paper.sum()) + int((alpha == 255).sum())
+        )
         if fraction > MAX_RECONSTRUCTION_FRACTION:
             problems.append("reconstruction exceeds maximum fraction")
         # As in preflight_cut, a fatal raw cut cannot be rescued by paper.
