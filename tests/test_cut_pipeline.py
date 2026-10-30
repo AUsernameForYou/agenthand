@@ -62,6 +62,7 @@ def test_ensemble_tiles_preserve_records_and_recover_observed_legs(monkeypatch):
     assert result["usage"]["images"] == len(calls)
     out = np.asarray(result["mask_image"])
     assert np.array_equal(out, truth)
+    assert result["dropped_component_pixels"] == 300
     assert any(
         c["role"] == "top_band_candidate"
         for r in result["records"]
@@ -85,3 +86,12 @@ def test_tile_budget_covers_both_bands_with_cap():
         )
         assert band[0]["bbox"][0] == 1563 and band[-1]["bbox"][2] == 4419
         assert all(a["bbox"][2] >= b["bbox"][0] for a, b in zip(band, band[1:]))
+
+
+
+def test_mask_review_discloses_omitted_component_area():
+    mask = Image.new("L", (100,100))
+    mask.paste(255,(20,20,80,80))
+    result = seg.review_mask(mask, dropped_component_pixels=300)
+    assert result["dropped_component_pixels"] == 300
+    assert any("300 pixels" in warning and "completeness" in warning for warning in result["warnings"])

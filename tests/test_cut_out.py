@@ -439,6 +439,10 @@ def test_cut_out_scales_oversize_source_and_maps_the_mask_back(monkeypatch):
         "sam_height": 3,
         "scale_method": "bilinear_threshold_128",
     }
+    assert result["mask_review"]["dropped_component_pixels"] == 0
+    import agenthand.assets as assets
+    pipeline = json.loads(assets.png_text_of_bytes(AssetStore(config.get_data_dir()).read_bytes(result["mask_asset"]))["agenthand_cut_pipeline"])
+    assert pipeline["dropped_component_pixels"] == 0
     # The image SAM received is the 4x3 working copy, not the 8x6 photo.
     sent_uri = client.responses.calls[0]["input"][0]["content"][1]["image_url"]
     sent = Image.open(BytesIO(base64.b64decode(sent_uri.split(",", 1)[1])))

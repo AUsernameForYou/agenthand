@@ -565,7 +565,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     pnginfo.add_text(
         "agenthand_cut_pipeline",
         json.dumps(
-            {"version": outcome["pipeline_version"], "records": evidence_records},
+            {"version": outcome["pipeline_version"], "records": evidence_records, "dropped_component_pixels": outcome["dropped_component_pixels"]},
             sort_keys=True,
         ),
     )
@@ -605,7 +605,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         kind=KIND_OVERLAY,
         source_asset_id=source_record.asset_id,
     )
-    mask_review = segmentation.review_mask(full_mask, source_image)
+    mask_review = segmentation.review_mask(full_mask, source_image, dropped_component_pixels=outcome["dropped_component_pixels"])
 
     return {
         "status": "ok",
