@@ -32,6 +32,7 @@ in the ledger.
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass, asdict
 import fcntl
 import json
 import math
@@ -911,16 +912,44 @@ _IMAGE_SIZE_CANDIDATES: tuple[tuple[int, int], ...] = (
     (1024, 1792),
 )
 
-# The fixed plate instruction wrapped around the caller's scene words.
-# The plate is a STAGE, not a picture of the product: it must come back
-# empty, with a clear place for the product to sit, because the real
-# product layer is composited onto it locally under the Fidelity Lock.
+STAGE_SPEC_VERSION = "agenthand.stage-spec/1"
+PLATE_MAX_ATTEMPTS = 2
+
+
+@dataclass(frozen=True)
+class StageSpec:
+    stage_mode: str = "room"
+    floor: str = "light wood"
+    wall: str = "neutral plaster"
+    lighting: str = "soft daylight"
+    camera_class: str = "level architectural camera"
+    version: str = STAGE_SPEC_VERSION
+
+    def __post_init__(self):
+        choices = {"stage_mode": {"room", "studio"}, "floor": {"light wood", "matte concrete", "studio gray"}, "wall": {"neutral plaster", "studio gray"}, "lighting": {"soft daylight", "warm diffuse light"}, "camera_class": {"level architectural camera"}, "version": {STAGE_SPEC_VERSION}}
+        for name, allowed in choices.items():
+            if getattr(self, name) not in allowed:
+                raise ValueError(f"unsupported StageSpec {name}")
+
+    @classmethod
+    def from_scene(cls, scene: str) -> "StageSpec":
+        words = scene.lower()
+        studio = "studio" in words
+        return cls(stage_mode="studio" if studio else "room",
+                   floor="studio gray" if studio else "matte concrete" if "concrete" in words else "light wood",
+                   wall="studio gray" if studio else "neutral plaster",
+                   lighting="warm diffuse light" if "warm" in words else "soft daylight")
+
+
+# One versioned template. No caller prose, product pixels, or object-placement
+# wording enters the image request. The compiled spec is disclosed in receipts.
 _PLATE_INSTRUCTION = (
-    "An empty scene photographed straight-on: the setting described "
-    "below, with a clear, unobstructed flat surface in the center "
-    "foreground where an object will be placed later. The scene is "
-    "EMPTY: no product, no featured object on the central surface, no "
-    "people, no animals, no text, no logos, no watermark. Scene: "
+    "EMPTY architectural photograph. Continuous {floor} floor from the wall "
+    "junction to every lower frame edge; {wall} wall; {lighting}; "
+    "{camera_class}. Mode: {stage_mode}. One continuous floor plane. "
+    "No raised slab, plinth, podium, platform, furniture, central object, "
+    "people, animals, text, logos or watermark; no product. "
+    "Specification: {version}."
 )
 
 
@@ -945,14 +974,10 @@ class ImageResultError(RuntimeError):
         self.code = code
 
 
-def wrap_plate_prompt(scene_prompt: str) -> str:
-    """Wrap the caller's scene words in the fixed empty-plate instruction.
-
-    The user's scene description is preserved verbatim at the end; the
-    wrapper only adds the constraints that make the result a usable
-    plate (empty, centered surface, no product/people/text).
-    """
-    return _PLATE_INSTRUCTION + scene_prompt
+def wrap_plate_prompt(scene_prompt: str | StageSpec) -> str:
+    """Compile a constrained versioned stage specification through one template."""
+    spec = scene_prompt if isinstance(scene_prompt, StageSpec) else StageSpec.from_scene(scene_prompt)
+    return _PLATE_INSTRUCTION.format(**asdict(spec))
 
 
 def closest_image_size(width: int | None, height: int | None) -> str:
@@ -1109,6 +1134,7 @@ def generate_background_plate(
     model: str = "muse-image-1.0",
     store=None,
     client=None,
+    foreground_bbox: list[int] | tuple[int,...] | None = None,
 ) -> tuple[str, dict]:
     """Generate a background plate through the billing choke point.
 
@@ -1135,17 +1161,32 @@ def generate_background_plate(
         store = AssetStore(config.get_data_dir())
     from .assets import KIND_PLATE
 
-    projected = project_draw_cost_usd(model)
-    outcome: dict = {}
-
-    def _call() -> UsageDict:
-        png_bytes, usage = _request_plate_image(
-            prompt, width, height, model=model, client=client
-        )
-        outcome["handle"] = store.put_bytes(
-            png_bytes, kind=KIND_PLATE, suffix=".png"
-        )
-        return usage
-
-    billing = billed_call("draw", model, projected, _call)
-    return outcome["handle"], billing
+    from .plate_quality import assess_plate
+    from . import backdrop
+    spec = prompt if isinstance(prompt, StageSpec) else StageSpec.from_scene(prompt)
+    bbox = foreground_bbox or [int(.2*width), int(.2*height), int(.8*width), int(.75*height)]
+    attempts = []
+    billings = []
+    handle = None
+    for _ in range(PLATE_MAX_ATTEMPTS):
+        outcome = {}
+        def _call() -> UsageDict:
+            png_bytes, usage = _request_plate_image(spec, width, height, model=model, client=client)
+            outcome["handle"] = store.put_bytes(png_bytes, kind=KIND_PLATE, suffix=".png")
+            return usage
+        billing = billed_call("draw", model, project_draw_cost_usd(model), _call)
+        billings.append(billing)
+        handle = outcome["handle"]
+        quality = assess_plate(store.read_image(handle), bbox, (width,height))
+        attempts.append({"plate_asset": handle, "quality": quality, "call_id": billing["call_id"]})
+        if quality["grade"] == "PASS": break
+    fallback = quality["grade"] != "PASS"
+    if fallback:
+        handle = store.put_image(backdrop.render_plate("studio_gray",width,height),kind=KIND_PLATE)
+        quality = assess_plate(store.read_image(handle),bbox,(width,height),code_backdrop=backdrop.backdrop_info("studio_gray"))
+    combined = dict(billings[-1])
+    combined.update(actual_usd=round(sum(b["actual_usd"] for b in billings),10),
+                    projected_usd=round(sum(b["projected_usd"] for b in billings),10),
+                    usage={"images":len(billings)}, call_ids=[b["call_id"] for b in billings],
+                    plate_quality={"assessment":quality,"attempts":attempts,"fallback":fallback,"fallback_reason":"two_rejected_plates" if fallback else None,"stage_spec":asdict(spec)})
+    return handle, combined

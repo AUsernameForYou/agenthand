@@ -153,7 +153,8 @@ def test_draw_live_plate_is_priced_settled_and_pinned_in_the_receipt(monkeypatch
     assert call["model"] == "muse-image-1.0"
     assert call["n"] == 1
     assert call["size"] == "1536x1024"
-    assert call["prompt"].endswith("a regal, warmly lit reading room")
+    assert call["prompt"] == meta_client.wrap_plate_prompt(meta_client.StageSpec.from_scene("a regal, warmly lit reading room"))
+    assert "where an object will be placed" not in call["prompt"]
     assert "EMPTY" in call["prompt"] and "no product" in call["prompt"]
 
     # Priced at the per-image rate and settled with images=1.

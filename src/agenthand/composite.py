@@ -417,6 +417,7 @@ def draw_product(
     reconstruction_handle: str | None = None,
     region_map_handle: str | None = None,
     reconstruction_report: dict | None = None,
+    plate_quality_report: dict | None = None,
 ) -> tuple[str, dict]:
     """Composite a stored foreground into a scene; returns (handle, receipt).
 
@@ -534,6 +535,13 @@ def draw_product(
         plate_pixel_sha256 = None
         if plate_kind is None:
             plate_kind = "local_placeholder"
+
+    from .plate_quality import assess_plate, PlateQualityError
+    quality = assess_plate(plate, foreground.getbbox() or [0,0,foreground.width,foreground.height], foreground.size, code_backdrop=backdrop if plate_kind == "code_rendered" else None)
+    if quality["grade"] != "PASS": raise PlateQualityError(quality)
+    if plate_quality_report is not None and quality != plate_quality_report.get("assessment"):
+        raise PlateQualityError({**quality,"grade":"FAIL","codes":["PLATE_REPORT_MISMATCH"]})
+    plate_quality_block = plate_quality_report or {"assessment": quality, "attempts": [], "fallback": False, "fallback_reason": None, "stage_spec": None}
 
     composite, _in_memory_counts, transformations = composite_images(
         foreground, plate, layer_image
@@ -690,6 +698,7 @@ def draw_product(
         ),
     }
     receipt["reconstruction"] = reconstruction_block
+    receipt["plate_quality"] = plate_quality_block
     if mask_provenance is not None:
         # Mask provenance (decision 68): the receipt states the frame
         # the mask was cut from, the frame SAM actually saw, and how

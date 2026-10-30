@@ -114,6 +114,7 @@ def _persist_full_receipt(
             "cost_usd": billing["actual_usd"],
             "usage": billing.get("usage"),
             "call_id": billing.get("call_id"),
+            "call_ids": billing.get("call_ids", [billing.get("call_id")]),
         }
     )
     store.save_receipt(handle, full)
@@ -217,12 +218,20 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
             foreground_record.width,
             foreground_record.height,
             model=DRAW_BACKGROUND_MODEL,
+            store=store,
+            foreground_bbox=store.read_image(asset).getbbox(),
         )
     except meta_client.ImageResultError as exc:
         return _error(exc.code, str(exc), cost_counted_usd=projected)
 
+    quality = billing["plate_quality"]
+    fallback_kwargs = {}
+    if quality["fallback"]:
+        from .backdrop import backdrop_info
+        fallback_kwargs = {"plate_kind": "code_rendered", "backdrop": backdrop_info("studio_gray")}
     handle, receipt = composite.draw_product(
-        store, asset, scene_prompt, plate_handle=plate_handle, **prepared
+        store, asset, scene_prompt, plate_handle=plate_handle,
+        plate_quality_report=quality, **prepared, **fallback_kwargs
     )
     # The receipt is persisted (with cost and call attribution) even
     # when the composite fails the Lock checks below: a violation's
