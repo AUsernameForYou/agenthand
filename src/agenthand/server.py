@@ -187,7 +187,7 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     # the mode branches — so a refused asset never reaches the gate,
     # never leaves a reservation, and is refused the same way in both
     # modes. Raises FidelityLockError / KeyError.
-    composite.preflight_cut(store, asset)
+    prepared = composite.prepare_draw(store, asset)
     foreground_record = store.get_record(asset)
 
     def _error(code: str, message: str, **extra) -> dict:
@@ -203,7 +203,7 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
         }
 
     if config.use_placeholder_plate():
-        return _draw_with_placeholder_plate(store, asset, scene_prompt)
+        return _draw_with_placeholder_plate(store, asset, scene_prompt, prepared)
 
     try:
         meta_client.require_meta_api_key()
@@ -222,7 +222,7 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
         return _error(exc.code, str(exc), cost_counted_usd=projected)
 
     handle, receipt = composite.draw_product(
-        store, asset, scene_prompt, plate_handle=plate_handle
+        store, asset, scene_prompt, plate_handle=plate_handle, **prepared
     )
     # The receipt is persisted (with cost and call attribution) even
     # when the composite fails the Lock checks below: a violation's
@@ -279,7 +279,7 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     return [result, preview]
 
 
-def _draw_with_placeholder_plate(store: AssetStore, asset: str, scene_prompt: str) -> list:
+def _draw_with_placeholder_plate(store: AssetStore, asset: str, scene_prompt: str, prepared: dict) -> list:
     """draw's offline dev mode (AGENTHAND_DRAW_PLACEHOLDER_PLATE=1).
 
     The full Fidelity Lock pipeline (validation, compositing, receipt)
@@ -292,7 +292,7 @@ def _draw_with_placeholder_plate(store: AssetStore, asset: str, scene_prompt: st
     outcome: dict = {}
 
     def _run_composite() -> dict:
-        handle, receipt = composite.draw_product(store, asset, scene_prompt)
+        handle, receipt = composite.draw_product(store, asset, scene_prompt, **prepared)
         outcome["handle"] = handle
         outcome["receipt"] = receipt
         return {}  # no model usage: the plate is a local placeholder

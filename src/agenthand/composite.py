@@ -357,18 +357,53 @@ class StageabilityError(FidelityLockError):
         super().__init__("Reshoot required: " + "; ".join(quality["instructions"]))
 
 
-def preflight_cut(store: AssetStore, foreground_handle: str) -> dict:
-    """Read current source/alpha evidence before any plate generation."""
+def preflight_cut(store: AssetStore, foreground_handle: str, *, reconstruction_handle: str | None = None, require_pass: bool = False, occluder_mask_handles: tuple[str,...] = ()) -> dict:
+    """Recompute source/mask quality, and regrade separate paper when supplied."""
     from .cut_quality import grade_cut
+    from .paperfill import load_typed_evidence, GUARD_RING_PX, MAX_RECONSTRUCTION_FRACTION
     chain = validate_foreground(store, foreground_handle)
     fg = store.read_image(foreground_handle)
     source = store.read_image(HANDLE_PREFIX + chain[-1].asset_id)
     if source.size != fg.size:
         raise FidelityLockError("source and foreground frames differ")
-    quality = grade_cut(source, fg.getchannel("A"))
+    _supports, occluders = load_typed_evidence(store, foreground_handle, occluder_mask_handles=occluder_mask_handles)
+    quality = grade_cut(source, fg.getchannel("A"), occluders=occluders)
     if quality["grade"] == "RESHOOT":
         raise StageabilityError(quality)
+    if reconstruction_handle:
+        record = store.get_record(reconstruction_handle)
+        parent = chain[1].asset_id if chain[1].kind == KIND_MASK else chain[0].asset_id
+        if record.kind != KIND_RECONSTRUCTION or record.source_asset_id != parent:
+            raise FidelityLockError("reconstruction is not chained to this cut")
+        store.verify_integrity(reconstruction_handle)
+        layer = store.read_image(reconstruction_handle)
+        if layer.size != fg.size: raise FidelityLockError("reconstruction frame differs")
+        alpha = np.asarray(fg.getchannel("A"))
+        paper = np.asarray(layer.getchannel("A")) > 0
+        near = cv2.dilate((alpha > 0).astype(np.uint8), np.ones((3,3),np.uint8), iterations=GUARD_RING_PX) > 0
+        if (paper & near).any(): raise FidelityLockError("paper violates foreground guard ring")
+        if int(paper.sum()) / max(1,int(paper.sum())+int((alpha==255).sum())) > MAX_RECONSTRUCTION_FRACTION:
+            raise FidelityLockError("reconstruction exceeds maximum fraction")
+        # Guard pixels remain plate pixels in the delivered image. Dilation
+        # bridges that one-pixel safety seam for stageability geometry only.
+        bridged = cv2.dilate(paper.astype(np.uint8),np.ones((3,3),np.uint8)) > 0
+        top = np.where((alpha > 0).any(axis=1))[0]
+        if len(top): bridged[:int(top[0])] = False
+        semantic = (alpha > 0) | bridged
+        quality = grade_cut(source, semantic.astype(np.uint8)*255)
+    if require_pass and quality["grade"] != "PASS":
+        quality = {**quality, "grade": "RESHOOT"}
+    if quality["grade"] == "RESHOOT": raise StageabilityError(quality)
     return quality
+
+
+def prepare_draw(store: AssetStore, foreground_handle: str) -> dict:
+    """Repair provable defects and require a passing cut before plate spend."""
+    from .paperfill import build_reconstruction
+    before = preflight_cut(store, foreground_handle)
+    report = build_reconstruction(store, foreground_handle) if before["grade"] == "REPAIRABLE" else {"status": "none"}
+    preflight_cut(store, foreground_handle, reconstruction_handle=report.get("layer_handle"), require_pass=True)
+    return {"reconstruction_handle": report.get("layer_handle"), "region_map_handle": report.get("region_map_handle"), "reconstruction_report": report}
 
 
 def draw_product(
@@ -398,7 +433,12 @@ def draw_product(
     from the plate's presence: a supplied plate asset defaults to
     "model_generated", no plate asset means "local_placeholder".
     """
-    preflight_cut(store, foreground_handle)
+    if reconstruction_handle is None and reconstruction_report is None:
+        prepared = prepare_draw(store, foreground_handle)
+        reconstruction_handle = prepared["reconstruction_handle"]
+        region_map_handle = prepared["region_map_handle"]
+        reconstruction_report = prepared["reconstruction_report"]
+    preflight_cut(store, foreground_handle, reconstruction_handle=reconstruction_handle, require_pass=True, occluder_mask_handles=tuple((reconstruction_report or {}).get("evidence", {}).get("occluder_mask_handles", [])))
     chain = validate_foreground(store, foreground_handle)
     record = chain[0]
     source_record = chain[-1]
@@ -557,6 +597,7 @@ def draw_product(
     reconstruction_block = {
         "status": recon_status,
         "renderer": report.get("renderer"),
+        "evidence": report.get("evidence", {}),
         "layer_asset": reconstruction_handle,
         "layer_sha256": layer_record.sha256 if layer_record else None,
         "layer_pixel_sha256": layer_record.pixel_sha256 if layer_record else None,

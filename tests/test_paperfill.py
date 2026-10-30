@@ -233,7 +233,7 @@ def test_support_motif_is_not_stretched():
 # -- occluders -------------------------------------------------------------
 
 
-def test_occluder_mask_becomes_an_occluder_region(tmp_path):
+def test_occluder_without_bounded_footprint_is_not_papered(tmp_path):
     src = _frame()
     alpha = _alpha_with([(20, 70, 30, 90)])
     store, source, _m, fg = _store_with_cut(tmp_path, src, alpha)
@@ -248,17 +248,9 @@ def test_occluder_mask_becomes_an_occluder_region(tmp_path):
     report = paperfill.build_reconstruction(
         store, fg, occluder_mask_handles=(occ_handle,)
     )
-    assert report["status"] == "applied"
-    classes = {r["class"] for r in report["regions"]}
-    assert "occluder" in classes
-    # Only the part of the occluder OFF the product is papered, and
-    # the guard ring takes the column touching the product:
-    # cols 91..99 of the 80..99 silhouette survive.
-    occ = next(r for r in report["regions"] if r["class"] == "occluder")
-    assert occ["pixels"] == 15 * 9
-    assert report["reconstruction_pixels"] == sum(
-        r["pixels"] for r in report["regions"]
-    )
+    assert report["status"] == "refused"
+    assert report["reconstruction_pixels"] == 0
+    assert any(r["code"] == "OCCLUDER_WITHOUT_FOOTPRINT" for r in report["refusals"])
 
 
 def test_occluder_from_another_source_is_refused(tmp_path):

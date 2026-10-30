@@ -16,7 +16,7 @@ INSTRUCTIONS = {
     'MASK_FRAGMENTED': 'Place one complete product against a plain contrasting background, leave space around every edge, and keep the whole product in frame.',
 }
 
-def grade_cut(source: Image.Image | np.ndarray | None, mask: Image.Image | np.ndarray) -> dict:
+def grade_cut(source: Image.Image | np.ndarray | None, mask: Image.Image | np.ndarray, *, occluders: list[evidence.TypedMask] | None = None) -> dict:
     alpha = np.asarray(mask.convert('L') if isinstance(mask, Image.Image) else mask)
     if alpha.ndim != 2:
         raise ValueError('cut mask must be a single-channel source-frame raster')
@@ -28,8 +28,12 @@ def grade_cut(source: Image.Image | np.ndarray | None, mask: Image.Image | np.nd
         codes.append('MASK_FRAGMENTED'); fatal = True
     if metrics['top_island_pixels'] > max(4, .001*area):
         codes.append('TOP_OCCLUDED'); fatal = True
+    footprints = evidence.top_footprints(alpha, occluders or []) if occluders else []
+    proven_top = sum(int(r.silhouette.sum()) for r in footprints)
+    metrics['proven_top_footprint_pixels'] = proven_top
     if metrics['top_concavity_pixels'] > max(12, .005*area):
-        codes.append('TOP_OCCLUDED'); fatal = True
+        codes.append('TOP_OCCLUDED')
+        fatal |= metrics['top_concavity_pixels'] - proven_top > max(12, .005*area)
     if metrics['enclosed_hole_pixels'] > max(4, .0005*area):
         codes.append('TOP_PERFORATED')
         fatal |= metrics['enclosed_hole_pixels'] > .4*area

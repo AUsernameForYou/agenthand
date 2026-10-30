@@ -56,7 +56,8 @@ from .assets import (
     AssetStore,
 )
 
-RENDERER_VERSION = "agenthand.paperfill/1"
+RENDERER_VERSION = "agenthand.paperfill/2"
+MAX_RECONSTRUCTION_FRACTION = 0.40
 
 # The paper print: the backdrop motif's geometry at full strength.
 PAPER_MOTIF_DIAMETER_PX = backdrop.WALLPAPER_MOTIF_DIAMETER_PX
@@ -78,6 +79,8 @@ from .mask_evidence import (
     _bbox_of,
     _components,
     detect_regions,
+    TypedMask,
+    typed_regions,
     MIN_HOLE_FRACTION,
     MAX_HOLE_FRACTION,
     SUPPORT_TOUCH_DILATE_PX,
@@ -158,7 +161,8 @@ def _render_region(
                 lats = rel_x[sel]
                 half[sel] = max((lats.max() - lats.min()) / 2.0, 0.5)
                 centre_off[sel] = (lats.max() + lats.min()) / 2.0
-        s = np.clip((rel_x - centre_off) / half, -1.0, 1.0)
+        ratio = np.divide(rel_x - centre_off, half, out=np.zeros_like(half), where=half > 0)
+        s = np.clip(ratio, -1.0, 1.0)
         theta = np.arcsin(s)
         u = half * theta
         v = rel_y - rel_y[local].min()
@@ -267,6 +271,8 @@ def build_reconstruction(
     store: AssetStore,
     foreground_handle: str,
     occluder_mask_handles: tuple[str, ...] = (),
+    *,
+    support_mask_handles: tuple[str, ...] = (),
 ) -> dict:
     """Detect, render, and store the paper layer for a foreground.
 
@@ -300,34 +306,17 @@ def build_reconstruction(
     source_rgb = np.asarray(source)
     fg_alpha = np.asarray(foreground.getchannel("A"))
 
-    regions, refusals, unfilled = detect_regions(source_rgb, fg_alpha)
-
-    for handle in occluder_mask_handles:
-        record = store.get_record(handle)
-        if record.kind != KIND_MASK:
-            raise FidelityLockError(
-                f"occluder {handle!r} is kind {record.kind!r}, not {KIND_MASK}"
-            )
-        if record.source_asset_id != source_record.asset_id:
-            raise FidelityLockError(
-                f"occluder {handle!r} is not chained to this foreground's source"
-            )
-        store.verify_integrity(handle)
-        occ = np.asarray(store.read_image(handle).convert("L")) > 127
-        silhouette = occ & (fg_alpha == 0)
-        if silhouette.any():
-            obox = _bbox_of(silhouette)
-            regions.append(
-                Region(
-                    cls="occluder",
-                    silhouette=silhouette[obox[1] : obox[3], obox[0] : obox[2]],
-                    provenance={
-                        "basis": "occluder_mask",
-                        "occluder_mask_asset": handle,
-                    },
-                    bbox=obox,
-                )
-            )
+    supports, occluders = load_typed_evidence(store, foreground_handle, support_mask_handles=support_mask_handles, occluder_mask_handles=occluder_mask_handles)
+    regions, refusals, unfilled = typed_regions(source_rgb, fg_alpha, supports, occluders)
+    union = np.zeros_like(fg_alpha, dtype=bool)
+    for r in regions:
+        x0,y0,x1,y1 = r.bbox
+        union[y0:y1,x0:x1] |= r.silhouette
+    wanted = int(union.sum())
+    if wanted / max(1, wanted + int((fg_alpha == 255).sum())) > MAX_RECONSTRUCTION_FRACTION:
+        refusals.append(Refusal("RECONSTRUCTION_TOO_LARGE", "evidence exceeds maximum reconstruction fraction", wanted))
+        unfilled += wanted
+        regions = []
 
     layer_image, region_map_image, clip_unfilled = render_reconstruction(
         source_rgb, fg_alpha, regions
@@ -339,6 +328,7 @@ def build_reconstruction(
     report: dict = {
         "status": "none",
         "renderer": RENDERER_VERSION,
+        "evidence": {"support_mask_handles": list(support_mask_handles), "occluder_mask_handles": list(occluder_mask_handles)},
         "layer_handle": None,
         "region_map_handle": None,
         "guard_ring_px": GUARD_RING_PX,
@@ -382,3 +372,36 @@ def build_reconstruction(
     report["layer_handle"] = layer_handle
     report["region_map_handle"] = region_map_handle
     return report
+
+
+def load_typed_evidence(store: AssetStore, foreground_handle: str, *, support_mask_handles: tuple[str,...]=(), occluder_mask_handles: tuple[str,...]=()) -> tuple[list[TypedMask],list[TypedMask]]:
+    """Load explicit/automatic masks, with integrity, frame and source checks."""
+    import json
+    from .assets import png_text_of_bytes
+    from .composite import validate_foreground, FidelityLockError
+    chain=validate_foreground(store,foreground_handle)
+    source=chain[-1]; fg=store.read_image(foreground_handle)
+    supports=[];occluders=[]
+    requests=[(h,'support',None) for h in support_mask_handles]+[(h,'occluder',None) for h in occluder_mask_handles]
+    mask_record=next((r for r in chain if r.kind==KIND_MASK),None)
+    if mask_record:
+        text=png_text_of_bytes(store.read_bytes(HANDLE_PREFIX+mask_record.asset_id))
+        pipeline=json.loads(text.get('agenthand_cut_pipeline','{}'))
+        for record in pipeline.get('records',[]):
+            for comp in record.get('components',[]):
+                if comp['role'] in ('support','occluder'):
+                    requests.append((record['mask_asset'],comp['role'],comp['bbox']))
+    for handle,kind,box in requests:
+        record=store.get_record(handle)
+        if record.kind!=KIND_MASK or record.source_asset_id!=source.asset_id:
+            raise FidelityLockError('typed evidence must be a mask chained to the same source')
+        store.verify_integrity(handle)
+        image=store.read_image(handle).convert('L')
+        if image.size!=fg.size: raise FidelityLockError('typed evidence frame differs from source')
+        on=np.asarray(image)>127
+        if box is not None:
+            clipped=np.zeros_like(on); x0,y0,x1,y1=box
+            clipped[y0:y1,x0:x1]=on[y0:y1,x0:x1];on=clipped
+        typed=TypedMask(kind,on,{'mask_asset':handle,'component_bbox':box})
+        (supports if kind=='support' else occluders).append(typed)
+    return supports,occluders
