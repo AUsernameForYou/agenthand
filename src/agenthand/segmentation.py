@@ -348,7 +348,7 @@ def extract_foreground(source: Image.Image, mask_image: Image.Image) -> Image.Im
     )
 
 
-PIPELINE_VERSION = "agenthand.cut-pipeline/2"
+PIPELINE_VERSION = "agenthand.cut-pipeline/3"
 MIN_TILE_FRAME_SIDE = 128  # sub-thumbnail controls contain no native thin detail
 
 
@@ -555,14 +555,12 @@ def run_cut_pipeline(
     selected = max(usable, key=lambda r: _body_score(r, usable))
     metrics, body, _ = geometry(np.asarray(selected["image"]))
     bbox = tuple(metrics["body_bbox"])
-    for i, tile in enumerate(
-        band_tiles(source.size, bbox, meta_client.SAM_MAX_ATTEMPTS - len(attempts))
-    ):
+    for tile in band_tiles(source.size, bbox, meta_client.SAM_MAX_ATTEMPTS - len(attempts)):
         crop = source.crop(tuple(tile["bbox"]))
         b = BytesIO()
         crop.save(b, format="PNG")
         data = prepare_sam_png(crop, b.getvalue())
-        acquire(phrases[i % len(phrases)], tile, data)
+        acquire(selected["phrase"], tile, data)
     rgb = np.asarray(source.convert("RGB"))
     merged = body.copy()
     for r in records:
