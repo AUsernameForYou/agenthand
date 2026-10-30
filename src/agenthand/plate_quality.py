@@ -9,7 +9,7 @@ import cv2
 import numpy as np
 from PIL import Image, ImageOps
 
-VERSION = "agenthand.plate-quality/1"
+VERSION = "agenthand.plate-quality/2"
 
 
 class PlateQualityError(RuntimeError):
@@ -111,10 +111,12 @@ def assess_plate(
             overlap = max(0, min(right, zone[2]) - max(left, zone[0]))
             if (
                 y > floor_y + 0.055
-                and zone[1] - 0.05 <= y <= zone[3]
+                and zone[1] - 0.05 <= y
                 and overlap >= 0.28 * max(0.01, zone[2] - zone[0])
             ):
                 obstructing.append(line)
+        # An empty stage needs continuous floor below the feet too; a
+        # slab edge does not become acceptable just below the placement zone.
         if obstructing:
             codes.append("RAISED_SLAB_OR_INTERRUPTED_FLOOR")
         if floor_y > zone[1] + 0.10:

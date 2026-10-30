@@ -1216,7 +1216,9 @@ def generate_background_plate(
                 "call_id": billing["call_id"],
             }
         )
-        if quality["grade"] == "PASS":
+        if quality["grade"] == "PASS" or "WALL_FLOOR_LINE_IN_PLACEMENT" in quality["codes"]:
+            # The fixed template cannot move this architectural line. Do not
+            # purchase an identical second attempt for an incompatible framing.
             break
     fallback = quality["grade"] != "PASS"
     if fallback:
@@ -1239,7 +1241,11 @@ def generate_background_plate(
             "assessment": quality,
             "attempts": attempts,
             "fallback": fallback,
-            "fallback_reason": "two_rejected_plates" if fallback else None,
+            "fallback_reason": (
+                "placement_horizon_mismatch"
+                if fallback and "WALL_FLOOR_LINE_IN_PLACEMENT" in attempts[-1]["quality"]["codes"]
+                else "two_rejected_plates" if fallback else None
+            ),
             "stage_spec": asdict(spec),
         },
     )

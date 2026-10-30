@@ -134,10 +134,15 @@ def is_plate_block(value):
     if attempts and spec is None:
         return False
     if value["fallback"]:
+        if not attempts or not all(i["quality"]["grade"] == "FAIL" for i in attempts):
+            return False
+        reason = value.get("fallback_reason")
+        horizon_failure = "WALL_FLOOR_LINE_IN_PLACEMENT" in attempts[-1]["quality"]["codes"]
         return (
-            len(attempts) == 2
-            and all(i["quality"]["grade"] == "FAIL" for i in attempts)
-            and value.get("fallback_reason") == "two_rejected_plates"
+            len(attempts) == 1 and horizon_failure and reason == "placement_horizon_mismatch"
+        ) or (
+            len(attempts) == 2 and not any("WALL_FLOOR_LINE_IN_PLACEMENT" in i["quality"]["codes"] for i in attempts[:-1])
+            and reason == ("placement_horizon_mismatch" if horizon_failure else "two_rejected_plates")
         )
     return value.get("fallback_reason") is None and (
         not attempts
