@@ -71,7 +71,9 @@ def verify_files(
     ``ok`` is True only when sizes match, at least one product pixel
     was actually checked (an empty or all-edge-band mask refuses),
     every fully-masked product pixel is byte-identical between source
-    and final, and the colour profile is preserved. Undecodable or
+    and final, the colour profile is preserved, and stageability is not
+    RESHOOT. Paper is regraded with the same guard-seam bridge as preflight.
+    Undecodable or
     missing files raise — the report is for files that exist but fail
     the fidelity rules.
     """
@@ -138,6 +140,7 @@ def verify_files(
     # recomposite identity — plate, then paper, then the product cut
     # from the source by the mask — is what promotes the rest of the
     # frame from unexamined to verified.
+    paper = None
     reconstruction_pixels = None
     reconstruction_overlap = None
     recomposite_identical = None
@@ -149,7 +152,7 @@ def verify_files(
                 f"reconstruction layer is {recon.size}, source is "
                 f"{source.size}; paper is rendered on the product's frame"
             )
-        else:
+        elif mask.size == source.size:
             recon_alpha = np.frombuffer(
                 recon.getchannel("A").tobytes(), dtype=np.uint8
             )
@@ -189,10 +192,32 @@ def verify_files(
                     )
 
     from .cut_quality import grade_cut
+    from .mask_evidence import repaired_alpha
+    from .paperfill import GUARD_RING_PX, MAX_RECONSTRUCTION_FRACTION
+    import cv2
+
     quality = grade_cut(source, mask) if source.size == mask.size else None
+    before = quality
+    if paper is not None:
+        alpha = np.asarray(mask)
+        paper = paper.reshape(alpha.shape)
+        near = cv2.dilate((alpha > 0).astype(np.uint8), np.ones((3, 3), np.uint8), iterations=GUARD_RING_PX) > 0
+        if (paper & near).any():
+            problems.append("paper violates foreground guard ring")
+        fraction = int(paper.sum()) / max(1, int(paper.sum()) + int((alpha == 255).sum()))
+        if fraction > MAX_RECONSTRUCTION_FRACTION:
+            problems.append("reconstruction exceeds maximum fraction")
+        # As in preflight_cut, a fatal raw cut cannot be rescued by paper.
+        if before["grade"] != "RESHOOT":
+            quality = grade_cut(source, repaired_alpha(alpha, paper))
+    fidelity_ok = not problems
+    if quality and quality["grade"] == "RESHOOT":
+        problems.append("stageability: RESHOOT (" + ", ".join(quality["codes"]) + ")")
 
     return {
         "cut_quality": quality,
+        "cut_quality_before": before,
+        "fidelity_ok": fidelity_ok,
         "ok": not problems,
         "source": str(source_path),
         "final": str(final_path),
@@ -218,7 +243,7 @@ def main(argv: list[str] | None = None) -> int:
         description=(
             "Verify a delivered agenthand composite against its source "
             "photo and mask, from the files on disk. Exit 0 = the "
-            "fidelity claim holds; 1 = it does not."
+            "fidelity and stageability checks hold; 1 = a check fails."
         ),
     )
     parser.add_argument(

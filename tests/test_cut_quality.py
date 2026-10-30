@@ -230,3 +230,35 @@ def test_missing_supports_detect_both_contrast_directions_and_chroma(floor, leg)
     for x in (35, 100):
         a[65:87, x:x+4] = 255
     assert grade_cut(src, a)["grade"] == "PASS"
+
+
+def test_export_verifier_fails_reshoot_even_when_fidelity_holds(tmp_path, capsys):
+    import json
+    from agenthand.verify import main
+    src, a = scene()
+    a[20:40, 50:80] = 0
+    paths = [tmp_path/n for n in ("source.png", "final.png", "mask.png")]
+    for path, pixels in zip(paths, (src, src, a)):
+        Image.fromarray(pixels).save(path)
+    assert main([str(p) for p in paths]) == 1
+    report = json.loads(capsys.readouterr().out)
+    assert report["fidelity_ok"] and report["changed_pixels"] == 0
+    assert report["cut_quality"]["grade"] == "RESHOOT"
+
+
+def test_export_verifier_regrades_paper_like_preflight(tmp_path):
+    from agenthand import paperfill
+    from agenthand.verify import verify_files
+    from test_paperfill import _store_with_cut
+    src, a = scene()
+    a[27:35, 50:65] = 0
+    store, sh, mh, fh = _store_with_cut(tmp_path, src, a)
+    report = paperfill.build_reconstruction(store, fh)
+    assert report["reconstruction_pixels"] > 0
+    final = tmp_path/"final.png"
+    Image.fromarray(src).save(final)
+    checked = verify_files(store.resolve(sh), final, store.resolve(mh), reconstruction_path=store.resolve(report["layer_handle"]))
+    assert checked["ok"], checked
+    assert checked["cut_quality_before"]["grade"] == "REPAIRABLE"
+    assert checked["cut_quality"] == composite.preflight_cut(store, fh, reconstruction_handle=report["layer_handle"], require_pass=True)
+    assert checked["cut_quality"]["grade"] == "PASS"

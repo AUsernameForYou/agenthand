@@ -89,6 +89,15 @@ PRODUCT_COLOUR_DISTANCE = 35.0
 PRODUCT_MATCH_FRACTION = 0.65
 
 
+def repaired_alpha(alpha, paper):
+    """Bridge the paper guard seam for grading only; never alter delivered alpha."""
+    bridged = cv2.dilate(paper.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    top = np.flatnonzero((alpha > 0).any(axis=1))
+    if len(top):
+        bridged[:int(top[0])] = False
+    return ((alpha > 0) | bridged).astype(np.uint8) * 255
+
+
 def floor_contrast(rgb, floor_samples):
     """Source contrast against the local floor, for either brightness polarity.
 

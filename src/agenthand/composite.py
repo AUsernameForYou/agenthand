@@ -427,12 +427,8 @@ def preflight_cut(
             raise FidelityLockError("reconstruction exceeds maximum fraction")
         # Guard pixels remain plate pixels in the delivered image. Dilation
         # bridges that one-pixel safety seam for stageability geometry only.
-        bridged = cv2.dilate(paper.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
-        top = np.where((alpha > 0).any(axis=1))[0]
-        if len(top):
-            bridged[: int(top[0])] = False
-        semantic = (alpha > 0) | bridged
-        quality = grade_cut(source, semantic.astype(np.uint8) * 255)
+        from .mask_evidence import repaired_alpha
+        quality = grade_cut(source, repaired_alpha(alpha, paper))
     if require_pass and quality["grade"] != "PASS":
         quality = {**quality, "grade": "RESHOOT"}
     if quality["grade"] == "RESHOOT":

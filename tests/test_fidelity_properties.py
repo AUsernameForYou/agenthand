@@ -202,7 +202,8 @@ def test_verify_files_counts_match_the_oracle(tmp_path, size, data):
         # An empty mask refuses: a check of nothing proves nothing.
         assert report["ok"] is False
         return
-    assert report["ok"] is True
+    assert report["fidelity_ok"] is True
+    assert report["ok"] == (report["cut_quality"]["grade"] != "RESHOOT")
     assert report["changed_pixels"] == 0
 
     # Flip exactly one fully-masked pixel in the delivered file:
