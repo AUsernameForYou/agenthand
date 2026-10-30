@@ -97,7 +97,8 @@ def test_fused_shadow_keeps_only_narrow_observed_core():
 
 def test_failed_repair_refuses_before_plate(tmp_path, monkeypatch):
     src, a = setup_scene()
-    src[75:95, 35:85] = 10
+    src[75:90, 40:43] = 10
+    src[90:98, 35:85] = 10
     store, _, _, fh = _store_with_cut(tmp_path, src, a)
     monkeypatch.setattr(
         composite, "generate_background_plate", lambda *a: pytest.fail("plate reached")

@@ -1,6 +1,6 @@
 """Fail-closed stageability policy, separate from pixel-preservation proof.
 
-Version 2 requires source evidence for topology defects. It is a bounded
+Version 3 distinguishes contact shadows from structured support evidence. It is a bounded
 heuristic, not a claim of semantic recognition or corpus-wide calibration.
 """
 
@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 from . import mask_evidence as evidence
 
-VERSION = "agenthand.cut-quality/2"
+VERSION = "agenthand.cut-quality/3"
 INSTRUCTIONS = {
     "SUPPORT_NOT_CAPTURED": "Move bins and clutter away from under the product. Photograph from a lower angle with every leg and foot visible against unobstructed, contrasting floor.",
     "TOP_OCCLUDED": "Remove everything resting on the product. Photograph its complete top and edges without objects overlapping them.",
@@ -79,12 +79,14 @@ def grade_cut(
             x0, y0, x1, y1 = metrics["body_bbox"]
             if y1 < alpha.shape[0]:
                 luma = rgb.mean(axis=2)
-                band = luma[y1:, x0:x1]
+                margin = max(1, int(0.05 * (x1-x0)))
+                band_x0 = max(0, x0-margin)
+                band = luma[y1:, band_x0:min(alpha.shape[1], x1+margin)]
                 dark = band < 0.5 * np.percentile(band, 90)
                 for b, c in evidence._components(dark):
                     height = b[3] - b[1]
                     mean_width = int(c.sum()) / max(1, height)
-                    if b[1] > 3 or height < evidence.SUPPORT_MIN_HEIGHT_PX:
+                    if b[1] > 3 or height < evidence.support_min_height(y1-y0):
                         continue
                     thin = (
                         height / max(1, mean_width) >= evidence.SUPPORT_MIN_ASPECT
@@ -92,7 +94,19 @@ def grade_cut(
                         <= evidence.SUPPORT_MAX_WIDTH_FRACTION * (x1 - x0)
                     )
                     bounded = b[3] < band.shape[0]
-                    if (not thin and bounded) or (
+                    # A wide flat band within the body envelope is ordinary
+                    # contact shadow. Hidden supports need extra geometry.
+                    extends_body = band_x0+b[0] < x0 or band_x0+b[2] > x1
+                    core_rows = 0
+                    core_pixels = 0
+                    for row in c:
+                        xs = np.flatnonzero(row)
+                        if not len(xs) or np.any(np.diff(xs) > 1) or len(xs) > evidence.SUPPORT_MAX_WIDTH_FRACTION * (x1-x0):
+                            break
+                        core_rows += 1
+                        core_pixels += len(xs)
+                    stem = core_rows >= evidence.support_min_height(y1-y0) and core_rows / max(1, core_pixels/max(1, core_rows)) >= evidence.SUPPORT_MIN_ASPECT
+                    if (not thin and bounded and (extends_body or stem)) or (
                         thin
                         and (
                             not bounded

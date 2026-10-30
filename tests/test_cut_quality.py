@@ -24,7 +24,8 @@ def scene():
         ("clean", None, "PASS"),
         ("legs_included", None, "PASS"),
         ("legs_missing", "SUPPORT_NOT_CAPTURED", "REPAIRABLE"),
-        ("fused_shadow", "SUPPORT_NOT_CAPTURED", "RESHOOT"),
+        ("fused_shadow", None, "PASS"),
+        ("fused_leg_shadow", "SUPPORT_NOT_CAPTURED", "RESHOOT"),
         ("hole", "TOP_PERFORATED", "REPAIRABLE"),
         ("notch", "TOP_OCCLUDED", "RESHOOT"),
         ("island", "TOP_OCCLUDED", "RESHOOT"),
@@ -40,6 +41,9 @@ def test_fixed_controls(defect, code, expected):
                 a[65:87, x : x + 4] = 255
     if defect == "fused_shadow":
         src[65:87, 30:110] = 15
+    if defect == "fused_leg_shadow":
+        src[65:82, 40:44] = 15
+        src[82:91, 30:110] = 15
     if defect == "hole":
         a[30:40, 50:65] = 0
     if defect == "notch":
@@ -193,3 +197,15 @@ def test_topology_without_source_does_not_authorize_defect_or_paper():
     q = grade_cut(None, a)
     assert q["grade"] == "PASS", q
     assert q["metrics"]["open_geometry_pixels"] > 0
+
+
+@pytest.mark.parametrize("scale", [1, 4])
+def test_box_contact_shadow_passes_at_multiple_resolutions(scale):
+    a = np.zeros((400, 500), np.uint8)
+    a[40:290, 100:400] = 255
+    src = np.full((400, 500, 3), 200, np.uint8)
+    src[a > 0] = (110, 80, 50)
+    src[290:305, 100:400] = 40
+    a = np.repeat(np.repeat(a, scale, axis=0), scale, axis=1)
+    src = np.repeat(np.repeat(src, scale, axis=0), scale, axis=1)
+    assert grade_cut(src, a)["grade"] == "PASS"

@@ -413,7 +413,7 @@ def _classify_component(
     binary: np.ndarray, body: np.ndarray, source_rgb: np.ndarray, bbox: tuple, kind: str
 ) -> str:
     """Only narrow, observed members touching the body may expand foreground."""
-    from .mask_evidence import _bbox_of
+    from .mask_evidence import _bbox_of, support_min_height
 
     x0, y0, x1, y1 = bbox
     bw, bh = x1 - x0, y1 - y0
@@ -448,7 +448,7 @@ def _classify_component(
         kind == "support"
         and in_zone
         and (binary & touching).any()
-        and height >= 12
+        and height >= support_min_height(bh)
         and height / max(1, mean_width) >= 4
         and mean_width <= 0.06 * bw
         and cy1 < body.shape[0]

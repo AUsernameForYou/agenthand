@@ -21,6 +21,12 @@ SUPPORT_MAX_WIDTH_FRACTION = 0.06
 SUPPORT_MAX_HEIGHT_FRACTION = 0.6
 SUPPORT_MAX_COUNT = 6
 SUPPORT_MIN_HEIGHT_PX = 12
+SUPPORT_MIN_HEIGHT_FRACTION = 0.08
+
+
+def support_min_height(body_height):
+    return max(SUPPORT_MIN_HEIGHT_PX, int(np.ceil(SUPPORT_MIN_HEIGHT_FRACTION * body_height)))
+
 # Receipt hygiene: support refusals below this size merge into one
 # record per code with summed pixels, so a noisy photo cannot flood
 # the receipt (floor grain on a real photo produces hundreds). The
@@ -247,9 +253,9 @@ def detect_regions(
             mean_width = area / max(comp_h, 1)
             aspect = comp_h / max(mean_width, 1e-9)
             reason = None
-            if comp_h < SUPPORT_MIN_HEIGHT_PX:
+            if comp_h < support_min_height(body_h):
                 reason = (
-                    f"height {comp_h} px under {SUPPORT_MIN_HEIGHT_PX}; "
+                    f"height {comp_h} px under {support_min_height(body_h)}; "
                     "too short to be a support"
                 )
             elif aspect < SUPPORT_MIN_ASPECT:
@@ -476,7 +482,7 @@ def skeleton_support_cores(source_rgb: np.ndarray, alpha: np.ndarray) -> list[Re
                 break
             core[row] = local[row]
         height = int(np.count_nonzero(core.any(axis=1)))
-        if height < 12 or height > SUPPORT_MAX_HEIGHT_FRACTION * bh:
+        if height < support_min_height(bh) or height > SUPPORT_MAX_HEIGHT_FRACTION * bh:
             continue
         if height == local.shape[0]:
             continue  # ordinary supports use legacy detector
@@ -524,7 +530,7 @@ def typed_regions(
             valid = (
                 y0 >= by1 - 0.15 * bh
                 and y1 < alpha.shape[0]
-                and height >= 12
+                and height >= support_min_height(bh)
                 and height <= 0.6 * bh
                 and height / max(1, width) >= 4
                 and width <= 0.06 * bw
