@@ -228,10 +228,19 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     fallback_kwargs = {}
     if quality["fallback"]:
         from .backdrop import backdrop_info
-        fallback_kwargs = {"plate_kind": "code_rendered", "backdrop": backdrop_info("studio_gray")}
+
+        fallback_kwargs = {
+            "plate_kind": "code_rendered",
+            "backdrop": backdrop_info("studio_gray"),
+        }
     handle, receipt = composite.draw_product(
-        store, asset, scene_prompt, plate_handle=plate_handle,
-        plate_quality_report=quality, **prepared, **fallback_kwargs
+        store,
+        asset,
+        scene_prompt,
+        plate_handle=plate_handle,
+        plate_quality_report=quality,
+        **prepared,
+        **fallback_kwargs,
     )
     # The receipt is persisted (with cost and call attribution) even
     # when the composite fails the Lock checks below: a violation's
@@ -338,15 +347,37 @@ def _draw_with_placeholder_plate(store: AssetStore, asset: str, scene_prompt: st
     return [result, preview]
 
 
-def _store_cut_evidence(store: AssetStore, source_record, candidates: list[dict]) -> list[dict]:
+def _store_cut_evidence(
+    store: AssetStore, source_record, candidates: list[dict]
+) -> list[dict]:
     """Persist all decoded SAM records, including rejected attempts."""
     evidence_records = []
     for candidate in candidates:
-        provenance = {k: candidate[k] for k in ("object_id", "phrase", "tile", "sam_width", "sam_height", "scale_method", "role", "components")}
-        buf = BytesIO(); info = PngInfo()
+        provenance = {
+            k: candidate[k]
+            for k in (
+                "object_id",
+                "sam_bounds",
+                "sam_mask_pixels",
+                "phrase",
+                "tile",
+                "sam_width",
+                "sam_height",
+                "scale_method",
+                "role",
+                "components",
+            )
+        }
+        buf = BytesIO()
+        info = PngInfo()
         info.add_text("agenthand_cut_evidence", json.dumps(provenance, sort_keys=True))
         candidate["image"].save(buf, format="PNG", pnginfo=info)
-        candidate_handle = store.put_bytes(buf.getvalue(), kind=KIND_MASK, suffix=".png", source_asset_id=source_record.asset_id)
+        candidate_handle = store.put_bytes(
+            buf.getvalue(),
+            kind=KIND_MASK,
+            suffix=".png",
+            source_asset_id=source_record.asset_id,
+        )
         evidence_records.append({"mask_asset": candidate_handle, **provenance})
     return evidence_records
 
@@ -367,7 +398,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     (Meta's official parser, behind the sam_masks boundary). The mask
     is quality-checked — coverage sane (not empty, not ~the whole
     frame) and dominated by one connected region — and on a zero-match
-    or a poor mask the loop retries ONCE with the first alternate
+    or a poor mask, all fixed identify phrases are evaluated and bounded
     phrase; every attempt is traced in the result. The foreground is
     the source pixels through the accepted mask, nothing regenerated.
     Storage is a lineage chain — mask parented to the source photo,
@@ -471,20 +502,21 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     except meta_client.NotConfiguredError as exc:
         return _error("NOT_CONFIGURED", str(exc))
 
-    # The attempt loop is bounded: the concept, plus one recovery retry
-    # with the first alternate. The reservation prices exactly the
-    # attempts the loop may make.
+    # The fixed concept/both-alternate ensemble and native band tiles share
+    # an eight-image reservation. Thumbnail controls need only global passes.
     phrases = list(dict.fromkeys([concept, *alternates[:2]]))
-    attempt_cap = meta_client.SAM_MAX_ATTEMPTS if min(source_image.size) >= segmentation.MIN_TILE_FRAME_SIDE else len(phrases)
+    attempt_cap = (
+        meta_client.SAM_MAX_ATTEMPTS
+        if min(source_image.size) >= segmentation.MIN_TILE_FRAME_SIDE
+        else len(phrases)
+    )
     projected = meta_client.project_cut_out_cost_usd(CUT_OUT_MODEL, attempt_cap)
     outcome: dict = {}
 
     # SAM working resolution (decision 68): past the proven cap, only
     # the SAM-bound copy is downscaled; the stored photo keeps its full
     # resolution and the returned mask is mapped back onto it below.
-    sam_payload = segmentation.prepare_sam_png(
-        source_image, store.read_bytes(handle)
-    )
+    sam_payload = segmentation.prepare_sam_png(source_image, store.read_bytes(handle))
     mask_provenance = {
         "source_width": source_image.width,
         "source_height": source_image.height,
@@ -493,7 +525,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         "scale_method": sam_payload["scale_method"],
     }
 
-    def _run_attempts() -> dict:
+    def _run_cut_pipeline() -> dict:
         result = segmentation.run_cut_pipeline(
             source_image,
             store.read_bytes(handle),
@@ -505,7 +537,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
 
     try:
         billing = meta_client.billed_call(
-            "cut_out", CUT_OUT_MODEL, projected, _run_attempts
+            "cut_out", CUT_OUT_MODEL, projected, _run_cut_pipeline
         )
     except segmentation.CutOutResultError as exc:
         return _error(
@@ -524,7 +556,13 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     evidence_records = _store_cut_evidence(store, source_record, outcome["records"])
     mask_buffer = BytesIO()
     pnginfo = PngInfo()
-    pnginfo.add_text("agenthand_cut_pipeline", json.dumps({"version": outcome["pipeline_version"], "records": evidence_records}, sort_keys=True))
+    pnginfo.add_text(
+        "agenthand_cut_pipeline",
+        json.dumps(
+            {"version": outcome["pipeline_version"], "records": evidence_records},
+            sort_keys=True,
+        ),
+    )
     pnginfo.add_text(
         MASK_PROVENANCE_PNG_KEY,
         json.dumps(mask_provenance, separators=(",", ":"), sort_keys=True),

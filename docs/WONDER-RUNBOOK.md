@@ -29,3 +29,54 @@ photos were supplied. A geometry pass is not human acceptance of a listing.
 Fidelity rules remain alpha 255, tolerance 0, no foreground scaling; paper is
 separate, only at alpha 0 with a one pixel guard. Identify prompt/schema must
 remain identical to the baseline. New schema 4 verification is Python only.
+
+## Current contracts and remaining validation
+
+- Normal cut acquisition uses the identify concept and both alternates, with
+  source-frame top/support bands (up to eight SAM requests). Small controls
+  below 128 px on either side use only global passes. Huge crop requests may
+  still require a disclosed downscale to fit the proven SAM cap. All decoded
+  records, including rejected attempts, are stored with phrase/tile metadata.
+  Legacy `mask_sam_*` fields describe the global pass; the mask's
+  `agenthand_cut_pipeline` PNG text contains the full acquisition graph.
+- A passing or provably repaired cut is required before any plate purchase.
+  Unbounded dark background is not proof of a missing support. A top concavity
+  must be bounded by product on both sides; ordinary silhouette taper does not
+  establish top occlusion. No threshold is selected per photo.
+- Supports use the measured cylindrical chart. Top footprints require foreign
+  evidence and product flanks. The top paper chart remains an image-plane chart
+  with clamped source shading; arbitrary perspective-correct surface wrapping
+  and the owner's phone-size visual acceptance remain unproved.
+- Plate requests use `StageSpec` version 1 and one template, with at most two
+  separately billed attempts. Repeated measurable rejection selects studio
+  gray and records both rejected plates, their hashes, quality and call IDs.
+  The camera class is fixed; source-camera matching is not proved by this
+  heuristic. A plate PASS is not a photographic-believability claim.
+- New receipts use schema 4. Required cut-quality, reconstruction and plate
+  disclosures are independently recomputed from stored files. Verification
+  re-renders attempted paper without writing assets, checks the guard/cap and
+  region map, and reproduces all three layers even for local placeholders.
+  Downgrade guards reject schema-4 fields under an older marker. Historical
+  unmarked v1 and v2/v3 receipts retain their policies. No Rust schema-4 parity.
+
+Full stored-receipt check:
+
+```sh
+.venv/bin/python -m agenthand.verify --data-dir /path/to/data --asset asset://COMPOSITE_ID
+```
+
+Exported-file preservation check (also reports current source/mask grade):
+
+```sh
+.venv/bin/python -m agenthand.verify SOURCE.png FINAL.png MASK.png
+```
+
+The exported-file check is not full schema-4 receipt verification. Keep its
+pixel-preservation result separate from the quality disclosure.
+
+The retained `docs/proof-source-v1.png` + `proof-mask-v1.png` is an explicit pass
+fixture alongside the synthetic controls. Hero masks remain explicit failure
+fixtures. Do not claim multi-category calibration, live recovery of the hero
+legs, source-camera matching or approved 3D wrapping from this offline suite.
+The identify instructions/schema hash remains
+`c7b529289c168126cc9f033024ccdb3c699a036f6b7075ab20856d678fc8b2bd`.

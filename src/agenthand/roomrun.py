@@ -986,7 +986,13 @@ def draw_with_code_plate(
             "region_map_handle": report.get("region_map_handle"),
             "reconstruction_report": report,
         }
-    composite.preflight_cut(store, foreground_handle, reconstruction_handle=recon_kwargs.get("reconstruction_handle"), require_pass=True, occluder_mask_handles=occluder_mask_handles)
+    composite.preflight_cut(
+        store,
+        foreground_handle,
+        reconstruction_handle=recon_kwargs.get("reconstruction_handle"),
+        require_pass=True,
+        occluder_mask_handles=occluder_mask_handles,
+    )
     plate = backdrop.render_plate(stage_mode, foreground.width, foreground.height)
     plate_handle = store.put_image(plate, kind=KIND_PLATE)
     handle, receipt = composite.draw_product(

@@ -46,9 +46,11 @@ def _data_uri(size=(6, 4), color=(10, 120, 200, 255)) -> str:
 
 
 def _seed_foreground(store: AssetStore) -> str:
-    photo = store.put_image(
-        Image.new("RGBA", (6, 4), (90, 90, 90, 255)), kind="source_photo"
-    )
+    photo_img = Image.new("RGBA", (6,4), (90,90,90,255))
+    for y in range(4):
+        for x in range(3):
+            photo_img.putpixel((x,y),(255,0,0,255))
+    photo = store.put_image(photo_img,kind="source_photo")
     fg_img = Image.new("RGBA", (6, 4), (0, 0, 0, 0))
     px = fg_img.load()
     for y in range(4):
@@ -137,9 +139,11 @@ def test_draw_runs_the_real_pipeline_with_a_placeholder_plate(monkeypatch):
 
 def test_draw_rejects_a_non_foreground_before_billing():
     store = AssetStore(config.get_data_dir())
-    photo = store.put_image(
-        Image.new("RGBA", (6, 4), (90, 90, 90, 255)), kind="source_photo"
-    )
+    photo_img = Image.new("RGBA", (6,4), (90,90,90,255))
+    for y in range(4):
+        for x in range(3):
+            photo_img.putpixel((x,y),(255,0,0,255))
+    photo = store.put_image(photo_img,kind="source_photo")
     with pytest.raises(composite.FidelityLockError):
         server.draw(photo, "a regal room")
     assert _ledger_records() == []  # refused before the gate: no reservation

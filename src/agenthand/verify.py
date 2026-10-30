@@ -221,9 +221,11 @@ def main(argv: list[str] | None = None) -> int:
             "fidelity claim holds; 1 = it does not."
         ),
     )
-    parser.add_argument("source", help="the source product photo (exported asset)")
-    parser.add_argument("final", help="the delivered composite image")
-    parser.add_argument("mask", help="the cut_out mask PNG")
+    parser.add_argument(
+        "source", nargs="?", help="the source product photo (exported asset)"
+    )
+    parser.add_argument("final", nargs="?", help="the delivered composite image")
+    parser.add_argument("mask", nargs="?", help="the cut_out mask PNG")
     parser.add_argument(
         "--reconstruction",
         help="the paper-fill reconstruction layer PNG (optional); "
@@ -235,7 +237,29 @@ def main(argv: list[str] | None = None) -> int:
         "--reconstruction, the final must recomposite exactly from "
         "plate, paper, and product",
     )
+    parser.add_argument(
+        "--data-dir", help="asset store root for full stored-receipt verification"
+    )
+    parser.add_argument(
+        "--asset",
+        help="composite asset handle; verifies v1-v4 under their own policies",
+    )
     args = parser.parse_args(argv)
+    if args.data_dir or args.asset:
+        if not (args.data_dir and args.asset) or any(
+            (args.source, args.final, args.mask, args.plate, args.reconstruction)
+        ):
+            parser.error(
+                "use --data-dir and --asset together, without exported-file arguments"
+            )
+        from .assets import AssetStore
+        from .composite import verify_receipt_from_disk
+
+        report = verify_receipt_from_disk(AssetStore(Path(args.data_dir)), args.asset)
+        print(json.dumps(report, indent=2, sort_keys=True))
+        return 0 if report["ok"] else 1
+    if not all((args.source, args.final, args.mask)):
+        parser.error("supply SOURCE FINAL MASK, or --data-dir DIR --asset HANDLE")
 
     report = verify_files(
         args.source,

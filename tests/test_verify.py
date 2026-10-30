@@ -598,6 +598,7 @@ def _masked_store_run(tmp_path, *, profiled=False):
 _CONTRACT_FIELDS = sorted(
     set(composite._RECEIPT_FIELDS_ANY_SCHEMA)
     | set(composite._RECEIPT_FIELDS_V2)
+    | set(composite._RECEIPT_FIELDS_V4)
     | {"receipt_schema"}
 )
 

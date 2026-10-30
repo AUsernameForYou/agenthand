@@ -75,11 +75,9 @@ COUNT_SAMPLE = "decoded_delivered_file"
 # Receipt schema marker, stamped by draw_product. Receipts without it
 # are the historical v1 shape (the frozen 2026-10-26 replay package
 # is the live example) and are graded under the compatibility policy
-# documented in _validate_receipt. Schema 3 adds the required
-# paper-fill reconstruction block (decision 93; the paper-fill
-# Gauntlet: a receipt that cannot account for its non-product pixels
-# does not pass).
-RECEIPT_SCHEMA_VERSION = 3
+# documented in _validate_receipt. Schema 4 requires recomputed cut, paper
+# and plate quality; older schemas keep their original policies. Python only.
+RECEIPT_SCHEMA_VERSION = 4
 
 
 class FidelityLockError(RuntimeError):
@@ -343,13 +341,14 @@ def validate_foreground(store: AssetStore, foreground_handle: str) -> list[Asset
     source_record = chain[-1]
     # The stored bytes must be exactly what was recorded. Raises on mismatch.
     store.verify_integrity(foreground_handle)
-    if source_record.asset_id != record.asset_id:
-        store.verify_integrity(HANDLE_PREFIX + source_record.asset_id)
+    for ancestor in chain[1:]:
+        store.verify_integrity(HANDLE_PREFIX + ancestor.asset_id)
     return chain
 
 
 class StageabilityError(FidelityLockError):
     """A measured cut cannot be staged; no plate should be purchased."""
+
     code = "RESHOOT_REQUIRED"
 
     def __init__(self, quality: dict):
@@ -357,16 +356,46 @@ class StageabilityError(FidelityLockError):
         super().__init__("Reshoot required: " + "; ".join(quality["instructions"]))
 
 
-def preflight_cut(store: AssetStore, foreground_handle: str, *, reconstruction_handle: str | None = None, require_pass: bool = False, occluder_mask_handles: tuple[str,...] = ()) -> dict:
+def preflight_cut(
+    store: AssetStore,
+    foreground_handle: str,
+    *,
+    reconstruction_handle: str | None = None,
+    require_pass: bool = False,
+    occluder_mask_handles: tuple[str, ...] = (),
+) -> dict:
     """Recompute source/mask quality, and regrade separate paper when supplied."""
     from .cut_quality import grade_cut
-    from .paperfill import load_typed_evidence, GUARD_RING_PX, MAX_RECONSTRUCTION_FRACTION
+    from .paperfill import (
+        load_typed_evidence,
+        GUARD_RING_PX,
+        MAX_RECONSTRUCTION_FRACTION,
+    )
+
     chain = validate_foreground(store, foreground_handle)
     fg = store.read_image(foreground_handle)
     source = store.read_image(HANDLE_PREFIX + chain[-1].asset_id)
     if source.size != fg.size:
         raise FidelityLockError("source and foreground frames differ")
-    _supports, occluders = load_typed_evidence(store, foreground_handle, occluder_mask_handles=occluder_mask_handles)
+    fg_array = np.asarray(fg.convert("RGBA"))
+    source_array = np.asarray(source.convert("RGBA"))
+    visible = fg_array[:, :, 3] > 0
+    solid = fg_array[:, :, 3] == 255
+    if not np.array_equal(
+        fg_array[:, :, :3][visible], source_array[:, :, :3][visible]
+    ) or not np.array_equal(fg_array[solid], source_array[solid]):
+        raise FidelityLockError(
+            "foreground visible pixels do not match the source photo"
+        )
+    if len(chain) == 3:
+        mask_image = store.read_image(HANDLE_PREFIX + chain[1].asset_id).convert("L")
+        if mask_image.size != fg.size or not np.array_equal(
+            np.asarray(mask_image), fg_array[:, :, 3]
+        ):
+            raise FidelityLockError("foreground alpha differs from its stored mask")
+    _supports, occluders = load_typed_evidence(
+        store, foreground_handle, occluder_mask_handles=occluder_mask_handles
+    )
     quality = grade_cut(source, fg.getchannel("A"), occluders=occluders)
     if quality["grade"] == "RESHOOT":
         raise StageabilityError(quality)
@@ -377,33 +406,61 @@ def preflight_cut(store: AssetStore, foreground_handle: str, *, reconstruction_h
             raise FidelityLockError("reconstruction is not chained to this cut")
         store.verify_integrity(reconstruction_handle)
         layer = store.read_image(reconstruction_handle)
-        if layer.size != fg.size: raise FidelityLockError("reconstruction frame differs")
+        if layer.size != fg.size:
+            raise FidelityLockError("reconstruction frame differs")
         alpha = np.asarray(fg.getchannel("A"))
         paper = np.asarray(layer.getchannel("A")) > 0
-        near = cv2.dilate((alpha > 0).astype(np.uint8), np.ones((3,3),np.uint8), iterations=GUARD_RING_PX) > 0
-        if (paper & near).any(): raise FidelityLockError("paper violates foreground guard ring")
-        if int(paper.sum()) / max(1,int(paper.sum())+int((alpha==255).sum())) > MAX_RECONSTRUCTION_FRACTION:
+        near = (
+            cv2.dilate(
+                (alpha > 0).astype(np.uint8),
+                np.ones((3, 3), np.uint8),
+                iterations=GUARD_RING_PX,
+            )
+            > 0
+        )
+        if (paper & near).any():
+            raise FidelityLockError("paper violates foreground guard ring")
+        if (
+            int(paper.sum()) / max(1, int(paper.sum()) + int((alpha == 255).sum()))
+            > MAX_RECONSTRUCTION_FRACTION
+        ):
             raise FidelityLockError("reconstruction exceeds maximum fraction")
         # Guard pixels remain plate pixels in the delivered image. Dilation
         # bridges that one-pixel safety seam for stageability geometry only.
-        bridged = cv2.dilate(paper.astype(np.uint8),np.ones((3,3),np.uint8)) > 0
+        bridged = cv2.dilate(paper.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
         top = np.where((alpha > 0).any(axis=1))[0]
-        if len(top): bridged[:int(top[0])] = False
+        if len(top):
+            bridged[: int(top[0])] = False
         semantic = (alpha > 0) | bridged
-        quality = grade_cut(source, semantic.astype(np.uint8)*255)
+        quality = grade_cut(source, semantic.astype(np.uint8) * 255)
     if require_pass and quality["grade"] != "PASS":
         quality = {**quality, "grade": "RESHOOT"}
-    if quality["grade"] == "RESHOOT": raise StageabilityError(quality)
+    if quality["grade"] == "RESHOOT":
+        raise StageabilityError(quality)
     return quality
 
 
 def prepare_draw(store: AssetStore, foreground_handle: str) -> dict:
     """Repair provable defects and require a passing cut before plate spend."""
     from .paperfill import build_reconstruction
+
     before = preflight_cut(store, foreground_handle)
-    report = build_reconstruction(store, foreground_handle) if before["grade"] == "REPAIRABLE" else {"status": "none"}
-    preflight_cut(store, foreground_handle, reconstruction_handle=report.get("layer_handle"), require_pass=True)
-    return {"reconstruction_handle": report.get("layer_handle"), "region_map_handle": report.get("region_map_handle"), "reconstruction_report": report}
+    report = (
+        build_reconstruction(store, foreground_handle)
+        if before["grade"] == "REPAIRABLE"
+        else {"status": "none"}
+    )
+    preflight_cut(
+        store,
+        foreground_handle,
+        reconstruction_handle=report.get("layer_handle"),
+        require_pass=True,
+    )
+    return {
+        "reconstruction_handle": report.get("layer_handle"),
+        "region_map_handle": report.get("region_map_handle"),
+        "reconstruction_report": report,
+    }
 
 
 def draw_product(
@@ -439,7 +496,21 @@ def draw_product(
         reconstruction_handle = prepared["reconstruction_handle"]
         region_map_handle = prepared["region_map_handle"]
         reconstruction_report = prepared["reconstruction_report"]
-    preflight_cut(store, foreground_handle, reconstruction_handle=reconstruction_handle, require_pass=True, occluder_mask_handles=tuple((reconstruction_report or {}).get("evidence", {}).get("occluder_mask_handles", [])))
+    explicit_occluders = tuple(
+        (reconstruction_report or {})
+        .get("evidence", {})
+        .get("occluder_mask_handles", [])
+    )
+    before_quality = preflight_cut(
+        store, foreground_handle, occluder_mask_handles=explicit_occluders
+    )
+    after_quality = preflight_cut(
+        store,
+        foreground_handle,
+        reconstruction_handle=reconstruction_handle,
+        require_pass=True,
+        occluder_mask_handles=explicit_occluders,
+    )
     chain = validate_foreground(store, foreground_handle)
     record = chain[0]
     source_record = chain[-1]
@@ -537,11 +608,28 @@ def draw_product(
             plate_kind = "local_placeholder"
 
     from .plate_quality import assess_plate, PlateQualityError
-    quality = assess_plate(plate, foreground.getbbox() or [0,0,foreground.width,foreground.height], foreground.size, code_backdrop=backdrop if plate_kind == "code_rendered" else None)
-    if quality["grade"] != "PASS": raise PlateQualityError(quality)
-    if plate_quality_report is not None and quality != plate_quality_report.get("assessment"):
-        raise PlateQualityError({**quality,"grade":"FAIL","codes":["PLATE_REPORT_MISMATCH"]})
-    plate_quality_block = plate_quality_report or {"assessment": quality, "attempts": [], "fallback": False, "fallback_reason": None, "stage_spec": None}
+
+    quality = assess_plate(
+        plate,
+        foreground.getbbox() or [0, 0, foreground.width, foreground.height],
+        foreground.size,
+        code_backdrop=backdrop if plate_kind == "code_rendered" else None,
+    )
+    if quality["grade"] != "PASS":
+        raise PlateQualityError(quality)
+    if plate_quality_report is not None and quality != plate_quality_report.get(
+        "assessment"
+    ):
+        raise PlateQualityError(
+            {**quality, "grade": "FAIL", "codes": ["PLATE_REPORT_MISMATCH"]}
+        )
+    plate_quality_block = plate_quality_report or {
+        "assessment": quality,
+        "attempts": [],
+        "fallback": False,
+        "fallback_reason": None,
+        "stage_spec": None,
+    }
 
     composite, _in_memory_counts, transformations = composite_images(
         foreground, plate, layer_image
@@ -598,14 +686,19 @@ def draw_product(
         recon_overlap = 0
         recon_status = report.get("status", "none")
         if recon_status not in ("none", "refused"):
-            raise FidelityLockError(
-                f"unknown reconstruction status {recon_status!r}"
-            )
+            raise FidelityLockError(f"unknown reconstruction status {recon_status!r}")
     recon_total = recon_pixels + counts["opaque_pixels"]
+    from . import paperfill
+
     reconstruction_block = {
+        "policy_version": paperfill.RENDERER_VERSION,
+        "max_fraction": paperfill.MAX_RECONSTRUCTION_FRACTION,
+        "attempted": bool(report.get("renderer")),
         "status": recon_status,
         "renderer": report.get("renderer"),
-        "evidence": report.get("evidence", {}),
+        "evidence": report.get(
+            "evidence", {"support_mask_handles": [], "occluder_mask_handles": []}
+        ),
         "layer_asset": reconstruction_handle,
         "layer_sha256": layer_record.sha256 if layer_record else None,
         "layer_pixel_sha256": layer_record.pixel_sha256 if layer_record else None,
@@ -619,7 +712,7 @@ def draw_product(
         "reconstruction_fraction": (
             round(recon_pixels / recon_total, 6) if recon_total else 0.0
         ),
-        "guard_ring_px": report.get("guard_ring_px"),
+        "guard_ring_px": report.get("guard_ring_px", paperfill.GUARD_RING_PX),
         "motif": report.get("motif"),
         "regions": report.get("regions", []),
         "refusals": report.get("refusals", []),
@@ -636,6 +729,7 @@ def draw_product(
 
     receipt = {
         "receipt_schema": RECEIPT_SCHEMA_VERSION,
+        "scene_prompt": scene_prompt,
         "source_asset": HANDLE_PREFIX + source_record.asset_id,
         "source_sha256": source_record.sha256,
         "source_pixel_sha256": source_record.pixel_sha256,
@@ -698,7 +792,15 @@ def draw_product(
         ),
     }
     receipt["reconstruction"] = reconstruction_block
-    receipt["plate_quality"] = plate_quality_block
+    from .plate_quality import VERSION as PLATE_QUALITY_VERSION
+    from .cut_quality import VERSION as CUT_QUALITY_VERSION
+
+    receipt["plate_quality"] = {"version": PLATE_QUALITY_VERSION, **plate_quality_block}
+    receipt["cut_quality"] = {
+        "version": CUT_QUALITY_VERSION,
+        "before": before_quality,
+        "after": after_quality,
+    }
     if mask_provenance is not None:
         # Mask provenance (decision 68): the receipt states the frame
         # the mask was cut from, the frame SAM actually saw, and how
@@ -917,6 +1019,21 @@ _RECEIPT_FIELDS_V3 = {
     "reconstruction": _is_reconstruction_block,
 }
 
+from .quality_receipt import is_cut_block, is_plate_block, is_reconstruction_policy
+
+_RECEIPT_FIELDS_V4 = {
+    "cut_quality": is_cut_block,
+    "plate_quality": is_plate_block,
+    "reconstruction": lambda v: _is_reconstruction_block(v) and is_reconstruction_policy(v),
+    "scene_prompt": lambda v: isinstance(v,str),
+    "plate_kind": lambda v: v in ("model_generated", "code_rendered", "local_placeholder"),
+    "plate_asset": lambda v: v is None or _is_handle(v),
+    "plate_sha256": _is_hash_or_none,
+    "plate_pixel_sha256": _is_hash_or_none,
+    "backdrop": lambda v: v is None or isinstance(v,dict),
+    "plate_source": lambda v: v in ("asset","local_placeholder"),
+}
+
 # Fields that exist only in the current schema (used by the
 # downgrade guard in _validate_receipt). mask_asset is excluded: v1
 # receipts name the mask asset too, they just do not pin its hashes.
@@ -966,13 +1083,13 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
     schema = receipt.get("receipt_schema")
     if schema is None:
         version = 1
-    elif type(schema) is int and schema in (2, RECEIPT_SCHEMA_VERSION):
+    elif type(schema) is int and schema in (2, 3, RECEIPT_SCHEMA_VERSION):
         version = schema
     else:
         version = 0
         shape.append(
             f"unsupported receipt_schema {schema!r}; this verifier "
-            f"grades schema 2 and {RECEIPT_SCHEMA_VERSION} receipts "
+            f"grades schema 2, 3 and {RECEIPT_SCHEMA_VERSION} receipts "
             "and unmarked v1 receipts"
         )
     strict = version >= 2
@@ -997,11 +1114,17 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
             "marked schema 3; refusing to grade reconstruction "
             "under an older policy"
         )
+    recon_policy = receipt.get("reconstruction")
+    v4_reconstruction = isinstance(recon_policy,dict) and any(k in recon_policy for k in ("policy_version", "max_fraction", "attempted"))
+    if 0 < version < 4 and (any(k in receipt for k in ("cut_quality", "plate_quality")) or v4_reconstruction):
+        shape.append("receipt carries schema-4 quality fields under an older policy")
     fields = dict(_RECEIPT_FIELDS_ANY_SCHEMA)
     if version >= 2:
         fields.update(_RECEIPT_FIELDS_V2)
     if version >= 3:
         fields.update(_RECEIPT_FIELDS_V3)
+    if version >= 4:
+        fields.update(_RECEIPT_FIELDS_V4)
     for name, valid in fields.items():
         if name not in receipt:
             shape.append(f"missing field: {name}")
@@ -1020,6 +1143,17 @@ def _validate_receipt(receipt: object) -> tuple[list[str], list[str]]:
                 )
     if shape:
         return shape, terms
+    if version >= 4:
+        if receipt["plate_kind"] == "local_placeholder":
+            if receipt["plate_source"] != "local_placeholder" or receipt["plate_asset"] is not None or receipt["plate_sha256"] is not None or receipt["plate_pixel_sha256"] is not None or receipt["backdrop"] is not None:
+                shape.append("local placeholder provenance is inconsistent")
+        elif receipt["plate_source"] != "asset" or not receipt["plate_asset"] or not receipt["plate_sha256"] or not receipt["plate_pixel_sha256"]:
+            shape.append("asset plate provenance is incomplete")
+        if receipt["plate_kind"] == "code_rendered" and not receipt["backdrop"]:
+            shape.append("code-rendered plate requires its backdrop specification")
+        if receipt["plate_kind"] == "model_generated" and receipt["backdrop"] is not None:
+            shape.append("model plate cannot claim a code backdrop")
+        if shape: return shape, terms
     # Internal consistency of the stated counts: a receipt whose own
     # numbers disagree with each other is forged or torn, whatever
     # the files say.
@@ -1672,5 +1806,14 @@ def verify_receipt_from_disk(
             recomputed["layer_reproduction"] = (
                 "skipped: no plate asset (local placeholder plate)"
             )
+
+    if receipt.get("receipt_schema") == 4 and decoded is not None:
+        try:
+            from .quality_receipt import verify_quality
+            quality_data, quality_checks = verify_quality(store, foreground_handle, receipt)
+            recomputed.update(quality_data)
+            for name,(ok,detail) in quality_checks.items(): check(name,ok,detail)
+        except Exception as exc:
+            check("schema4_quality_recomputed",False,f"{type(exc).__name__}: {exc}")
 
     return report()

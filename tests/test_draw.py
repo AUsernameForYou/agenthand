@@ -354,6 +354,9 @@ def test_draw_live_profile_break_is_a_fidelity_violation(monkeypatch):
     )
     store = AssetStore(config.get_data_dir())
     photo_img = Image.new("RGBA", (6, 4), (90, 90, 90, 255))
+    for y in range(4):
+        for x in range(3):
+            photo_img.putpixel((x,y),(255,0,0,255))
     photo_img.info["icc_profile"] = _profile_bytes()
     photo = store.put_image(photo_img, kind="source_photo")
     # The foreground was stored WITHOUT the source's profile (an older

@@ -3,6 +3,7 @@
 The legacy paper detector is kept byte-for-byte here so grading and rendering
 consume the same observations. No model calls or product pixel synthesis.
 """
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 import cv2
@@ -41,7 +42,6 @@ REGION_CLASS_CODES = {"hole": 1, "support": 2, "occluder": 3}
 # pitch (112 px) horizontally and 2 * pitch vertically, so a tile of
 # 2 * pitch in both axes sampled modulo reproduces the infinite
 # tiling exactly.
-
 
 
 @dataclass
@@ -177,11 +177,14 @@ def detect_regions(
         band_luma = luma[band]
         dark_limit = SUPPORT_DARK_MEDIAN_FRACTION * float(np.median(band_luma))
         candidates = band & (luma < dark_limit)
-        dilated_product = cv2.dilate(
-            product_any.astype(np.uint8),
-            np.ones((3, 3), np.uint8),
-            iterations=SUPPORT_TOUCH_DILATE_PX,
-        ) > 0
+        dilated_product = (
+            cv2.dilate(
+                product_any.astype(np.uint8),
+                np.ones((3, 3), np.uint8),
+                iterations=SUPPORT_TOUCH_DILATE_PX,
+            )
+            > 0
+        )
         accepted: list[Region] = []
         for cbox, comp in _components(candidates):
             area = int(np.count_nonzero(comp))
@@ -208,8 +211,7 @@ def detect_regions(
                 )
             elif aspect < SUPPORT_MIN_ASPECT:
                 reason = (
-                    f"aspect {aspect:.2f} under {SUPPORT_MIN_ASPECT}; "
-                    "not a thin member"
+                    f"aspect {aspect:.2f} under {SUPPORT_MIN_ASPECT}; not a thin member"
                 )
             elif mean_width > SUPPORT_MAX_WIDTH_FRACTION * body_w:
                 reason = (
@@ -223,7 +225,9 @@ def detect_regions(
                     f"{SUPPORT_MAX_HEIGHT_FRACTION} of the body height"
                 )
             elif cbox[3] >= height:
-                reason = "component reaches the frame bottom; its foot is not in the photo"
+                reason = (
+                    "component reaches the frame bottom; its foot is not in the photo"
+                )
             if reason is not None:
                 refusals.append(Refusal("SUPPORT_REJECTED", reason, area))
                 unfilled += area
@@ -284,7 +288,6 @@ def detect_regions(
     return regions, refusals, unfilled
 
 
-
 def geometry(alpha: np.ndarray) -> tuple[dict, np.ndarray, np.ndarray]:
     """Measured geometry, dominant body and upper hull gaps at source resolution.
 
@@ -303,42 +306,63 @@ def geometry(alpha: np.ndarray) -> tuple[dict, np.ndarray, np.ndarray]:
     else:
         box = (0, 0, 0, 0)
     x0, y0, x1, y1 = box
-    bw, bh = x1-x0, y1-y0
+    bw, bh = x1 - x0, y1 - y0
     top_gaps = np.zeros_like(on)
     if bw and bh:
-        contours, _ = cv2.findContours(body.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours, _ = cv2.findContours(
+            body.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         hull = cv2.convexHull(np.concatenate(contours))
         cv2.fillConvexPoly(top_gaps.view(np.uint8), hull, 1)
         top_gaps &= ~on
-        top_gaps[y0 + max(1, int(.35*bh)):] = False
+        top_gaps[y0 + max(1, int(0.35 * bh)) :] = False
     holes = np.zeros_like(on)
     for b, c in _components(~on):
         if b[0] and b[1] and b[2] < w and b[3] < h:
-            holes[b[1]:b[3], b[0]:b[2]] |= c
+            holes[b[1] : b[3], b[0] : b[2]] |= c
     top_gaps &= ~holes
+    # A convex hull also spans ordinary outer tapers. A top defect must
+    # have product on BOTH sides in the same row, rather than merely
+    # lying between a silhouette and its convex hull.
+    for y in range(y0, min(h, y0 + max(1, int(0.35 * bh)))):
+        xs = np.flatnonzero(body[y])
+        if not len(xs):
+            top_gaps[y] = False
+        else:
+            top_gaps[y, : int(xs[0]) + 1] = False
+            top_gaps[y, int(xs[-1]) :] = False
     # A contact is a separate narrow member below the broad body envelope.
     row_width = body.sum(axis=1)
-    broad = np.where(row_width >= max(1, .55 * row_width.max()))[0]
-    body_bottom = int(broad[-1])+1 if len(broad) else y1
+    broad = np.where(row_width >= max(1, 0.55 * row_width.max()))[0]
+    body_bottom = int(broad[-1]) + 1 if len(broad) else y1
     contacts = 0
     if bh and body_bottom < y1:
         tail = body[body_bottom:]
-        contacts = sum(1 for b,c in _components(tail) if c.sum() >= max(2, .0001*area))
-    islands = sum(int(c.sum()) for b,c in parts if b != box and b[1] < y0 + .35*bh)
+        contacts = sum(
+            1 for b, c in _components(tail) if c.sum() >= max(2, 0.0001 * area)
+        )
+    islands = sum(int(c.sum()) for b, c in parts if b != box and b[1] < y0 + 0.35 * bh)
     ax0, ay0, ax1, ay1 = _bbox_of(on)
     metrics = {
-        'mask_pixels': area, 'coverage': round(area/(h*w), 6),
-        'components': len(parts), 'dominant_fraction': round(int(body.sum())/area,6) if area else 0.,
-        'bbox': list(_bbox_of(on)), 'body_bbox': list(box),
-        'bbox_fill': round(area/max(1, (ax1-ax0)*(ay1-ay0)),6),
-        'enclosed_hole_pixels': int(holes.sum()), 'top_concavity_pixels': int(top_gaps.sum()),
-        'top_island_pixels': islands, 'captured_support_components': contacts,
+        "mask_pixels": area,
+        "coverage": round(area / (h * w), 6),
+        "components": len(parts),
+        "dominant_fraction": round(int(body.sum()) / area, 6) if area else 0.0,
+        "bbox": list(_bbox_of(on)),
+        "body_bbox": list(box),
+        "bbox_fill": round(area / max(1, (ax1 - ax0) * (ay1 - ay0)), 6),
+        "enclosed_hole_pixels": int(holes.sum()),
+        "top_concavity_pixels": int(top_gaps.sum()),
+        "top_island_pixels": islands,
+        "captured_support_components": contacts,
     }
     return metrics, body, top_gaps
+
 
 @dataclass
 class TypedMask:
     """Observed mask with an explicit role; never itself a repair instruction."""
+
     kind: str  # support | occluder
     silhouette: np.ndarray
     provenance: dict = field(default_factory=dict)
@@ -347,19 +371,32 @@ class TypedMask:
 def top_footprints(alpha: np.ndarray, occluders: list[TypedMask]) -> list[Region]:
     """Only a bounded upper hull gap overlapped by foreign-object evidence."""
     metrics, body, gaps = geometry(alpha)
-    bx0,by0,bx1,by1=metrics['body_bbox']
-    output=[]
-    for box,local in _components(gaps):
-        x0,y0,x1,y1=box; area=int(local.sum())
-        if area < max(12,.005*metrics['mask_pixels']) or area>.4*metrics['mask_pixels']: continue
+    bx0, by0, bx1, by1 = metrics["body_bbox"]
+    output = []
+    for box, local in _components(gaps):
+        x0, y0, x1, y1 = box
+        area = int(local.sum())
+        if (
+            area < max(12, 0.005 * metrics["mask_pixels"])
+            or area > 0.4 * metrics["mask_pixels"]
+        ):
+            continue
         # Require real product on both flanks, not just the convex hull.
-        left=body[y0:y1,max(bx0,x0-4):x0].any()
-        right=body[y0:y1,x1:min(bx1,x1+4)].any()
-        if not (left and right): continue
+        left = body[y0:y1, max(bx0, x0 - 4) : x0].any()
+        right = body[y0:y1, x1 : min(bx1, x1 + 4)].any()
+        if not (left and right):
+            continue
         for occ in occluders:
-            overlap=local & occ.silhouette[y0:y1,x0:x1]
-            if int(overlap.sum()) >= .5*area:
-                output.append(Region('occluder',local.copy(),{'basis':'bounded_top_footprint','evidence':occ.provenance},bbox=box))
+            overlap = local & occ.silhouette[y0:y1, x0:x1]
+            if int(overlap.sum()) >= 0.5 * area:
+                output.append(
+                    Region(
+                        "occluder",
+                        local.copy(),
+                        {"basis": "bounded_top_footprint", "evidence": occ.provenance},
+                        bbox=box,
+                    )
+                )
                 break
     return output
 
@@ -371,65 +408,137 @@ def skeleton_support_cores(source_rgb: np.ndarray, alpha: np.ndarray) -> list[Re
     disconnected rows, clipped feet and wide attachments cannot supply a core.
     This does not invent the hidden foot or authorize the surrounding shadow.
     """
-    metrics,body,_=geometry(alpha)
-    x0,y0,x1,y1=metrics['body_bbox']; bw,bh=x1-x0,y1-y0
-    if not bw or y1>=alpha.shape[0]: return []
-    luma=source_rgb.mean(axis=2)
-    band=luma[y1:,x0:x1]
-    dark=band < .5*np.percentile(band,90)
-    results=[]
-    for box,local in _components(dark):
-        xa,ya,xb,yb=box
-        if ya>3 or yb>=band.shape[0]: continue
-        distance=cv2.distanceTransform(np.pad(local.astype(np.uint8),1),cv2.DIST_L2,5)[1:-1,1:-1]
-        core=np.zeros_like(local)
+    metrics, body, _ = geometry(alpha)
+    x0, y0, x1, y1 = metrics["body_bbox"]
+    bw, bh = x1 - x0, y1 - y0
+    if not bw or y1 >= alpha.shape[0]:
+        return []
+    luma = source_rgb.mean(axis=2)
+    band = luma[y1:, x0:x1]
+    dark = band < 0.5 * np.percentile(band, 90)
+    results = []
+    for box, local in _components(dark):
+        xa, ya, xb, yb = box
+        if ya > 3 or yb >= band.shape[0]:
+            continue
+        distance = cv2.distanceTransform(
+            np.pad(local.astype(np.uint8), 1), cv2.DIST_L2, 5
+        )[1:-1, 1:-1]
+        core = np.zeros_like(local)
         for row in range(local.shape[0]):
-            xs=np.where(local[row])[0]
-            if not len(xs) or np.any(np.diff(xs)>1): break
-            if len(xs)>.06*bw or 2*distance[row].max()>.06*bw+1: break
-            core[row]=local[row]
-        height=int(np.count_nonzero(core.any(axis=1)))
-        if height<12 or height>SUPPORT_MAX_HEIGHT_FRACTION*bh: continue
-        if height==local.shape[0]: continue  # ordinary supports use legacy detector
-        if height/(int(core.sum())/height)<SUPPORT_MIN_ASPECT: continue
-        box2=(x0+xa,y1+ya,x0+xb,y1+ya+height)
-        results.append(Region('support',core[:height],{'basis':'source_skeleton_width_core','max_width_px':int(core.sum(axis=1).max()),'shadow_excluded':True},bbox=box2))
+            xs = np.where(local[row])[0]
+            if not len(xs) or np.any(np.diff(xs) > 1):
+                break
+            if len(xs) > 0.06 * bw or 2 * distance[row].max() > 0.06 * bw + 1:
+                break
+            core[row] = local[row]
+        height = int(np.count_nonzero(core.any(axis=1)))
+        if height < 12 or height > SUPPORT_MAX_HEIGHT_FRACTION * bh:
+            continue
+        if height == local.shape[0]:
+            continue  # ordinary supports use legacy detector
+        if height / (int(core.sum()) / height) < SUPPORT_MIN_ASPECT:
+            continue
+        box2 = (x0 + xa, y1 + ya, x0 + xb, y1 + ya + height)
+        results.append(
+            Region(
+                "support",
+                core[:height],
+                {
+                    "basis": "source_skeleton_width_core",
+                    "max_width_px": int(core.sum(axis=1).max()),
+                    "shadow_excluded": True,
+                },
+                bbox=box2,
+            )
+        )
     return results
 
 
-def typed_regions(source_rgb: np.ndarray, alpha: np.ndarray, supports: list[TypedMask], occluders: list[TypedMask]) -> tuple[list[Region],list[Refusal],int]:
-    regions,refusals,unfilled=detect_regions(source_rgb,alpha)
-    metrics,body,_=geometry(alpha)
-    bx0,by0,bx1,by1=metrics['body_bbox'];bw,bh=bx1-bx0,by1-by0
-    touch=cv2.dilate(body.astype(np.uint8),np.ones((3,3),np.uint8),iterations=3)>0
-    luma=source_rgb.mean(axis=2)
-    floor=luma[min(by1,alpha.shape[0]-1):,bx0:bx1]
-    floor_luma=float(np.percentile(floor,90)) if floor.size else 0.
+def typed_regions(
+    source_rgb: np.ndarray,
+    alpha: np.ndarray,
+    supports: list[TypedMask],
+    occluders: list[TypedMask],
+) -> tuple[list[Region], list[Refusal], int]:
+    regions, refusals, unfilled = detect_regions(source_rgb, alpha)
+    metrics, body, _ = geometry(alpha)
+    bx0, by0, bx1, by1 = metrics["body_bbox"]
+    bw, bh = bx1 - bx0, by1 - by0
+    touch = (
+        cv2.dilate(body.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=3) > 0
+    )
+    luma = source_rgb.mean(axis=2)
+    floor = luma[min(by1, alpha.shape[0] - 1) :, bx0:bx1]
+    floor_luma = float(np.percentile(floor, 90)) if floor.size else 0.0
     for item in supports:
-        for box,local in _components(item.silhouette & (alpha==0)):
-            x0,y0,x1,y1=box; area=int(local.sum());height=y1-y0
-            width=area/max(1,height)
-            observed=luma[y0:y1,x0:x1][local].mean()<.65*floor_luma
-            valid=(y0>=by1-.15*bh and y1<alpha.shape[0] and height>=12 and height<=.6*bh and height/max(1,width)>=4 and width<=.06*bw and (local&touch[y0:y1,x0:x1]).any() and observed)
+        for box, local in _components(item.silhouette & (alpha == 0)):
+            x0, y0, x1, y1 = box
+            area = int(local.sum())
+            height = y1 - y0
+            width = area / max(1, height)
+            observed = luma[y0:y1, x0:x1][local].mean() < 0.65 * floor_luma
+            valid = (
+                y0 >= by1 - 0.15 * bh
+                and y1 < alpha.shape[0]
+                and height >= 12
+                and height <= 0.6 * bh
+                and height / max(1, width) >= 4
+                and width <= 0.06 * bw
+                and (local & touch[y0:y1, x0:x1]).any()
+                and observed
+            )
             if valid:
-                regions.append(Region('support',local,{'basis':'typed_support_mask',**item.provenance},bbox=box))
+                regions.append(
+                    Region(
+                        "support",
+                        local,
+                        {"basis": "typed_support_mask", **item.provenance},
+                        bbox=box,
+                    )
+                )
             else:
-                refusals.append(Refusal('SUPPORT_EVIDENCE_AMBIGUOUS','typed support lacks narrow, touching source evidence',area));unfilled+=area
-    regions.extend(skeleton_support_cores(source_rgb,alpha))
-    footprints=top_footprints(alpha,occluders)
+                refusals.append(
+                    Refusal(
+                        "SUPPORT_EVIDENCE_AMBIGUOUS",
+                        "typed support lacks narrow, touching source evidence",
+                        area,
+                    )
+                )
+                unfilled += area
+    regions.extend(skeleton_support_cores(source_rgb, alpha))
+    footprints = top_footprints(alpha, occluders)
     regions.extend(footprints)
     for occ in occluders:
-        matched=any((occ.silhouette[r.bbox[1]:r.bbox[3],r.bbox[0]:r.bbox[2]] & r.silhouette).any() for r in footprints)
+        matched = any(
+            (
+                occ.silhouette[r.bbox[1] : r.bbox[3], r.bbox[0] : r.bbox[2]]
+                & r.silhouette
+            ).any()
+            for r in footprints
+        )
         if not matched:
-            refusals.append(Refusal('OCCLUDER_WITHOUT_FOOTPRINT','foreign-object evidence has no bounded top footprint; the object itself is not papered',int(occ.silhouette.sum())))
-    support_union=np.zeros_like(alpha,dtype=bool)
+            refusals.append(
+                Refusal(
+                    "OCCLUDER_WITHOUT_FOOTPRINT",
+                    "foreign-object evidence has no bounded top footprint; the object itself is not papered",
+                    int(occ.silhouette.sum()),
+                )
+            )
+    support_union = np.zeros_like(alpha, dtype=bool)
     for region in regions:
-        if region.cls=='support':
-            x0,y0,x1,y1=region.bbox
-            support_union[y0:y1,x0:x1] |= region.silhouette
+        if region.cls == "support":
+            x0, y0, x1, y1 = region.bbox
+            support_union[y0:y1, x0:x1] |= region.silhouette
     if sum(1 for _ in _components(support_union)) > SUPPORT_MAX_COUNT:
-        refused=int(support_union.sum())
-        regions=[r for r in regions if r.cls!='support']
-        refusals.append(Refusal('SUPPORT_COUNT_OUT_OF_RANGE','typed and inferred supports exceed the shared count cap',refused))
-        unfilled+=refused
-    return regions,refusals,unfilled
+        refused = int(support_union.sum())
+        regions = [r for r in regions if r.cls != "support"]
+        refusals.append(
+            Refusal(
+                "SUPPORT_COUNT_OUT_OF_RANGE",
+                "typed and inferred supports exceed the shared count cap",
+                refused,
+            )
+        )
+        unfilled += refused
+    return regions, refusals, unfilled

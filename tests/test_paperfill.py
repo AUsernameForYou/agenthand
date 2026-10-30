@@ -284,7 +284,7 @@ def test_draw_with_paper_fill_receipt_verifies(tmp_path):
     result = roomrun.draw_with_code_plate(store, fg, "wallpaper")
     assert result["status"] == "ok", result
     receipt = result["fidelity_receipt"]
-    assert receipt["receipt_schema"] == 3
+    assert receipt["receipt_schema"] == 4
     block = receipt["reconstruction"]
     assert block["status"] == "applied"
     assert block["reconstruction_pixels"] > 0
@@ -381,6 +381,8 @@ def test_v2_receipt_still_grades_and_v2_with_paper_fails(tmp_path):
     v2 = dict(receipt)
     v2["receipt_schema"] = 2
     v2.pop("reconstruction")
+    v2.pop("cut_quality")
+    v2.pop("plate_quality")
     report = composite.verify_receipt_from_disk(store, handle, receipt=v2)
     assert report["ok"] is True, report["problems"]
     smuggled = dict(v2)

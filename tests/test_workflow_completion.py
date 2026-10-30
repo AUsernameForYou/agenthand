@@ -437,6 +437,10 @@ def test_draw_receipt_plate_kinds_and_verifier_acceptance(tmp_path):
     assert report["ok"] is True
     # Old-shape receipts (no plate_kind / backdrop) keep passing.
     stripped = dict(rendered)
+    stripped["receipt_schema"] = 3
+    stripped.pop("cut_quality")
+    stripped.pop("plate_quality")
+    stripped["reconstruction"] = {k:v for k,v in rendered["reconstruction"].items() if k not in ("policy_version","max_fraction","attempted")}
     stripped.pop("plate_kind")
     stripped.pop("backdrop")
     report = composite.verify_receipt_from_disk(store, handle, receipt=stripped)

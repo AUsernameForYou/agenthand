@@ -23,7 +23,13 @@ def _foreground() -> Image.Image:
 
 
 def _photo() -> Image.Image:
-    return Image.new("RGBA", (6, 4), (90, 90, 90, 255))
+    photo = Image.new("RGBA", (6,4), (90,90,90,255))
+    fg = _foreground()
+    for y in range(4):
+        for x in range(4):
+            r,g,b,_ = fg.getpixel((x,y))
+            photo.putpixel((x,y),(r,g,b,255))
+    return photo
 
 
 def _store_with_foreground(tmp_path, with_mask=False):
@@ -31,7 +37,7 @@ def _store_with_foreground(tmp_path, with_mask=False):
     photo = store.put_image(_photo(), kind="source_photo")
     parent = AssetStore.parse_handle(photo)
     if with_mask:
-        mask_img = Image.new("RGBA", (6, 4), (255, 255, 255, 255))
+        mask_img = _foreground().getchannel("A")
         mask = store.put_image(mask_img, kind="mask_png", source_asset_id=parent)
         parent = AssetStore.parse_handle(mask)
     fg = store.put_image(_foreground(), kind="foreground_png", source_asset_id=parent)
