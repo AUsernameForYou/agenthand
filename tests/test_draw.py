@@ -444,3 +444,15 @@ def test_mocked_draw_never_touches_the_real_ledger(monkeypatch):
 
     after = REAL_LEDGER.read_bytes() if REAL_LEDGER.exists() else None
     assert after == before  # no sam/image (or any) entries leaked in
+
+
+@pytest.mark.parametrize("scene", ["a regal warmly lit reading room", "a beach house"])
+def test_draw_discloses_compiled_scene_and_dropped_words(monkeypatch, scene):
+    from dataclasses import asdict
+    _install_fake(monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())]))
+    store = AssetStore(config.get_data_dir())
+    fg = _seed_foreground(store)
+    result, _ = server.draw(fg, scene)
+    assert result["stage_spec"] == asdict(meta_client.StageSpec.from_scene(scene))
+    assert "unmatched words were dropped" in result["scene_prompt_note"]
+    assert result["stage_spec"] == result["fidelity_receipt"]["plate_quality"]["stage_spec"]
