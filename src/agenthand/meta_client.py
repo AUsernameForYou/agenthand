@@ -805,10 +805,9 @@ def vision_identify(
 # SAM 3.1 segmentation calls (Responses API transport).
 # ---------------------------------------------------------------------------
 
-# The mask-recovery loop's bound: the concept phrase, plus ONE retry
-# with the first alternate. The reservation for a cut_out call is priced
-# at this many images, so the loop can never spend past its projection.
-SAM_MAX_ATTEMPTS = 2
+# Three fixed phrases plus at most five band tiles. All requests remain
+# inside one pre-reserved billed_call, with actual processed images settled.
+SAM_MAX_ATTEMPTS = 8
 
 
 def project_cut_out_cost_usd(model: str, max_attempts: int = SAM_MAX_ATTEMPTS) -> float:

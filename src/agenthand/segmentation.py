@@ -11,7 +11,9 @@ asset store:
 - ``extract_foreground`` builds the transparent foreground: source
   pixels exactly where the mask is on, transparent black elsewhere.
   Nothing is regenerated — this is the Fidelity Lock's extraction step.
-- ``run_attempts`` is the recovery loop the tool contract promises:
+- ``run_cut_pipeline`` acquires a fixed phrase ensemble and band tiles.
+  All records and provenance survive; source pixels alone become foreground.
+- Legacy history: ``run_attempts`` was the recovery loop the tool contract promises:
   try the concept phrase; on a zero-match or a poor mask, retry ONCE
   with the first alternate phrase. Every attempt is traced (phrase,
   outcome, coverage, QA detail). Total failure raises
@@ -161,10 +163,11 @@ class CutOutResultError(RuntimeError):
         attempts: The full attempt trace (see run_attempts).
     """
 
-    def __init__(self, message: str, *, code: str, attempts: list[dict]):
+    def __init__(self, message: str, *, code: str, attempts: list[dict], records: list[dict] | None = None):
         super().__init__(message)
         self.code = code
         self.attempts = attempts
+        self.records = records or []
 
 
 @dataclass
@@ -361,95 +364,142 @@ def extract_foreground(source: Image.Image, mask_image: Image.Image) -> Image.Im
     )
 
 
-def _choose_mask(masks: list[DecodedMask]) -> DecodedMask:
-    """Pick the record to QA: the largest mask by pixel count.
+PIPELINE_VERSION = 'agenthand.cut-pipeline/1'
+MIN_TILE_FRAME_SIDE = 128  # sub-thumbnail controls contain no native thin detail
 
-    A text-prompted segmentation can return several candidate objects;
-    the product is the dominant one. The choice is deterministic (ties
-    keep response order) and the record count rides in the trace.
+
+def _body_score(record: dict, records: list[dict]) -> tuple:
+    """Agreement, compactness and centering; area alone never chooses a product."""
+    from .mask_evidence import geometry
+    image = record['image']
+    metrics, _, _ = geometry(np.asarray(image))
+    box = metrics['body_bbox']
+    cx = (box[0]+box[2])/2/image.width
+    cy = (box[1]+box[3])/2/image.height
+    agreement = max((mask_iou(image,r['image']) for r in records if r['phrase'] != record['phrase']), default=0.)
+    defects = (metrics['top_concavity_pixels']+metrics['top_island_pixels'])/max(1,metrics['mask_pixels'])
+    score = agreement + metrics['bbox_fill'] - abs(cx-.5) - abs(cy-.5) - 2*defects
+    return (score, metrics['dominant_fraction'])
+
+
+def band_tiles(size: tuple[int,int], bbox: tuple[int,int,int,int], slots: int) -> list[dict]:
+    """Fixed bottom/top coverage, overlapping horizontally; every request fits cap.
+
+    Full native resolution whenever the band fits its allocation. Very large
+    bands get minimally scaled within each allotted crop, explicitly recorded.
     """
-    return max(masks, key=lambda m: m.mask_pixels)
+    w,h=size; x0,y0,x1,y1=bbox; bw,bh=x1-x0,y1-y0
+    if min(w,h)<MIN_TILE_FRAME_SIDE or not bw or not bh or slots<2: return []
+    bands=[('support',max(0,y1-int(.1*bh)), min(h,y1+max(16,int(.5*bh)))),
+           ('top',max(0,y0-int(.1*bh)), min(h,y0+max(16,int(.35*bh))))]
+    result=[]
+    for index,(kind,ya,yb) in enumerate(bands):
+        allotted = slots//2 + (slots%2 if index==0 else 0)
+        needed = max(1,math.ceil(bw*(yb-ya)/(.85*SAM_MAX_PIXELS)))
+        count = min(needed,allotted)
+        tile_w = bw if count==1 else min(bw,math.ceil(bw/(count-.12*(count-1))))
+        for i in range(count):
+            xa=x0 if count==1 else x0+round(i*(bw-tile_w)/(count-1))
+            result.append({'kind':kind,'bbox':[xa,ya,xa+tile_w,yb]})
+    return result
 
 
-def run_attempts(
-    png_bytes: bytes,
-    phrases: list[str],
-    *,
-    model: str,
-    frame_width: int,
-    frame_height: int,
-    client=None,
-) -> dict:
-    """Run the bounded attempt loop; returns the winning mask + trace.
+def _classify_component(binary: np.ndarray, body: np.ndarray, source_rgb: np.ndarray, bbox: tuple, kind: str) -> str:
+    """Only narrow, observed members touching the body may expand foreground."""
+    from .mask_evidence import _bbox_of
+    x0,y0,x1,y1=bbox; bw,bh=x1-x0,y1-y0
+    cx0,cy0,cx1,cy1=_bbox_of(binary)
+    area=int(binary.sum()); overlap=int((binary&body).sum())
+    if not area: return 'debris'
+    if overlap/area>.5: return 'body'
+    if cy1 <= y0+.35*bh: return 'occluder'
+    height=cy1-cy0; mean_width=area/max(1,height)
+    touching=cv2.dilate(body.astype(np.uint8),np.ones((3,3),np.uint8),iterations=3)>0
+    in_zone=cy0>=y1-.15*bh and cy1<=y1+.6*bh and cx0>=x0-.05*bw and cx1<=x1+.05*bw
+    luma=source_rgb.mean(axis=2)
+    floor=luma[min(y1,body.shape[0]-1):,x0:x1]
+    observed=float(luma[binary].mean()) < .65*float(np.percentile(floor,90)) if floor.size else False
+    if kind=='support' and in_zone and (binary&touching).any() and height>=12 and height/max(1,mean_width)>=4 and mean_width<=.06*bw and cy1<body.shape[0] and observed:
+        return 'support'
+    return 'debris'
 
-    ``phrases`` is [concept, first_alternate] at most (the caller caps
-    it): the concept is tried first, the alternate is the single
-    recovery retry. On success returns a dict with mask_image (the
-    winning full-frame "L" mask), mask (the DecodedMask), phrase (the
-    phrase that produced it), attempts (the trace), and usage
-    ({"images": <attempts made>}). Raises CutOutResultError when every
-    attempt fails; a SAM response that cannot be parsed raises
-    CutOutResultError with code BAD_MODEL_RESPONSE immediately (a
-    different phrase will not fix a broken wire format).
 
-    This performs network I/O (via meta_client.segment_image) and must
-    only run as the fn of billed_call.
+def run_cut_pipeline(source: Image.Image, stored_png_bytes: bytes, phrases: list[str], *, model: str, client=None) -> dict:
+    """Acquire the fixed phrase ensemble and bounded top/support detail.
+
+    Must be invoked inside billed_call. Every decoded record is returned,
+    including rejected/debris records, with source coordinates and provenance.
     """
-    attempts: list[dict] = []
-    images = 0
-    last_code = "NO_MATCH"
-    for phrase in phrases:
-        output_text, _usage = meta_client.segment_image(
-            png_bytes, phrase, model=model, client=client
-        )
-        images += 1
-        trace: dict = {"phrase": phrase, "records": 0}
-        try:
-            masks = parse_sam_masks(output_text, frame_width, frame_height)
+    from .mask_evidence import geometry, _components
+    phrases=list(dict.fromkeys(phrases[:3]))
+    if not phrases: raise ValueError('at least one fixed phrase is required')
+    records=[]; attempts=[]
+    payload=prepare_sam_png(source,stored_png_bytes)
+    fullbox=[0,0,source.width,source.height]
+
+    def acquire(phrase, tile, data):
+        output,_=meta_client.segment_image(data['png_bytes'],phrase,model=model,client=client)
+        trace={'phrase':phrase,'tile':tile,'records':0,'sam_width':data['sam_width'],'sam_height':data['sam_height'],'scale_method':data['scale_method']}
+        try: masks=parse_sam_masks(output,data['sam_width'],data['sam_height'])
         except SamOutputError as exc:
-            trace["outcome"] = "unparseable"
-            attempts.append(trace)
-            raise CutOutResultError(
-                f"SAM output for phrase {phrase!r} could not be used: {exc}",
-                code="BAD_MODEL_RESPONSE",
-                attempts=attempts,
-            ) from exc
-        trace["records"] = len(masks)
-        if not masks:
-            # Zero-match is a normal outcome: it drives the retry.
-            trace["outcome"] = "no_match"
-            attempts.append(trace)
-            last_code = "NO_MATCH"
-            continue
-        chosen = _choose_mask(masks)
-        assessment = assess_mask(chosen.image)
-        trace.update(
-            {
-                "object_id": chosen.object_id,
-                "coverage": round(assessment.coverage, 6),
-                "mask_pixels": assessment.mask_pixels,
-                "components": assessment.components,
-                "dominant_fraction": round(assessment.dominant_fraction, 6),
-            }
-        )
-        if not assessment.accepted:
-            trace["outcome"] = "poor_mask"
-            trace["rejection"] = assessment.rejection
-            attempts.append(trace)
-            last_code = "POOR_MASK"
-            continue
-        trace["outcome"] = "accepted"
+            trace['outcome']='unparseable';attempts.append(trace)
+            raise CutOutResultError(str(exc),code='BAD_MODEL_RESPONSE',attempts=attempts,records=records) from exc
+        trace['records']=len(masks)
+        trace['outcome']='no_match' if not masks else 'poor_mask'
+        for mask in masks:
+            box=tile['bbox']; local=map_mask_to_frame(mask.image,box[2]-box[0],box[3]-box[1])
+            mapped=Image.new('L',source.size); mapped.paste(local,(box[0],box[1]))
+            qa=assess_mask(mapped)
+            records.append({'image':mapped,'object_id':mask.object_id,'phrase':phrase,'tile':tile,
+                            'sam_width':data['sam_width'],'sam_height':data['sam_height'],
+                            'scale_method':data['scale_method'],'assessment':qa,'role':'debris','components':[]})
+            if qa.accepted:
+                trace.update(object_id=mask.object_id,coverage=round(qa.coverage,6),mask_pixels=qa.mask_pixels,
+                             components=qa.components,dominant_fraction=round(qa.dominant_fraction,6),outcome='accepted')
+            else:
+                trace.update(coverage=round(qa.coverage,6),mask_pixels=qa.mask_pixels,components=qa.components,dominant_fraction=round(qa.dominant_fraction,6))
+                trace['rejection']=qa.rejection
         attempts.append(trace)
-        return {
-            "mask_image": chosen.image,
-            "mask": chosen,
-            "phrase": phrase,
-            "attempts": attempts,
-            "usage": {"images": images},
-        }
-    raise CutOutResultError(
-        f"No usable mask after {len(attempts)} attempt(s); "
-        f"final outcome: {last_code}.",
-        code=last_code,
-        attempts=attempts,
-    )
+
+    for phrase in phrases: acquire(phrase,{'kind':'global','bbox':fullbox},payload)
+    usable=[r for r in records if r['assessment'].accepted]
+    if not usable:
+        code='POOR_MASK' if records else 'NO_MATCH'
+        raise CutOutResultError('No usable global body in fixed phrase ensemble.',code=code,attempts=attempts,records=records)
+    selected=max(usable,key=lambda r:_body_score(r,usable))
+    metrics,body,_=geometry(np.asarray(selected['image']))
+    bbox=tuple(metrics['body_bbox'])
+    for i,tile in enumerate(band_tiles(source.size,bbox,meta_client.SAM_MAX_ATTEMPTS-len(attempts))):
+        crop=source.crop(tuple(tile['bbox'])); b=BytesIO();crop.save(b,format='PNG')
+        data=prepare_sam_png(crop,b.getvalue())
+        acquire(phrases[i%len(phrases)],tile,data)
+    rgb=np.asarray(source.convert('RGB'))
+    merged=body.copy()
+    for r in records:
+        roles=[]
+        for box,local in _components(np.asarray(r['image'])>0):
+            binary=np.zeros_like(body);binary[box[1]:box[3],box[0]:box[2]]=local
+            role=_classify_component(binary,body,rgb,bbox,r['tile']['kind'])
+            roles.append({'role':role,'bbox':list(box),'pixels':int(local.sum())})
+            if role=='support': merged|=binary
+            if r['tile']['kind']=='support' and role=='body':
+                # SAM may return a leg attached to a body fragment; assess
+                # the new pixels independently, rather than discarding them.
+                for extra_box,extra_local in _components(binary & ~body):
+                    extra=np.zeros_like(body)
+                    extra[extra_box[1]:extra_box[3],extra_box[0]:extra_box[2]]=extra_local
+                    extra_role=_classify_component(extra,body,rgb,bbox,'support')
+                    roles.append({'role':extra_role,'bbox':list(extra_box),'pixels':int(extra_local.sum())})
+                    if extra_role=='support': merged|=extra
+        r['components']=roles
+        r['role']='body' if r is selected else (roles[0]['role'] if roles and len({p['role'] for p in roles})==1 else 'mixed')
+    mask=Image.fromarray((merged*255).astype(np.uint8))
+    return {'mask_image':mask,'phrase':selected['phrase'],'attempts':attempts,'records':records,
+            'pipeline_version':PIPELINE_VERSION,'usage':{'images':len(attempts)}}
+
+
+def run_attempts(png_bytes: bytes, phrases: list[str], *, model: str, frame_width: int, frame_height: int, client=None) -> dict:
+    """Compatibility entry point; uses the same ensemble policy as cut_out."""
+    with Image.open(BytesIO(png_bytes)) as image: source=image.convert('RGBA')
+    if source.size != (frame_width,frame_height): raise ValueError('SAM frame mismatch')
+    return run_cut_pipeline(source,png_bytes,phrases,model=model,client=client)

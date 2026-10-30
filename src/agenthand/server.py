@@ -329,6 +329,19 @@ def _draw_with_placeholder_plate(store: AssetStore, asset: str, scene_prompt: st
     return [result, preview]
 
 
+def _store_cut_evidence(store: AssetStore, source_record, candidates: list[dict]) -> list[dict]:
+    """Persist all decoded SAM records, including rejected attempts."""
+    evidence_records = []
+    for candidate in candidates:
+        provenance = {k: candidate[k] for k in ("object_id", "phrase", "tile", "sam_width", "sam_height", "scale_method", "role", "components")}
+        buf = BytesIO(); info = PngInfo()
+        info.add_text("agenthand_cut_evidence", json.dumps(provenance, sort_keys=True))
+        candidate["image"].save(buf, format="PNG", pnginfo=info)
+        candidate_handle = store.put_bytes(buf.getvalue(), kind=KIND_MASK, suffix=".png", source_asset_id=source_record.asset_id)
+        evidence_records.append({"mask_asset": candidate_handle, **provenance})
+    return evidence_records
+
+
 @mcp.tool()
 def cut_out(image: str, concept: str | None = None) -> dict:
     """Cut the product out of its photo as a transparent PNG.
@@ -452,8 +465,9 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     # The attempt loop is bounded: the concept, plus one recovery retry
     # with the first alternate. The reservation prices exactly the
     # attempts the loop may make.
-    phrases = [concept, *alternates[: meta_client.SAM_MAX_ATTEMPTS - 1]]
-    projected = meta_client.project_cut_out_cost_usd(CUT_OUT_MODEL, len(phrases))
+    phrases = list(dict.fromkeys([concept, *alternates[:2]]))
+    attempt_cap = meta_client.SAM_MAX_ATTEMPTS if min(source_image.size) >= segmentation.MIN_TILE_FRAME_SIDE else len(phrases)
+    projected = meta_client.project_cut_out_cost_usd(CUT_OUT_MODEL, attempt_cap)
     outcome: dict = {}
 
     # SAM working resolution (decision 68): past the proven cap, only
@@ -471,12 +485,11 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     }
 
     def _run_attempts() -> dict:
-        result = segmentation.run_attempts(
-            sam_payload["png_bytes"],
+        result = segmentation.run_cut_pipeline(
+            source_image,
+            store.read_bytes(handle),
             phrases,
             model=CUT_OUT_MODEL,
-            frame_width=sam_payload["sam_width"],
-            frame_height=sam_payload["sam_height"],
         )
         outcome.update(result)
         return result["usage"]
@@ -490,6 +503,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
             exc.code,
             str(exc),
             attempts=exc.attempts,
+            cut_evidence=_store_cut_evidence(store, source_record, exc.records),
             cost_counted_usd=projected,
         )
 
@@ -497,11 +511,11 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     # frame before anything is cut, reviewed, or stored, so every
     # downstream artifact (mask asset, foreground, overlay) is at the
     # photo's own resolution and the Fidelity Lock binds those pixels.
-    full_mask = segmentation.map_mask_to_frame(
-        outcome["mask_image"], source_image.width, source_image.height
-    )
+    full_mask = outcome["mask_image"]
+    evidence_records = _store_cut_evidence(store, source_record, outcome["records"])
     mask_buffer = BytesIO()
     pnginfo = PngInfo()
+    pnginfo.add_text("agenthand_cut_pipeline", json.dumps({"version": outcome["pipeline_version"], "records": evidence_records}, sort_keys=True))
     pnginfo.add_text(
         MASK_PROVENANCE_PNG_KEY,
         json.dumps(mask_provenance, separators=(",", ":"), sort_keys=True),
@@ -554,6 +568,8 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         "mask_asset": mask_handle,
         "mask_overlay_asset": overlay_handle,
         "mask_review": mask_review,
+        "cut_evidence": evidence_records,
+        "cut_pipeline_version": outcome["pipeline_version"],
         "mask_provenance": mask_provenance,
         "hashes": {
             "source": {

@@ -207,7 +207,7 @@ def test_cut_out_ships_the_mask_overlay_and_review(monkeypatch):
     assert review["warnings"] == []
 
 
-def test_cut_out_picks_the_largest_record(monkeypatch):
+def test_cut_out_selects_coherent_body_and_preserves_every_record(monkeypatch):
     _install_fake(
         monkeypatch, _FakeClient(sam_responses=[_sam_response(TWO_RECORDS_TEXT)])
     )
@@ -217,6 +217,11 @@ def test_cut_out_picks_the_largest_record(monkeypatch):
     assert attempt["records"] == 2
     assert attempt["object_id"] == "1"  # the 24-pixel block, not the 4-pixel blob
     assert attempt["coverage"] == 0.5
+    assert len(result["cut_evidence"]) == 2
+    store = AssetStore(config.get_data_dir())
+    for record in result["cut_evidence"]:
+        store.verify_integrity(record["mask_asset"])
+        assert record["tile"]["kind"] == "global"
 
 
 def test_cut_out_recovers_with_first_alternate_after_zero_match(monkeypatch):
@@ -224,7 +229,7 @@ def test_cut_out_recovers_with_first_alternate_after_zero_match(monkeypatch):
         monkeypatch,
         _FakeClient(
             chat_responses=[_chat_response(IDENTIFY_PAYLOAD)],
-            sam_responses=[_sam_response(""), _sam_response(GOOD_TEXT)],
+            sam_responses=[_sam_response(""), _sam_response(GOOD_TEXT), _sam_response("")],
         ),
     )
     result = server.cut_out(_photo_uri())
@@ -233,23 +238,24 @@ def test_cut_out_recovers_with_first_alternate_after_zero_match(monkeypatch):
     assert result["concept_source"] == "identify_internal"
     # The winning phrase is the first alternate; the trace shows both tries.
     assert result["concept"] == "leather bifold wallet"
-    assert [a["outcome"] for a in result["attempts"]] == ["no_match", "accepted"]
+    assert [a["outcome"] for a in result["attempts"]] == ["no_match", "accepted", "no_match"]
     assert [a["phrase"] for a in result["attempts"]] == [
         "brown leather wallet",
         "leather bifold wallet",
+        "brown wallet",
     ]
     phrases_sent = [
         call["input"][0]["content"][0]["text"] for call in client.responses.calls
     ]
-    assert phrases_sent == ["brown leather wallet", "leather bifold wallet"]
+    assert phrases_sent == ["brown leather wallet", "leather bifold wallet", IDENTIFY_PAYLOAD["alternates"][1]]
 
     # Both attempts billed: settled at two images; identify billed on its own.
-    assert result["usage"]["images"] == 2
-    assert result["cost_usd"] == 0.005
+    assert result["usage"]["images"] == 3
+    assert result["cost_usd"] == 0.0075
     cut_records = _records("cut_out")
     assert [r["phase"] for r in cut_records] == ["pending", "settled"]
-    assert cut_records[0]["usd_estimate"] == 0.005  # reservation priced both attempts
-    assert cut_records[1]["images"] == 2
+    assert cut_records[0]["usd_estimate"] == 0.0075  # reservation priced both attempts
+    assert cut_records[1]["images"] == 3
     tools = [r["tool"] for r in _records() if r["phase"] == "pending"]
     assert tools == ["identify", "cut_out"]
 
@@ -292,7 +298,7 @@ def test_cut_out_recovery_exhausted_counts_spend_once_per_attempt(monkeypatch):
         monkeypatch,
         _FakeClient(
             chat_responses=[_chat_response(IDENTIFY_PAYLOAD)],
-            sam_responses=[_sam_response(""), _sam_response(FRAG_TEXT)],
+            sam_responses=[_sam_response(""), _sam_response(FRAG_TEXT), _sam_response("")],
         ),
     )
     result = server.cut_out(_photo_uri())
@@ -303,13 +309,14 @@ def test_cut_out_recovery_exhausted_counts_spend_once_per_attempt(monkeypatch):
     assert [a["outcome"] for a in result["error"]["attempts"]] == [
         "no_match",
         "poor_mask",
+        "no_match",
     ]
     assert result["error"]["attempts"][1]["rejection"] == "fragmented"
     # One reservation priced at both attempts, counted exactly once.
     records = _records("cut_out")
     assert [r["phase"] for r in records] == ["pending"]
-    assert records[0]["usd_estimate"] == 0.005
-    assert result["error"]["cost_counted_usd"] == 0.005
+    assert records[0]["usd_estimate"] == 0.0075
+    assert result["error"]["cost_counted_usd"] == 0.0075
 
 
 def test_cut_out_missing_key_is_not_configured_with_no_ledger_write(monkeypatch):
