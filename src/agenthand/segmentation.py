@@ -413,7 +413,7 @@ def _classify_component(
     binary: np.ndarray, body: np.ndarray, source_rgb: np.ndarray, bbox: tuple, kind: str
 ) -> str:
     """Only narrow, observed members touching the body may expand foreground."""
-    from .mask_evidence import _bbox_of, support_min_height
+    from .mask_evidence import _bbox_of, support_min_height, floor_contrast
 
     x0, y0, x1, y1 = bbox
     bw, bh = x1 - x0, y1 - y0
@@ -437,13 +437,8 @@ def _classify_component(
         and cx0 >= x0 - 0.05 * bw
         and cx1 <= x1 + 0.05 * bw
     )
-    luma = source_rgb.mean(axis=2)
-    floor = luma[min(y1, body.shape[0] - 1) :, x0:x1]
-    observed = (
-        float(luma[binary].mean()) < 0.65 * float(np.percentile(floor, 90))
-        if floor.size
-        else False
-    )
+    floor = source_rgb[min(y1, body.shape[0]-1):, x0:x1]
+    observed = float(floor_contrast(source_rgb, floor.reshape(-1, 3))[binary].mean()) >= 0.65
     if (
         kind == "support"
         and in_zone

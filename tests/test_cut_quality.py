@@ -209,3 +209,24 @@ def test_box_contact_shadow_passes_at_multiple_resolutions(scale):
     a = np.repeat(np.repeat(a, scale, axis=0), scale, axis=1)
     src = np.repeat(np.repeat(src, scale, axis=0), scale, axis=1)
     assert grade_cut(src, a)["grade"] == "PASS"
+
+
+@pytest.mark.parametrize("floor,leg", [((200,200,200),(15,15,15)), ((40,40,40),(230,230,230)), ((150,100,70),(70,110,200))])
+def test_missing_supports_detect_both_contrast_directions_and_chroma(floor, leg):
+    src, a = scene()
+    src[:] = floor
+    for x in (35, 100):
+        src[65:87, x:x+4] = leg
+    q = grade_cut(src, a)
+    assert q["grade"] == "REPAIRABLE", q
+    assert "SUPPORT_NOT_CAPTURED" in q["codes"]
+    from agenthand.mask_evidence import TypedMask, typed_regions
+    from agenthand.segmentation import _classify_component
+    support = np.zeros_like(a, bool)
+    support[65:87, 35:39] = True
+    assert _classify_component(support, a>0, src, (25,20,115,65), "support") == "support"
+    regions, _, _ = typed_regions(src, a, [TypedMask("support", support)], [])
+    assert any(r.provenance.get("basis") == "typed_support_mask" for r in regions)
+    for x in (35, 100):
+        a[65:87, x:x+4] = 255
+    assert grade_cut(src, a)["grade"] == "PASS"

@@ -13,7 +13,7 @@ import numpy as np
 MIN_HOLE_FRACTION = 0.0005
 MAX_HOLE_FRACTION = 0.40
 
-# Support gates, applied to dark components in the band below the
+# Support gates, applied to contrasting components in the band below the
 # product (see detect_regions).
 SUPPORT_TOUCH_DILATE_PX = 3
 SUPPORT_MIN_ASPECT = 4.0
@@ -34,13 +34,6 @@ def support_min_height(body_height):
 # mask area, so it scales with the product like the other gates.
 REFUSAL_AGGREGATE_FLOOR_PX = 64
 REFUSAL_AGGREGATE_FRACTION = 0.001
-# A support candidate must be much darker than the typical
-# under-product background: under half the band's median luma. A
-# percentile threshold collapses when the dark thing is large (its
-# own luma becomes the percentile), which would make big dark
-# objects vanish from candidacy instead of being refused on record.
-SUPPORT_DARK_MEDIAN_FRACTION = 0.5
-
 # Region-map class codes (the region map asset is an L image).
 REGION_CLASS_CODES = {"hole": 1, "support": 2, "occluder": 3}
 
@@ -94,6 +87,24 @@ def _components(binary: np.ndarray):
 # Fixed source-appearance gates, versioned by cut_quality.VERSION.
 PRODUCT_COLOUR_DISTANCE = 35.0
 PRODUCT_MATCH_FRACTION = 0.65
+
+
+def floor_contrast(rgb, floor_samples):
+    """Source contrast against the local floor, for either brightness polarity.
+
+    Chroma distance also preserves coloured members with similar luminance.
+    Large uniform backgrounds alone remain non-authorizing geometry.
+    """
+    if not len(floor_samples):
+        return np.zeros(rgb.shape[:2], bool)
+    colour = np.median(floor_samples.reshape(-1, 3), axis=0)
+    values = rgb.astype(np.float32)
+    weights = np.array([0.2126, 0.7152, 0.0722])
+    luma = values @ weights
+    floor_luma = float(colour @ weights)
+    chroma = values - values.mean(axis=-1, keepdims=True)
+    floor_chroma = colour - colour.mean()
+    return (np.abs(luma-floor_luma) > max(30, 0.45*floor_luma)) | (np.linalg.norm(chroma-floor_chroma, axis=-1) > 60)
 
 
 def resembles_product(source_rgb, product, bbox, local) -> bool:
@@ -201,7 +212,7 @@ def detect_regions(
                 )
             )
 
-    # ---- Supports: observed dark thin components below the body. ----
+    # ---- Supports: observed contrasting thin components below the body. ----
     bx0, by0, bx1, by1 = _bbox_of(product_any)
     body_w, body_h = bx1 - bx0, by1 - by0
     widen = int(0.05 * body_w)
@@ -218,14 +229,7 @@ def detect_regions(
             bottoms[x] = rows.max()
             band[bottoms[x] + 1 :, x] = True
     if band.any():
-        luma = (
-            0.2126 * source_rgb[:, :, 0].astype(np.float64)
-            + 0.7152 * source_rgb[:, :, 1].astype(np.float64)
-            + 0.0722 * source_rgb[:, :, 2].astype(np.float64)
-        )
-        band_luma = luma[band]
-        dark_limit = SUPPORT_DARK_MEDIAN_FRACTION * float(np.median(band_luma))
-        candidates = band & (luma < dark_limit)
+        candidates = band & floor_contrast(source_rgb, source_rgb[band])
         dilated_product = (
             cv2.dilate(
                 product_any.astype(np.uint8),
@@ -242,7 +246,7 @@ def detect_regions(
                 refusals.append(
                     Refusal(
                         "SUPPORT_NO_TOUCH",
-                        "dark component below the product does not "
+                        "contrasting component below the product does not "
                         "touch it; not evidence of a support",
                         area,
                     )
@@ -462,9 +466,8 @@ def skeleton_support_cores(source_rgb: np.ndarray, alpha: np.ndarray) -> list[Re
     bw, bh = x1 - x0, y1 - y0
     if not bw or y1 >= alpha.shape[0]:
         return []
-    luma = source_rgb.mean(axis=2)
-    band = luma[y1:, x0:x1]
-    dark = band < 0.5 * np.percentile(band, 90)
+    band = source_rgb[y1:, x0:x1]
+    dark = floor_contrast(band, band.reshape(-1, 3))
     results = []
     for box, local in _components(dark):
         xa, ya, xb, yb = box
@@ -517,16 +520,15 @@ def typed_regions(
     touch = (
         cv2.dilate(body.astype(np.uint8), np.ones((3, 3), np.uint8), iterations=3) > 0
     )
-    luma = source_rgb.mean(axis=2)
-    floor = luma[min(by1, alpha.shape[0] - 1) :, bx0:bx1]
-    floor_luma = float(np.percentile(floor, 90)) if floor.size else 0.0
+    floor = source_rgb[min(by1, alpha.shape[0]-1):, bx0:bx1]
+    observed_pixels = floor_contrast(source_rgb, floor.reshape(-1, 3))
     for item in supports:
         for box, local in _components(item.silhouette & (alpha == 0)):
             x0, y0, x1, y1 = box
             area = int(local.sum())
             height = y1 - y0
             width = area / max(1, height)
-            observed = luma[y0:y1, x0:x1][local].mean() < 0.65 * floor_luma
+            observed = float(observed_pixels[y0:y1, x0:x1][local].mean()) >= 0.65
             valid = (
                 y0 >= by1 - 0.15 * bh
                 and y1 < alpha.shape[0]
