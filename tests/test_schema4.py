@@ -140,3 +140,43 @@ def test_opaque_foreground_cannot_fabricate_source_alpha(tmp_path):
     )
     with pytest.raises(composite.FidelityLockError, match="source photo"):
         composite.preflight_cut(store, handle)
+
+
+def test_actual_retained_v1_receipt_verifies_under_legacy_policy(tmp_path):
+    from pathlib import Path
+    from agenthand.assets import AssetRecord
+
+    docs = Path(__file__).resolve().parents[1] / "docs"
+    replay = json.loads((docs / "replay-run-v1.json").read_text())
+    receipt = json.loads((docs / "proof-receipt-v1.json").read_text())
+    store = AssetStore(tmp_path)
+    store.assets_dir.mkdir(parents=True)
+    # Restore original IDs and byte-exact assets; do not issue a new receipt.
+    for asset in replay["assets"]:
+        asset_id = store.parse_handle(asset["asset"])
+        filename = asset_id + ".png"
+        (store.assets_dir / filename).write_bytes(
+            (docs / asset["site_file"]).read_bytes()
+        )
+        parent = (
+            store.parse_handle(asset["source_asset"]) if asset["source_asset"] else None
+        )
+        store._save_record(
+            AssetRecord(
+                asset_id=asset_id,
+                filename=filename,
+                kind=asset["kind"],
+                sha256=asset["sha256"],
+                pixel_sha256=asset["pixel_sha256"],
+                width=asset["width"],
+                height=asset["height"],
+                byte_size=asset["byte_size"],
+                created_at=asset["created_at"],
+                source_asset_id=parent,
+            )
+        )
+    result = composite.verify_receipt_from_disk(store, receipt["output_asset"], receipt)
+    assert result["ok"], result["problems"]
+    assert result["recomputed"]["opaque_pixels"] == 580_613
+    assert result["recomputed"]["changed_opaque_pixels"] == 0
+    assert "plate_quality_recomputed" not in result["checks"]
