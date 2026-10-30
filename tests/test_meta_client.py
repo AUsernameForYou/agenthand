@@ -149,3 +149,19 @@ def test_two_threads_racing_the_gate_cannot_both_fit():
     release.set()
     thread_a.join(timeout=10)
     assert errors == []
+
+
+@pytest.mark.parametrize("code", ["NO_MATCH", "POOR_MASK", "BAD_MODEL_RESPONSE"])
+def test_completed_cut_failure_settles_three_images_from_eight_image_reservation(code):
+    from agenthand.segmentation import CutOutResultError
+    failure = CutOutResultError("decoded failure", code=code, attempts=[{}]*3)
+    def run():
+        raise failure
+    with pytest.raises(CutOutResultError) as raised:
+        meta_client.billed_call("cut_out", "sam-3.1", 8*0.0025, run)
+    assert raised.value is failure and failure.images == 3
+    assert failure.cost_counted_usd == 0.0075
+    rows = _records()
+    assert [r["phase"] for r in rows] == ["pending", "settled"]
+    assert rows[-1]["images"] == 3 and rows[-1]["status"] == "error"
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == 0.0075

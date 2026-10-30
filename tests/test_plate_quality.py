@@ -151,3 +151,22 @@ def test_one_horizon_failure_fallback_receipt_recomputes(tmp_path, monkeypatch):
     q = deepcopy(q)
     q["attempts"][0]["quality"]["codes"] = ["CENTRAL_OBJECT"]
     assert not is_plate_block(q)
+
+
+
+def test_second_plate_error_reports_settled_attempt_plus_open_reservation(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    monkeypatch.setenv("AGENTHAND_DATA_DIR",str(tmp_path))
+    monkeypatch.setenv("META_API_KEY","test-not-real")
+    monkeypatch.delenv("AGENTHAND_DRAW_PLACEHOLDER_PLATE",raising=False)
+    monkeypatch.setattr(config,"_DOTENV_LOADED",True)
+    _install_fake(monkeypatch,_FakeClient([
+        _image_response(b64_json=base64.b64encode((FIXTURES/"plate-v1-podium.png").read_bytes()).decode()),
+        SimpleNamespace(data=[]),
+    ]))
+    store=AssetStore(tmp_path)
+    result=server.draw(seed(store),"room")
+    assert result["error"]["code"] == "BAD_IMAGE_RESPONSE"
+    counted=2*meta_client.project_draw_cost_usd("muse-image-1.0")
+    assert result["error"]["cost_counted_usd"] == counted
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == counted

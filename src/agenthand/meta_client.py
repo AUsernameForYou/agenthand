@@ -102,7 +102,8 @@ def billed_call(
 
     Raises ledger.SpendCapExceeded if the reservation would exceed the
     cap, pricing.UnknownModelError for an unpriced model, and whatever fn
-    raises (with the reservation left counted).
+    raises (with the reservation left counted for unknown failures; completed
+    SAM cut failures settle their observed image count before re-raising).
     """
     if model is not None and not pricing.is_known_model(model):
         raise pricing.UnknownModelError(
@@ -133,12 +134,23 @@ def billed_call(
             ),
         )
 
-    # Call. If this raises, the reservation stays counted; do not settle.
+    # Unknown failures keep the reservation. A decoded cut failure carries
+    # the exact completed image count, which can be settled before re-raising.
     # The call_id rides a context var while fn runs so nested code can
     # correlate its debug artifacts with this call's ledger records.
+    from .segmentation import CutOutResultError
+    cut_failure = None
     token = _current_call_id.set(call_id)
     try:
         usage = fn() or {}
+    except CutOutResultError as exc:
+        if tool != "cut_out" or model != "sam-3.1" or exc.images <= 0:
+            raise
+        cut_failure = exc
+        usage = {"images": exc.images}
+        status = "error"
+        suffix = f"{exc.code}: settled {exc.images} completed SAM images; unknown call failures retain their reservation (fail-closed)"
+        note = f"{note} | {suffix}" if note else suffix
     finally:
         _current_call_id.reset(token)
     usage = {key: int(usage.get(key, 0)) for key in _USAGE_KEYS}
@@ -184,6 +196,11 @@ def billed_call(
                 note=settle_note,
             ),
         )
+
+    if cut_failure is not None:
+        cut_failure.cost_counted_usd = actual_usd
+        cut_failure.call_id = call_id
+        raise cut_failure
 
     return {
         "call_id": call_id,
@@ -1202,7 +1219,12 @@ def generate_background_plate(
             )
             return usage
 
-        billing = billed_call("draw", model, project_draw_cost_usd(model), _call)
+        projected = project_draw_cost_usd(model)
+        try:
+            billing = billed_call("draw", model, projected, _call)
+        except ImageResultError as exc:
+            exc.cost_counted_usd = round(sum(b["actual_usd"] for b in billings) + projected, 10)
+            raise
         billings.append(billing)
         handle = outcome["handle"]
         quality = assess_plate(store.read_image(handle), bbox, (width, height))

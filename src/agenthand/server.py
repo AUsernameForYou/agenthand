@@ -224,7 +224,7 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
             foreground_bbox=store.read_image(asset).getbbox(),
         )
     except meta_client.ImageResultError as exc:
-        return _error(exc.code, str(exc), cost_counted_usd=projected)
+        return _error(exc.code, str(exc), cost_counted_usd=getattr(exc, "cost_counted_usd", projected))
 
     quality = billing["plate_quality"]
     fallback_kwargs = {}
@@ -551,7 +551,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
             str(exc),
             attempts=exc.attempts,
             cut_evidence=_store_cut_evidence(store, source_record, exc.records),
-            cost_counted_usd=projected,
+            cost_counted_usd=getattr(exc, "cost_counted_usd", projected),
         )
 
     # The winning mask is in the SAM frame; map it onto the full source

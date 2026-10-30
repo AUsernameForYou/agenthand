@@ -272,9 +272,9 @@ def test_cut_out_no_match_with_provided_concept(monkeypatch):
     assert result["output_asset"] is None
     (attempt,) = result["error"]["attempts"]
     assert attempt["outcome"] == "no_match"
-    # The single attempt's reservation stays counted; nothing settled.
+    # The completed attempt settles at its measured image count.
     records = _records("cut_out")
-    assert [r["phase"] for r in records] == ["pending"]
+    assert [r["phase"] for r in records] == ["pending", "settled"]
     assert records[0]["usd_estimate"] == 0.0025
     assert result["error"]["cost_counted_usd"] == 0.0025
     assert ledger.ledger_total_usd(config.get_ledger_path()) == 0.0025
@@ -290,7 +290,7 @@ def test_cut_out_poor_mask_full_frame(monkeypatch):
     assert attempt["outcome"] == "poor_mask"
     assert attempt["rejection"] == "full_frame"
     assert attempt["coverage"] == 1.0
-    assert [r["phase"] for r in _records("cut_out")] == ["pending"]
+    assert [r["phase"] for r in _records("cut_out")] == ["pending", "settled"]
 
 
 def test_cut_out_recovery_exhausted_counts_spend_once_per_attempt(monkeypatch):
@@ -314,7 +314,7 @@ def test_cut_out_recovery_exhausted_counts_spend_once_per_attempt(monkeypatch):
     assert result["error"]["attempts"][1]["rejection"] == "fragmented"
     # One reservation priced at both attempts, counted exactly once.
     records = _records("cut_out")
-    assert [r["phase"] for r in records] == ["pending"]
+    assert [r["phase"] for r in records] == ["pending", "settled"]
     assert records[0]["usd_estimate"] == 0.0075
     assert result["error"]["cost_counted_usd"] == 0.0075
 
@@ -498,3 +498,30 @@ def test_cut_out_unscaled_records_none_provenance(monkeypatch):
 
     report = composite.verify_receipt_from_disk(store, drawn["output_asset"])
     assert report["ok"], report["problems"]
+
+
+@pytest.mark.parametrize("failure", ["no_match", "poor_mask", "unparseable"])
+def test_failed_large_cut_settles_only_completed_images(monkeypatch, failure):
+    from agenthand import segmentation
+    from agenthand.sam_masks import DecodedMask, SamOutputError
+    import numpy as np
+    response = _sam_response("not-used")
+    client = _install_fake(monkeypatch, _FakeClient(sam_responses=[response]*3))
+    def parse(text,w,h):
+        if failure == "unparseable":
+            raise SamOutputError("unparseable SAM record")
+        if failure == "no_match":
+            return []
+        a = np.full((h,w),255,np.uint8)
+        return [DecodedMask("full",(0,0,w,h),int(a.size),Image.fromarray(a))]
+    monkeypatch.setattr(segmentation,"parse_sam_masks",parse)
+    result = server.cut_out(_photo_uri(size=(200,200)), "box")
+    expected = 1
+    assert result["status"] == "error"
+    records = _records("cut_out")
+    assert records[0]["images"] == 0 and records[0]["usd_estimate"] == 8*0.0025
+    assert records[-1]["phase"] == "settled" and records[-1]["images"] == expected
+    assert records[-1]["status"] == "error" and "fail-closed" in records[-1]["note"]
+    assert len(client.responses.calls) == expected
+    assert result["error"]["cost_counted_usd"] == expected*0.0025
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == expected*0.0025

@@ -154,6 +154,7 @@ class CutOutResultError(RuntimeError):
         super().__init__(message)
         self.code = code
         self.attempts = attempts
+        self.images = len(attempts)
         self.records = records or []
 
 
