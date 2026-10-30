@@ -83,7 +83,7 @@ def test_enclosed_hole_is_found_open_bay_is_not():
     # Detection counts live on the silhouette; Region.pixels is set
     # by the render (post-clip) count.
     assert int(np.count_nonzero(holes[0].silhouette)) == 400
-    assert holes[0].provenance["basis"] == "mask_topology"
+    assert holes[0].provenance["basis"] == "source_product_appearance"
 
 
 def test_hole_too_small_is_a_recorded_refusal():

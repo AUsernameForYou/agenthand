@@ -1,6 +1,6 @@
 """Fail-closed stageability policy, separate from pixel-preservation proof.
 
-Version 1 uses fixed conservative topology/source thresholds. It is a bounded
+Version 2 requires source evidence for topology defects. It is a bounded
 heuristic, not a claim of semantic recognition or corpus-wide calibration.
 """
 
@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 from . import mask_evidence as evidence
 
-VERSION = "agenthand.cut-quality/1"
+VERSION = "agenthand.cut-quality/2"
 INSTRUCTIONS = {
     "SUPPORT_NOT_CAPTURED": "Move bins and clutter away from under the product. Photograph from a lower angle with every leg and foot visible against unobstructed, contrasting floor.",
     "TOP_OCCLUDED": "Remove everything resting on the product. Photograph its complete top and edges without objects overlapping them.",
@@ -28,6 +28,12 @@ def grade_cut(
     if alpha.ndim != 2:
         raise ValueError("cut mask must be a single-channel source-frame raster")
     metrics, body, gaps = evidence.geometry(alpha)
+    rgb = None
+    if source is not None:
+        rgb = np.asarray(source.convert("RGB") if isinstance(source, Image.Image) else source)
+        if rgb.shape != (*alpha.shape, 3):
+            raise ValueError("source and cut mask frames must match")
+    holes, proven = evidence.gap_evidence(rgb, alpha, body, gaps)
     area = metrics["mask_pixels"]
     codes: list[str] = []
     fatal = False
@@ -45,21 +51,24 @@ def grade_cut(
     footprints = evidence.top_footprints(alpha, occluders or []) if occluders else []
     proven_top = sum(int(r.silhouette.sum()) for r in footprints)
     metrics["proven_top_footprint_pixels"] = proven_top
-    if metrics["top_concavity_pixels"] > max(12, 0.005 * area):
+    supported_concavity = sum(int(local.sum()) for kind, box, local in proven if kind == "concavity")
+    top_limit = metrics["body_bbox"][1] + max(1, int(0.35 * (metrics["body_bbox"][3] - metrics["body_bbox"][1])))
+    supported_holes = sum(int(local[:max(0, top_limit-box[1])].sum()) for kind, box, local in proven if kind == "hole")
+    metrics["source_supported_top_concavity_pixels"] = supported_concavity
+    metrics["source_supported_top_hole_pixels"] = supported_holes
+    proven_gap_pixels = sum(int(local.sum()) for _, _, local in proven)
+    metrics["open_geometry_pixels"] = max(0, int(holes.sum()) + int(gaps.sum()) - proven_gap_pixels - proven_top)
+    top_defect = max(supported_concavity, proven_top)
+    if top_defect > max(12, 0.005 * area):
         codes.append("TOP_OCCLUDED")
-        fatal |= metrics["top_concavity_pixels"] - proven_top > max(12, 0.005 * area)
-    if metrics["enclosed_hole_pixels"] > max(4, 0.0005 * area):
+        fatal |= supported_concavity - proven_top > max(12, 0.005 * area)
+    if supported_holes > max(4, 0.0005 * area):
         codes.append("TOP_PERFORATED")
-        fatal |= metrics["enclosed_hole_pixels"] > 0.4 * area
+        fatal |= supported_holes > 0.4 * area
     metrics["observed_support_pixels"] = 0
     metrics["uncaptured_support_pixels"] = 0
     metrics["ambiguous_support_pixels"] = 0
     if source is not None:
-        rgb = np.asarray(
-            source.convert("RGB") if isinstance(source, Image.Image) else source
-        )
-        if rgb.shape != (*alpha.shape, 3):
-            raise ValueError("source and cut mask frames must match")
         regions, refusals, _ = evidence.detect_regions(rgb, alpha)
         supports = sum(int(r.silhouette.sum()) for r in regions if r.cls == "support")
         ambiguous = 0

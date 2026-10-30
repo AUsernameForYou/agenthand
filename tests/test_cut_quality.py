@@ -143,3 +143,53 @@ def test_outer_taper_and_unbounded_dark_background_are_not_top_or_support_defect
     assert (
         "TOP_OCCLUDED" not in q["codes"] and "SUPPORT_NOT_CAPTURED" not in q["codes"]
     ), q
+
+
+@pytest.mark.parametrize("shape", ["ladder_back", "stretcher_table", "two_post_chair", "planter_handles", "mug_handle"])
+def test_real_openings_pass_without_paper(tmp_path, shape):
+    a = np.zeros((300, 360), np.uint8)
+    if shape == "ladder_back":
+        a[30:240, 60:78] = a[30:240, 282:300] = 255
+        for y in (30, 75, 120, 190):
+            a[y:y+18, 60:300] = 255
+    elif shape == "stretcher_table":
+        a[30:65, 40:320] = 255
+        a[65:250, 60:80] = a[65:250, 280:300] = 255
+        a[210:230, 60:300] = 255
+    elif shape == "two_post_chair":
+        a[30:250, 60:80] = a[30:250, 280:300] = 255
+        a[180:205, 60:300] = 255
+    elif shape == "planter_handles":
+        a[85:250, 85:275] = 255
+        a[35:105, 65:105] = a[35:105, 255:295] = 255
+    else:
+        a[50:240, 50:230] = 255
+        a[80:105, 230:300] = a[185:210, 230:300] = 255
+        a[80:210, 280:305] = 255
+    src = np.full((*a.shape, 3), 205, np.uint8)
+    src[a > 0] = (95, 65, 40)
+    quality = grade_cut(src, a)
+    assert quality["grade"] == "PASS", quality
+    assert quality["metrics"]["open_geometry_pixels"] > 0
+    from test_paperfill import _store_with_cut
+    from agenthand import paperfill
+    store, _, _, fh = _store_with_cut(tmp_path, src, a)
+    assert composite.prepare_draw(store, fh)["reconstruction_report"]["status"] == "none"
+    report = paperfill.build_reconstruction(store, fh)
+    assert report["reconstruction_pixels"] == 0, report
+
+
+def test_lower_source_supported_hole_is_not_top_perforation():
+    src, a = scene()
+    a[50:60, 50:65] = 0
+    q = grade_cut(src, a)
+    assert "TOP_PERFORATED" not in q["codes"]
+
+
+def test_topology_without_source_does_not_authorize_defect_or_paper():
+    _, a = scene()
+    a[20:35, 50:65] = 0
+    a[38:48, 50:65] = 0
+    q = grade_cut(None, a)
+    assert q["grade"] == "PASS", q
+    assert q["metrics"]["open_geometry_pixels"] > 0

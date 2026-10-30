@@ -721,6 +721,8 @@ def _export_paper_run(tmp_path):
     from agenthand import paperfill
 
     photo = _pattern_photo(size=(48, 36))
+    # The omitted patch contains product-coloured source pixels, not open space.
+    photo.paste((140, 110, 80, 255), (8, 6, 40, 30))
     mask = Image.new("L", (48, 36), 0)
     px = mask.load()
     for y in range(6, 30):

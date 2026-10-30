@@ -1,7 +1,7 @@
 """Shared, source-frame mask evidence. Detector thresholds are versioned in code.
 
-The legacy paper detector is kept byte-for-byte here so grading and rendering
-consume the same observations. No model calls or product pixel synthesis.
+Grading and rendering share source-backed observations; empty topology
+alone never authorizes paper. No model calls or product pixel synthesis.
 """
 
 from __future__ import annotations
@@ -85,6 +85,46 @@ def _components(binary: np.ndarray):
         yield (x, y, x + w, y + h), labels[y : y + h, x : x + w] == i
 
 
+# Fixed source-appearance gates, versioned by cut_quality.VERSION.
+PRODUCT_COLOUR_DISTANCE = 35.0
+PRODUCT_MATCH_FRACTION = 0.65
+
+
+def resembles_product(source_rgb, product, bbox, local) -> bool:
+    """Require most gap pixels to resemble nearby visible product colour.
+
+    Use a local product collar, falling back to the visible body for large
+    openings. This is appearance evidence, not semantic ownership proof.
+    """
+    if source_rgb is None or not product.any() or not local.any():
+        return False
+    x0, y0, x1, y1 = bbox
+    pad = max(4, int(0.05 * max(product.shape)))
+    xa, ya = max(0, x0-pad), max(0, y0-pad)
+    xb, yb = min(product.shape[1], x1+pad), min(product.shape[0], y1+pad)
+    samples = source_rgb[ya:yb, xa:xb][product[ya:yb, xa:xb]]
+    if not len(samples):
+        samples = source_rgb[product]
+    colour = np.median(samples, axis=0)
+    distance = np.linalg.norm(source_rgb[y0:y1, x0:x1][local].astype(float)-colour, axis=1)
+    return float(np.mean(distance <= PRODUCT_COLOUR_DISTANCE)) >= PRODUCT_MATCH_FRACTION
+
+
+def gap_evidence(source_rgb, alpha, body, gaps):
+    """Split topology into source-supported damage and ordinary open geometry."""
+    holes = np.zeros_like(body)
+    h, w = body.shape
+    for box, local in _components(alpha == 0):
+        if box[0] and box[1] and box[2] < w and box[3] < h:
+            holes[box[1]:box[3], box[0]:box[2]] |= local
+    proven = []
+    for kind, candidates in (("hole", holes), ("concavity", gaps)):
+        for box, local in _components(candidates):
+            if resembles_product(source_rgb, body, box, local):
+                proven.append((kind, box, local))
+    return holes, proven
+
+
 def detect_regions(
     source_rgb: np.ndarray, fg_alpha: np.ndarray
 ) -> tuple[list[Region], list[Refusal], int]:
@@ -113,6 +153,9 @@ def detect_regions(
             bbox[0] == 0 or bbox[1] == 0 or bbox[2] == width or bbox[3] == height
         )
         if touches_border:
+            continue
+        if not resembles_product(source_rgb, product_any, bbox, comp):
+            # A handle, frame opening or bay stays transparent.
             continue
         area = int(np.count_nonzero(comp))
         if area < MIN_HOLE_FRACTION * mask_area:
@@ -147,7 +190,7 @@ def detect_regions(
                 Region(
                     cls="hole",
                     silhouette=comp,
-                    provenance={"basis": "mask_topology"},
+                    provenance={"basis": "source_product_appearance"},
                     bbox=bbox,
                 )
             )
