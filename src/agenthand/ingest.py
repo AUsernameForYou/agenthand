@@ -139,4 +139,32 @@ def ingest(source: str, store: AssetStore, *, kind: str = KIND_SOURCE) -> str:
             f"Image is {len(data)} bytes, over the {_max_image_bytes()}-byte "
             "ingest cap."
         )
-    return store.put_bytes(normalize_image_bytes(data), kind=kind, suffix=".png")
+    normalized = normalize_image_bytes(data)
+    # Provenance signals (mirrors the Rust build): read the block
+    # from the ORIGINAL bytes before normalization discards their
+    # metadata, mint the metadata-free public copy when the file
+    # carries location coordinates, and carry the block inside
+    # the stored PNG as a text chunk so draw can republish it
+    # into the fidelity receipt under the asset's pinned hash.
+    # Best-effort: any failure stores the plain normalized PNG.
+    try:
+        import json as _json
+
+        from PIL import Image as _Image
+
+        from . import provenance as _provenance
+        from .assets import PROVENANCE_PNG_KEY as _PROVENANCE_PNG_KEY
+
+        with _Image.open(BytesIO(normalized)) as _img:
+            dims = (_img.width, _img.height)
+        block = _provenance.provenance_block(data, dims)
+        _provenance.attach_public_copy(block, store, data)
+        canonical = _json.dumps(
+            block, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        annotated = _provenance.inject_png_text(normalized, _PROVENANCE_PNG_KEY, canonical)
+        if annotated is not None:
+            normalized = annotated
+    except Exception:  # noqa: BLE001 — provenance never blocks ingest
+        pass
+    return store.put_bytes(normalized, kind=kind, suffix=".png")

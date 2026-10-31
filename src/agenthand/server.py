@@ -152,10 +152,20 @@ def _annotate_verify_fields(store: AssetStore, handle: str, full: dict) -> dict:
     annotated = dict(full)
     annotated["verify_url"] = verify_url
     store.save_receipt(handle, annotated)
-    return {
+    fields = {
         "verify_url": verify_url,
         "label": f"Digitally altered. Original photo and proof: {verify_url}",
     }
+    # Provenance signals (mirrors the Rust build): mirror the
+    # block the receipt carries onto the tool result, with the
+    # location warning as its own field.
+    block = full.get("provenance")
+    if isinstance(block, dict):
+        fields["provenance"] = block
+        warning = block.get("location_warning")
+        if warning:
+            fields["location_warning"] = warning
+    return fields
 
 
 # Model assignments (priced in pricing.py). identify starts on Spark; a

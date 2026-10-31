@@ -46,6 +46,7 @@ from .assets import (
     KIND_REGION_MAP,
     KIND_SOURCE,
     MASK_PROVENANCE_PNG_KEY,
+    PROVENANCE_PNG_KEY,
     AssetIntegrityError,
     AssetRecord,
     AssetStore,
@@ -824,6 +825,19 @@ def draw_product(
                 "mask_scale_method": mask_provenance["scale_method"],
             }
         )
+    # Provenance signals (mirrors the Rust build): the source
+    # asset carries the block ingest read from the original file
+    # in a PNG text chunk; republishing it here binds those
+    # observations to this receipt under the same pinned hash
+    # that binds the pixel claim. Sources stored before the
+    # block existed simply have no field (additive change).
+    try:
+        source_bytes = store.read_bytes(HANDLE_PREFIX + source_record.asset_id)
+        raw_block = png_text_of_bytes(source_bytes).get(PROVENANCE_PNG_KEY)
+        if raw_block:
+            receipt["provenance"] = json.loads(raw_block)
+    except Exception:  # noqa: BLE001 — a missing block never fails a draw
+        pass
     # Persist the receipt beside the composite (architecture Gauntlet,
     # Fable + GPT "adopt now, as a file"): a receipt that exists only
     # in the tool's return value is gone if the client drops it, and

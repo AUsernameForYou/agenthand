@@ -1824,6 +1824,24 @@ def _keep_primary(
         "cut_quality": _keep_cut_quality(primary),
         "identify_call_id": result.get("call_id"),
     }
+    # Provenance signals (mirrors the Rust build): read from the
+    # same original file bytes the binding above hashes; a keeper
+    # whose file carries location coordinates also gets its
+    # metadata-free public copy minted here, parented to the
+    # source asset. Additive: the ownership verifier reads named
+    # fields only.
+    try:
+        keep_bytes = source.path.read_bytes()
+    except Exception:
+        keep_bytes = b""
+    if keep_bytes:
+        from . import provenance as _provenance
+
+        block = _provenance.provenance_block(keep_bytes, (width, height))
+        _provenance.attach_public_copy(
+            block, ctx.store, keep_bytes, source_record.asset_id
+        )
+        receipt["provenance"] = block
     ctx.store.save_receipt(crop_handle, receipt)
     record["output_asset"] = crop_handle
     record["receipt"] = receipt
@@ -1879,6 +1897,12 @@ def _build_keep_inventory(
             "source_file_sha256": source.get("file_sha256"),
             "exif_capture_time": source.get("exif_capture_time"),
             "cut_grade": (ownership.get("cut_quality") or {}).get("grade"),
+            "location_warning": (ownership.get("provenance") or {}).get(
+                "location_warning"
+            ),
+            "public_copy": (
+                (ownership.get("provenance") or {}).get("location") or {}
+            ).get("public_copy"),
             "receipt_sha256": receipt_sha256,
             "receipt_file": item.get("receipt_file"),
         }
@@ -1904,6 +1928,12 @@ def _build_keep_inventory(
             f'<td class="mono">{receipt_sha256}</td>'
             "</tr>"
         )
+        if entry.get("location_warning"):
+            rows.append(
+                "<tr><td></td>"
+                f'<td colspan="4"><strong>Location warning:</strong> '
+                f"{text_of(entry['location_warning'])}</td></tr>"
+            )
     if not entries:
         return None
     inventory = {

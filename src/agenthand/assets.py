@@ -61,6 +61,10 @@ KIND_OVERLAY = "mask_overlay"
 # never receipted as real.
 KIND_RECONSTRUCTION = "reconstruction_layer"
 KIND_REGION_MAP = "reconstruction_region_map"
+# The metadata-free public copy of a GPS-carrying source photo
+# (provenance package): same pixels, no embedded metadata,
+# always labelled a derived copy wherever it surfaces.
+KIND_PUBLIC_COPY = "public_copy"
 
 
 def _register_image_openers() -> None:
@@ -113,6 +117,10 @@ def pixel_hash_of_image(image) -> str:
 # receipt builder.
 MASK_PROVENANCE_PNG_KEY = "agenthand_mask_provenance"
 COMPOSITE_POLICY_PNG_KEY = "agenthand_composite_policy"
+# PNG text key carrying a source asset's provenance signals
+# block (provenance.py), written at ingest from the original
+# file's bytes and republished by draw into the receipt.
+PROVENANCE_PNG_KEY = "agenthand_provenance"
 
 
 def png_text_of_bytes(data: bytes) -> dict[str, str]:
