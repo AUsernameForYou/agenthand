@@ -151,6 +151,7 @@ import argparse
 import array
 import base64
 import copy
+import hashlib
 import json
 import math
 import mimetypes
@@ -544,25 +545,38 @@ NARRATION_PROMPT = (
     "sell (wording like 'sell this', 'this one's for sale', 'get rid "
     "of'), one per line, naming each item the way the speaker referred "
     "to it; if the speaker marks no item for sale, write NONE under "
-    "that heading. Then, under the heading MENTIONED, list each other "
-    "physical item the speaker refers to in passing without saying "
-    "they want to sell it, one per line; if there are none, write "
-    "NONE. Use exactly those three headings, in that order, and do "
-    "not add any other text. Do not invent items the speaker did not "
-    "refer to."
+    "that heading. Then, under the heading KEEP, list each physical "
+    "item the speaker says they are keeping or not selling (wording "
+    "like 'the bike stays', 'keep it', 'not for sale', 'keep it for "
+    "insurance'), one per line; if there are none, write NONE. Then, "
+    "under the heading MENTIONED, list each other physical item the "
+    "speaker refers to in passing without saying they want to sell "
+    "it or keep it, one per line; if there are none, write NONE. Use "
+    "exactly those four headings, in that order, and do not add any "
+    "other text. Do not invent items the speaker did not refer to."
 )
 
 
 def parse_narration_reply(text: str | None) -> dict:
-    """Split a narration reply into transcript / selling / mentioned.
+    """Split a narration reply into transcript / selling / keep / mentioned.
 
     Pure and forgiving in exactly one direction: a reply with no
     recognizable heading is treated as all transcript with no items,
     never as items with no transcript. Item lines are cleaned of
     bullets and numbering; a NONE line means the empty list.
     """
-    sections: dict[str, list[str]] = {"transcript": [], "selling": [], "mentioned": []}
-    headings = {"transcript": "transcript", "selling": "selling", "mentioned": "mentioned"}
+    sections: dict[str, list[str]] = {
+        "transcript": [],
+        "selling": [],
+        "keep": [],
+        "mentioned": [],
+    }
+    headings = {
+        "transcript": "transcript",
+        "selling": "selling",
+        "keep": "keep",
+        "mentioned": "mentioned",
+    }
     current: str | None = None
     found = False
     for raw_line in (text or "").splitlines():
@@ -576,7 +590,7 @@ def parse_narration_reply(text: str | None) -> dict:
             continue  # preamble before the first heading is not evidence
         sections[current].append(line)
     if not found:
-        return {"transcript": (text or "").strip(), "selling": [], "mentioned": []}
+        return {"transcript": (text or "").strip(), "selling": [], "keep": [], "mentioned": []}
 
     def _items(lines: list[str]) -> list[str]:
         out: list[str] = []
@@ -592,6 +606,7 @@ def parse_narration_reply(text: str | None) -> dict:
     return {
         "transcript": "\n".join(sections["transcript"]).strip(),
         "selling": _items(sections["selling"]),
+        "keep": _items(sections["keep"]),
         "mentioned": _items(sections["mentioned"]),
     }
 
@@ -815,6 +830,7 @@ def _narrate_one(
         "peak_fraction": None,
         "transcript": None,
         "named_items": [],
+        "kept_items": [],
         "mentioned_items": [],
         "usage": None,
         "projected_cost_usd": None,
@@ -878,6 +894,7 @@ def _narrate_one(
     parsed = parse_narration_reply(result.get("reply") or "")
     record["transcript"] = parsed["transcript"]
     record["named_items"] = parsed["selling"]
+    record["kept_items"] = parsed["keep"]
     record["mentioned_items"] = parsed["mentioned"]
     record["usage"] = result.get("usage") or {}
     record["latency_ms"] = result.get("latency_ms")
@@ -1521,6 +1538,411 @@ def _stage_primary(
     return False
 
 
+def _intent_of_origin(origin: str | None) -> str:
+    """The manifest intent vocabulary, identical in both builds:
+    selling | keep | mentioned, derived from the item's origin."""
+    return {
+        "narration_mentioned": "mentioned",
+        "narration_keep": "keep",
+    }.get(origin or "", "selling")
+
+
+def _keep_cut_quality(primary: dict) -> dict:
+    """Grade a kept item's cut from the sighting's review signals:
+    a mask box running off a frame edge is the occlusion signature
+    (RESHOOT), as are mask-review warnings. For keep items the
+    grade rides INSIDE the ownership record with its retake
+    instruction instead of blocking the record (decision 114)."""
+    touches: list[str] = []
+    bbox = primary.get("bbox_normalized") or []
+    if len(bbox) == 4:
+        if bbox[0] == 0.0:
+            touches.append("left")
+        if bbox[1] == 0.0:
+            touches.append("top")
+        if bbox[2] == 1.0:
+            touches.append("right")
+        if bbox[3] == 1.0:
+            touches.append("bottom")
+    warnings = primary.get("mask_warnings") or []
+    if not touches and not warnings:
+        return {"grade": "PASS", "reshoot_instruction": None, "mask_warnings": warnings}
+    if touches:
+        edge_text = (
+            f"it currently runs off the {' and '.join(touches)} "
+            f"edge{'s' if len(touches) > 1 else ''}"
+        )
+    else:
+        edge_text = "the mask review flagged this cut"
+    return {
+        "grade": "RESHOOT",
+        "reshoot_instruction": (
+            "Retake the photo a step further back so the whole item "
+            f"sits inside the frame — {edge_text}. The ownership "
+            "record stands as issued; a cleaner photo can re-issue it."
+        ),
+        "mask_warnings": warnings,
+    }
+
+
+def _exif_capture_time(path: Path) -> str | None:
+    """The capture time a photo file states about itself, via
+    Pillow's EXIF reader (DateTimeOriginal preferred, DateTime as
+    fallback). HEIC files Pillow cannot open without a plugin
+    return None here; the Rust build reads those through its
+    container parser — the file hash binds either way."""
+    try:
+        from PIL import Image
+
+        with Image.open(path) as img:
+            exif = img.getexif()
+            if not exif:
+                return None
+            dt = None
+            try:
+                dt = exif.get_ifd(0x8769).get(0x9003)
+            except Exception:
+                dt = None
+            dt = dt or exif.get(0x0132)
+            if isinstance(dt, bytes):
+                dt = dt.decode("ascii", "replace")
+            if isinstance(dt, str) and len(dt) >= 10 and dt[4] == ":":
+                return dt.strip("\x00").strip()
+    except Exception:
+        return None
+    return None
+
+
+def _verify_ownership_record(store: AssetStore, receipt: dict) -> dict:
+    """Independent verification of an ownership record, mirroring
+    the Rust build: re-derive the crop from the stored source
+    photo's pixels and compare pixel hashes. "0 changed" is a
+    recomputation: the crop provably comes from exactly the stored
+    source pixels, and the receipt's source file hash binds those
+    pixels to the original file as ingested."""
+    from io import BytesIO
+
+    from .assets import _image_facts
+
+    problems: list[str] = []
+    checks: list[dict] = []
+
+    def note(name: str, ok: bool, detail: str) -> None:
+        if not ok:
+            problems.append(f"{name}: {detail}")
+        checks.append({"name": name, "ok": ok, "detail": detail})
+
+    crop_checked = 0
+    crop_changed = 0
+    source = receipt.get("source") or {}
+    crop = receipt.get("crop") or {}
+    try:
+        source_image = store.read_image(source.get("asset"))
+    except Exception as exc:  # noqa: BLE001 — a verify failure is data
+        source_image = None
+        note("source_pixels_match", False, f"source photo unreadable: {exc}")
+    if source_image is not None:
+        buf = BytesIO()
+        source_image.save(buf, format="PNG")
+        actual = _image_facts(buf.getvalue())[0]
+        claimed = source.get("pixel_sha256")
+        note(
+            "source_pixels_match",
+            actual == claimed,
+            f"stored source pixels hash {actual}",
+        )
+        rect = crop.get("rect_px") or []
+        if len(rect) == 4 and rect[2] > rect[0] and rect[3] > rect[1]:
+            recomputed = source_image.crop(tuple(rect))
+            crop_checked = recomputed.width * recomputed.height
+            buf = BytesIO()
+            recomputed.save(buf, format="PNG")
+            actual_crop = _image_facts(buf.getvalue())[0]
+            claimed_crop = crop.get("pixel_sha256")
+            if actual_crop == claimed_crop:
+                note(
+                    "crop_recomputed_from_source",
+                    True,
+                    "re-cropping the stored source at the receipt's rect reproduces the crop pixel hash",
+                )
+            else:
+                # Count differing pixels on the raw RGBA bytes
+                # when the stored crop has the same shape, so
+                # "changed" stays a count, never a guess.
+                try:
+                    stored_crop = store.read_image(crop.get("asset"))
+                    if stored_crop.size == recomputed.size:
+                        a = stored_crop.convert("RGBA").tobytes()
+                        b = recomputed.convert("RGBA").tobytes()
+                        crop_changed = sum(
+                            1
+                            for i in range(0, len(a), 4)
+                            if a[i : i + 4] != b[i : i + 4]
+                        )
+                except Exception:
+                    crop_changed = 0
+                note(
+                    "crop_recomputed_from_source",
+                    False,
+                    f"recomputed crop hash {actual_crop} != receipt {claimed_crop}",
+                )
+        else:
+            note(
+                "crop_recomputed_from_source",
+                False,
+                "receipt crop rect is missing or empty",
+            )
+    return {
+        "ok": not problems,
+        "method": "ownership_recompute",
+        "checks": checks,
+        "problems": problems,
+        "crop_pixels_checked": crop_checked,
+        "crop_pixels_changed": crop_changed,
+    }
+
+
+def _keep_primary(
+    ctx: _RunContext, record: dict, sources: list[PhotoSource], primary: dict
+) -> None:
+    """Issue the ownership record for one keep item, in place.
+
+    identify + cut_out only: no listing copy, no staging, no draw.
+    The crop identify (the same single call the listing path rides)
+    supplies the condition notes. The receipt binds the full source
+    FILE's hash and its EXIF capture time, both read from the
+    seller's file at ingest, plus the crop's own proof. Its claim
+    is exactly: this crop comes from exactly this file, captured at
+    the time the file states, unchanged since — never that the file
+    was unedited at capture, which no tool can know.
+    """
+    name = record["name"]
+    record["primary_photo_index"] = primary["photo_index"]
+    record["also_seen_in"] = [
+        s["photo_index"]
+        for s in record["sightings"]
+        if s["status"] == "ok" and s is not primary
+    ]
+
+    def fail(code: str, message: str) -> None:
+        record["failure"] = {"stage": "ownership", "code": code, "message": message}
+
+    source = sources[primary["photo_index"]]
+    bbox = primary.get("bbox_normalized")
+    if not bbox or source.handle is None:
+        fail(
+            "OWNERSHIP_INCOMPLETE",
+            f"no foreground box was recorded for {name}; there is no crop "
+            "to bind into an ownership record",
+        )
+        return
+    try:
+        image = ctx.store.read_image(source.handle)
+    except Exception as exc:  # noqa: BLE001 — recorded, not raised
+        fail(
+            "OWNERSHIP_INCOMPLETE",
+            f"the source photo for {name} could not be read back ({exc}); "
+            "the ownership record cannot be issued",
+        )
+        return
+    source_record = ctx.store.get_record(source.handle)
+    width, height = image.width, image.height
+    box_w = (bbox[2] - bbox[0]) * width
+    box_h = (bbox[3] - bbox[1]) * height
+    x0 = max(0, math.floor(bbox[0] * width - 0.10 * box_w))
+    y0 = max(0, math.floor(bbox[1] * height - 0.10 * box_h))
+    x1 = min(width, math.ceil(bbox[2] * width + 0.10 * box_w))
+    y1 = min(height, math.ceil(bbox[3] * height + 0.10 * box_h))
+    if x1 <= x0 or y1 <= y0:
+        fail(
+            "OWNERSHIP_INCOMPLETE",
+            f"the crop box for {name} was empty; the ownership record "
+            "cannot be issued",
+        )
+        return
+    crop = image.crop((x0, y0, x1, y1))
+    crop_handle = ctx.store.put_image(
+        crop, kind=KIND_CROP, source_asset_id=AssetStore.parse_handle(source.handle)
+    )
+    crop_record = ctx.store.get_record(crop_handle)
+    # Condition notes ride the crop identify (one billed call).
+    try:
+        result = ctx.chain["identify"](crop_handle)
+    except Exception as exc:  # noqa: BLE001 — the record still issues
+        result = {
+            "status": "error",
+            "error": {"code": "IDENTIFY_FAILED", "message": str(exc)},
+        }
+    record["cost_usd"] += _call_cost(result)
+    plan = result if result.get("status") == "ok" else None
+    if plan is not None and isinstance(plan.get("plan"), dict):
+        plan = plan["plan"]
+    condition_notes = plan.get("condition_notes") if plan else None
+    condition_note = None
+    if plan is None:
+        condition_note = (
+            f"identify did not return a plan for the crop of {name}; the "
+            "record carries no condition notes rather than borrowed ones"
+        )
+    # The file-level binding: hash + stated capture time of the
+    # original file, read from the seller's own bytes.
+    try:
+        file_bytes = source.path.read_bytes()
+        file_sha256: str | None = hashlib.sha256(file_bytes).hexdigest()
+    except Exception:
+        file_sha256 = None
+    receipt = {
+        "receipt_type": "ownership",
+        "receipt_schema": 1,
+        "item": name,
+        "intent": "keep",
+        "recorded_at": datetime.now(timezone.utc).isoformat(),
+        "claim": (
+            "this crop comes from exactly this file, captured at the "
+            "time the file states, unchanged since"
+        ),
+        "source": {
+            "asset": source.handle,
+            "file_name": source.path.name,
+            "file_sha256": file_sha256,
+            "pixel_sha256": source_record.pixel_sha256,
+            "exif_capture_time": _exif_capture_time(source.path),
+            "width": width,
+            "height": height,
+        },
+        "crop": {
+            "asset": crop_handle,
+            "rect_px": [x0, y0, x1, y1],
+            "pixel_sha256": crop_record.pixel_sha256,
+            "sha256": crop_record.sha256,
+        },
+        "foreground_asset": primary.get("foreground_asset"),
+        "mask_asset": primary.get("mask_asset"),
+        "condition_notes": condition_notes,
+        "condition_source": "identify (muse-spark-1.3) over the item crop",
+        "condition_note": condition_note,
+        "cut_quality": _keep_cut_quality(primary),
+        "identify_call_id": result.get("call_id"),
+    }
+    ctx.store.save_receipt(crop_handle, receipt)
+    record["output_asset"] = crop_handle
+    record["receipt"] = receipt
+    record["ownership"] = receipt
+    receipt_path = ctx.store.receipt_path(crop_handle)
+    record["receipt_file"] = str(receipt_path) if receipt_path.exists() else None
+    record["stage_reached"] = "ownership"
+    verification = _verify_ownership_record(ctx.store, receipt)
+    record["verification"] = verification
+    if verification["ok"]:
+        record["status"] = "kept"
+        record["stage_reached"] = "done"
+        record["failure"] = None
+    else:
+        record["status"] = "verify_failed"
+        problems = verification["problems"]
+        record["failure"] = {
+            "stage": "verify",
+            "code": "VERIFY_FAILED",
+            "message": (
+                "the ownership record did not pass independent verification: "
+                + ("; ".join(problems) if problems else "verifier reported failure")
+            ),
+        }
+
+
+def _build_keep_inventory(
+    store: AssetStore, out_dir: Path, room_id: str, records: list[dict]
+) -> dict | None:
+    """Collect a run's kept items into the ownership inventory:
+    inventory.json plus a human-readable inventory.html sheet,
+    both rendered from the same entries (mirrors the Rust build).
+    Returns the manifest section, or None when nothing was kept."""
+    import html as html_mod
+
+    entries: list[dict] = []
+    rows: list[str] = []
+    for item in records:
+        if item.get("intent") != "keep" or item.get("status") != "kept":
+            continue
+        ownership = item.get("ownership") or {}
+        canonical = json.dumps(
+            ownership, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        receipt_sha256 = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+        source = ownership.get("source") or {}
+        entry = {
+            "name": item.get("name"),
+            "crop_asset": item.get("output_asset"),
+            "condition_notes": ownership.get("condition_notes"),
+            "recorded_at": ownership.get("recorded_at"),
+            "source_file": source.get("file_name"),
+            "source_file_sha256": source.get("file_sha256"),
+            "exif_capture_time": source.get("exif_capture_time"),
+            "cut_grade": (ownership.get("cut_quality") or {}).get("grade"),
+            "receipt_sha256": receipt_sha256,
+            "receipt_file": item.get("receipt_file"),
+        }
+        entries.append(entry)
+        try:
+            crop_bytes = store.read_bytes(item.get("output_asset"))
+            img_tag = (
+                '<img alt="crop" style="max-width:240px" '
+                f'src="data:image/png;base64,{base64.b64encode(crop_bytes).decode()}">'
+            )
+        except Exception:
+            img_tag = "<em>crop image unavailable</em>"
+
+        def text_of(value: object) -> str:
+            return html_mod.escape(str(value)) if value else "—"
+
+        rows.append(
+            "<tr>"
+            f"<td>{img_tag}</td>"
+            f"<td><strong>{text_of(entry['name'])}</strong></td>"
+            f"<td>{text_of(entry['condition_notes'])}</td>"
+            f"<td>{text_of(entry['exif_capture_time'])}</td>"
+            f'<td class="mono">{receipt_sha256}</td>'
+            "</tr>"
+        )
+    if not entries:
+        return None
+    inventory = {
+        "room_id": room_id,
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "items": entries,
+    }
+    (out_dir / "inventory.json").write_text(
+        json.dumps(inventory, indent=2, sort_keys=True), encoding="utf-8"
+    )
+    sheet = (
+        "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"utf-8\">\n"
+        f"<title>Ownership inventory — room {html_mod.escape(room_id)}</title>\n"
+        "<style>\n"
+        "body { font-family: system-ui, sans-serif; color: #111; max-width: 60rem; margin: 2rem auto; padding: 0 1rem; }\n"
+        "table { border-collapse: collapse; width: 100%; } td { border-top: 1px solid #ddd; padding: 0.5rem; vertical-align: top; }\n"
+        ".mono { font-family: ui-monospace, Menlo, monospace; font-size: 0.8em; word-break: break-all; }\n"
+        "</style>\n</head>\n<body>\n"
+        "<h1>Ownership inventory</h1>\n"
+        f"<p>Items the owner marked to keep, recorded during room run "
+        f'<span class="mono">{html_mod.escape(room_id)}</span>. '
+        "Each crop is bound by its receipt to the exact source photo file "
+        "it came from, unchanged since ingest.</p>\n"
+        "<table>\n"
+        "<tr><td><strong>Crop</strong></td><td><strong>Item</strong></td>"
+        "<td><strong>Condition notes</strong></td>"
+        "<td><strong>Captured (per file)</strong></td>"
+        "<td><strong>Receipt SHA-256</strong></td></tr>\n"
+        + "\n".join(rows)
+        + "\n</table>\n</body>\n</html>\n"
+    )
+    (out_dir / "inventory.html").write_text(sheet, encoding="utf-8")
+    return {
+        "json_file": "inventory.json",
+        "sheet_file": "inventory.html",
+        "items": len(entries),
+    }
+
+
 def _process_item(
     ctx: _RunContext,
     item: dict,
@@ -1537,6 +1959,7 @@ def _process_item(
         "failure": None,
         "narration": item.get("narration"),
         "origin": item.get("origin", "named"),
+        "intent": _intent_of_origin(item.get("origin")),
         "stage_mode": ctx.stage_mode,
         "sightings": [],
         "primary_photo_index": None,
@@ -1546,6 +1969,7 @@ def _process_item(
         "receipt_file": None,
         "verification": None,
         "listing": None,
+        "ownership": None,
         "pricing": None,
         "possible_duplicate_of": [],
         "flags": list(item.get("flags", [])),
@@ -1585,6 +2009,11 @@ def _process_item(
     primary = sorted(
         successes, key=lambda s: _sighting_primary_key(sources, s)
     )[0]
+    if record["origin"] == "narration_keep":
+        # KEEP: identify + cut_out only. No listing, no staging,
+        # no draw — the ownership record is the deliverable.
+        _keep_primary(ctx, record, sources, primary)
+        return record
     _stage_primary(ctx, record, sources, primary)
     return record
 
@@ -2232,6 +2661,7 @@ def _run_room_body(
     # -- narration (optional): the seller's voice names the items ------------
     narration_records: list[dict] = []
     narration_named: list[tuple[str, str]] = []  # (item name, source path)
+    narration_keep: list[tuple[str, str]] = []
     narration_mentioned: list[tuple[str, str]] = []
     transcript_file: Path | None = None
     if narrated_videos or narrated_audios:
@@ -2254,6 +2684,8 @@ def _run_room_body(
         for record in narration_records:
             for name in record["named_items"]:
                 narration_named.append((name, record["path"]))
+            for name in record["kept_items"]:
+                narration_keep.append((name, record["path"]))
             for name in record["mentioned_items"]:
                 narration_mentioned.append((name, record["path"]))
         spoken = [r for r in narration_records if r["transcript"]]
@@ -2288,7 +2720,9 @@ def _run_room_body(
             meta_client.project_identify_cost_usd(server.IDENTIFY_MODEL, w, h)
             * meta_client.IDENTIFY_MAX_ATTEMPTS
         )
-    n_narration_items = len(narration_named) + len(narration_mentioned)
+    n_narration_items = (
+        len(narration_named) + len(narration_keep) + len(narration_mentioned)
+    )
     if item_names:
         n_items_estimate = len(item_names) + n_narration_items
     elif auto:
@@ -2322,6 +2756,7 @@ def _run_room_body(
             notes.append(
                 f"narration from {record['path']}: "
                 f"{len(record['named_items'])} item(s) named for sale, "
+                f"{len(record['kept_items'])} kept, "
                 f"{len(record['mentioned_items'])} mentioned in passing"
             )
 
@@ -2384,19 +2819,32 @@ def _run_room_body(
         for existing in items:
             if token_similarity(existing["name"], name) >= MERGE_SIMILARITY:
                 current = existing.get("narration")
-                if current is None or (
-                    current["kind"] == "mentioned" and kind == "named"
-                ):
+                # Intent precedence, as in the Rust build: an
+                # explicit "named" (sell) beats "keep", and both
+                # explicit intents beat a passing "mentioned".
+                replace = current is None or (
+                    current["kind"] == "mentioned" and kind in ("named", "keep")
+                ) or (current["kind"] == "keep" and kind == "named")
+                if replace:
                     existing["narration"] = {"kind": kind, "source": source_path}
-                    if existing.get("origin") == "narration_mentioned" and kind == "named":
+                    if kind == "named" and existing.get("origin") in (
+                        "narration_mentioned",
+                        "narration_keep",
+                    ):
                         existing["origin"] = "narration_selling"
+                    elif kind == "keep" and existing.get("origin") == "narration_mentioned":
+                        existing["origin"] = "narration_keep"
                 return
         entry: dict = {
             "name": name,
             "candidate_photo_indices": _rank_photos(name, sources),
             "flags": [],
             "narration": {"kind": kind, "source": source_path},
-            "origin": "narration_selling" if kind == "named" else "narration_mentioned",
+            "origin": {
+                "named": "narration_selling",
+                "keep": "narration_keep",
+                "mentioned": "narration_mentioned",
+            }[kind],
         }
         if kind == "mentioned":
             entry["flags"].append(
@@ -2404,10 +2852,18 @@ def _run_room_body(
                 "marked for sale; included so the visual pipeline can "
                 "confirm or refute it against the photos"
             )
+        if kind == "keep":
+            entry["flags"].append(
+                "marked keep in the seller's narration: identified "
+                "and cut out for an ownership record; never staged "
+                "or listed for sale"
+            )
         items.append(entry)
 
     for narrated_name, narrated_source in narration_named:
         _attach_narration(narrated_name, narrated_source, "named")
+    for narrated_name, narrated_source in narration_keep:
+        _attach_narration(narrated_name, narrated_source, "keep")
     for narrated_name, narrated_source in narration_mentioned:
         _attach_narration(narrated_name, narrated_source, "mentioned")
     if narration_records and not auto and not item_names:
@@ -2454,6 +2910,7 @@ def _run_room_body(
                     },
                     "narration": item.get("narration"),
                     "origin": item.get("origin", "named"),
+                    "intent": _intent_of_origin(item.get("origin")),
                     "stage_mode": stage_mode,
                     "sightings": [],
                     "primary_photo_index": None,
@@ -2463,6 +2920,7 @@ def _run_room_body(
                     "receipt_file": None,
                     "verification": None,
                     "listing": None,
+                    "ownership": None,
                     "pricing": None,
                     "possible_duplicate_of": [],
                     "flags": list(item.get("flags", [])),
@@ -2550,6 +3008,7 @@ def _run_room_body(
         "items": records,
         "notes": notes,
     }
+    manifest["inventory"] = _build_keep_inventory(store, out_dir, room_id, records)
     (out_dir / "manifest.json").write_text(
         json.dumps(manifest, indent=2, sort_keys=True), encoding="utf-8"
     )
@@ -2589,9 +3048,13 @@ def summarize_manifest(manifest: dict) -> str:
                     f"{record['error']['message']}"
                 )
             else:
+                kept_part = ""
+                if "kept_items" in record:
+                    kept_part = f"kept: {record['kept_items'] or 'none'}; "
                 lines.append(
                     f"  {record['path']}: {record['duration_s']}s of speech — "
                     f"named for sale: {record['named_items'] or 'none'}; "
+                    f"{kept_part}"
                     f"mentioned: {record['mentioned_items'] or 'none'}; "
                     f"est. ${record['cost_usd_estimate']:.6f}"
                 )

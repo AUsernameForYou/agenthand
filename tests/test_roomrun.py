@@ -1022,3 +1022,127 @@ def test_sample_video_frames_extracts(tmp_path):
     assert note is None
     assert [t for _, t in frames] == [0.0, 1.0, 2.0]
     assert all(p.exists() for p, _ in frames)
+
+
+# ---------------------------------------------------------------------------
+# KEEP intent (mirror of the Rust build's acceptance): a narrated
+# run with a sell item, a keep item, a confirmed mention, and a
+# refuted mention. Keep items get identify + cut_out only and an
+# ownership record binding the source file's hash and EXIF time.
+# ---------------------------------------------------------------------------
+
+_KEEP_REPLY = (
+    "TRANSCRIPT\n"
+    "Sell the red bike. The brass lamp stays, keep it for insurance. "
+    "There is an old rug and a grand piano somewhere.\n"
+    "SELLING\n"
+    "red bike\n"
+    "KEEP\n"
+    "brass lamp\n"
+    "MENTIONED\n"
+    "old rug\n"
+    "grand piano\n"
+)
+
+
+def _photo_with_exif(tmp_path: Path, name: str, color=(60, 200, 120)) -> Path:
+    path = tmp_path / name
+    img = Image.new("RGB", (48, 36), color)
+    exif = img.getexif()
+    exif[0x0132] = "2026:10:31 09:15:00"
+    img.save(path, format="JPEG", exif=exif)
+    return path
+
+
+def test_parse_narration_reply_splits_keep():
+    parsed = roomrun.parse_narration_reply(_KEEP_REPLY)
+    assert parsed["selling"] == ["red bike"]
+    assert parsed["keep"] == ["brass lamp"]
+    assert parsed["mentioned"] == ["old rug", "grand piano"]
+
+
+def test_keep_cut_quality_grades_edge_touch_as_reshoot():
+    quality = roomrun._keep_cut_quality(
+        {"bbox_normalized": [0.08, 0.0, 0.62, 0.83], "mask_warnings": []}
+    )
+    assert quality["grade"] == "RESHOOT"
+    assert "top" in quality["reshoot_instruction"]
+    quality = roomrun._keep_cut_quality(
+        {"bbox_normalized": [0.08, 0.11, 0.62, 0.83], "mask_warnings": []}
+    )
+    assert quality["grade"] == "PASS"
+    assert quality["reshoot_instruction"] is None
+
+
+def test_narrated_run_with_keep_item_issues_ownership_record(tmp_path):
+    import hashlib
+    import json
+
+    store = AssetStore(tmp_path)
+    photos = [
+        _photo(tmp_path, "bike.jpg"),
+        _photo_with_exif(tmp_path, "lamp.jpg"),
+        _photo(tmp_path, "rug.jpg", (90, 90, 200)),
+    ]
+    crop_plan = _plan("brass lamp")
+    crop_plan["condition_notes"] = "brass shows light tarnish on the stem"
+    fake = FakeChain(
+        store,
+        plans=[
+            _plan("red bike"),
+            _plan("brass lamp"),
+            _plan("old rug"),
+            crop_plan,  # the keep item's crop identify (4th identify call)
+        ],
+        contents={
+            (0, "red bike"): "bike1",
+            (1, "brass lamp"): "lamp1",
+            (2, "old rug"): "rug1",
+        },
+    )
+    narration = FakeNarration(_KEEP_REPLY)
+    manifest = _run_narrated(
+        tmp_path,
+        photos,
+        fake,
+        narration,
+        narrated_audios=[_wav_file(tmp_path / "walk.wav")],
+    )
+    items = {i["name"]: i for i in manifest["items"]}
+    assert items["red bike"]["intent"] == "selling"
+    assert items["red bike"]["status"] == "staged"
+    assert items["old rug"]["intent"] == "mentioned"
+    assert items["old rug"]["status"] == "staged"
+    piano = items["grand piano"]
+    assert piano["intent"] == "mentioned"
+    assert piano["status"] == "failed"
+    assert piano["failure"]["code"] == "NO_MATCH"
+
+    lamp = items["brass lamp"]
+    assert lamp["intent"] == "keep"
+    assert lamp["status"] == "kept"
+    assert lamp["listing"] is None
+    assert fake.calls["draw"] == 2  # bike + rug only; keep never draws
+
+    own = lamp["ownership"]
+    assert own["receipt_type"] == "ownership"
+    assert own["source"]["file_sha256"] == hashlib.sha256(
+        photos[1].read_bytes()
+    ).hexdigest()
+    assert own["source"]["exif_capture_time"] == "2026:10:31 09:15:00"
+    assert own["condition_notes"] == "brass shows light tarnish on the stem"
+    assert own["cut_quality"]["grade"] == "PASS"
+    assert lamp["verification"]["ok"] is True
+    assert lamp["verification"]["crop_pixels_changed"] == 0
+    assert lamp["verification"]["crop_pixels_checked"] > 0
+
+    assert manifest["inventory"]["items"] == 1
+    inventory = json.loads((tmp_path / "out" / "inventory.json").read_text())
+    (entry,) = inventory["items"]
+    assert entry["name"] == "brass lamp"
+    assert entry["exif_capture_time"] == "2026:10:31 09:15:00"
+    assert len(entry["receipt_sha256"]) == 64
+    sheet = (tmp_path / "out" / "inventory.html").read_text()
+    assert "brass lamp" in sheet
+    assert "data:image/png;base64," in sheet
+    assert entry["receipt_sha256"] in sheet
