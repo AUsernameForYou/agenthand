@@ -1038,14 +1038,14 @@ def estimate(
             f"(~{card_px:.0f} px across; this card is only validated "
             f"for close-ups at ~{envelope_min:.0f} px across or more, "
             "where its ranges demonstrably cover the true size) — "
-            "move closer or use a bigger card."
+            "Retake the shot or use a bigger card."
         )
     if card_px < MIN_CARD_PX:
         raise MeasureError(
             f"Card too small in frame (~{card_px:.0f} px across; the "
             f"fit stays quiet but the range stops covering the true "
-            f"size below ~{MIN_CARD_PX:.0f} px) — move closer or use "
-            "a bigger card."
+            f"size below ~{MIN_CARD_PX:.0f} px) — Retake the shot "
+            "or use a bigger card."
         )
     sys_frac = 0.0
     if card_px < COMFORT_CARD_PX:
