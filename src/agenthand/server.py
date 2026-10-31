@@ -65,6 +65,7 @@ offline tests and no-key demos; live mode never substitutes it.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from io import BytesIO
 
@@ -119,6 +120,42 @@ def _persist_full_receipt(
     )
     store.save_receipt(handle, full)
     return full
+
+
+VERIFY_URL_BASE = "https://ausernameforyou.github.io/agenthand/verify"
+
+
+def _canonical_receipt_json(receipt: dict) -> str:
+    """Canonical receipt JSON for hashing: sorted keys, compact
+    separators, unescaped UTF-8 — byte-identical to the Rust
+    build's serde_json serialization of the same receipt data and
+    to the docs verifier's JS canonicalization."""
+    return json.dumps(
+        receipt, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+    )
+
+
+def _annotate_verify_fields(store: AssetStore, handle: str, full: dict) -> dict:
+    """AB 723 verify annotation, mirroring the Rust build: hash the
+    full persisted receipt BEFORE annotation, derive its verify
+    URL, persist the field, and return the result-level fields
+    (verify_url + the ready-to-paste label line). Older receipts
+    without the field still verify; stripping the field and
+    re-canonicalizing reproduces the hash in the URL.
+
+    Divergence (recorded 2026-10-31): the QR PNG sidecar itself
+    (qr_asset / qr_sha256) is rendered by the Rust build only —
+    this environment has no QR library — so Python results carry
+    the URL and label but no QR asset."""
+    digest = hashlib.sha256(_canonical_receipt_json(full).encode("utf-8")).hexdigest()
+    verify_url = f"{VERIFY_URL_BASE}#{digest}"
+    annotated = dict(full)
+    annotated["verify_url"] = verify_url
+    store.save_receipt(handle, annotated)
+    return {
+        "verify_url": verify_url,
+        "label": f"Digitally altered. Original photo and proof: {verify_url}",
+    }
 
 
 # Model assignments (priced in pricing.py). identify starts on Spark; a
@@ -252,7 +289,7 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     # The receipt is persisted (with cost and call attribution) even
     # when the composite fails the Lock checks below: a violation's
     # receipt is exactly the evidence an inspector needs.
-    _persist_full_receipt(store, handle, receipt, billing, scene_prompt)
+    full_receipt = _persist_full_receipt(store, handle, receipt, billing, scene_prompt)
     if receipt["changed_opaque_pixels"] != 0 or not receipt["color_profile_preserved"]:
         # The Lock is measured, not assumed: a composite that changed
         # opaque product pixels — or that lost/changed the source
@@ -302,6 +339,7 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
             "was composited untouched and never sent to the image model."
         ),
     }
+    result.update(_annotate_verify_fields(store, handle, full_receipt))
     preview = Image(data=store.read_bytes(handle), format="png")
     return [result, preview]
 
@@ -334,7 +372,7 @@ def _draw_with_placeholder_plate(
         status="stub",
         note="Local placeholder plate (dev flag AGENTHAND_DRAW_PLACEHOLDER_PLATE); no API call.",
     )
-    _persist_full_receipt(
+    full_receipt = _persist_full_receipt(
         store, outcome["handle"], outcome["receipt"], billing, scene_prompt
     )
     result = {
@@ -356,6 +394,7 @@ def _draw_with_placeholder_plate(
             "checks, and fidelity receipt are the real pipeline."
         ),
     }
+    result.update(_annotate_verify_fields(store, outcome["handle"], full_receipt))
     preview = Image(data=store.read_bytes(outcome["handle"]), format="png")
     return [result, preview]
 

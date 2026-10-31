@@ -452,3 +452,37 @@ def test_draw_discloses_compiled_scene_and_dropped_words(monkeypatch, scene):
         result["stage_spec"]
         == result["fidelity_receipt"]["plate_quality"]["stage_spec"]
     )
+
+
+def test_draw_result_carries_the_verify_url_and_label(monkeypatch):
+    """AB 723 mirror of the Rust build: the draw result and the
+    persisted receipt carry verify_url (hash of the pre-annotation
+    canonical receipt) and the exact label line. The QR PNG itself
+    is rendered by the Rust build only (recorded divergence)."""
+    import hashlib
+
+    _install_fake(monkeypatch, _FakeClient([_image_response(b64_json=_png_b64())]))
+    store = AssetStore(config.get_data_dir())
+    fg = _seed_foreground(store)
+
+    result, _preview = server.draw(fg, "a quiet studio")
+    assert result["status"] == "ok"
+    verify_url = result["verify_url"]
+    assert verify_url.startswith(
+        "https://ausernameforyou.github.io/agenthand/verify#"
+    )
+    fragment = verify_url.rsplit("#", 1)[1]
+    assert len(fragment) == 64
+    assert result["label"] == (
+        f"Digitally altered. Original photo and proof: {verify_url}"
+    )
+    # Python renders no QR sidecar (see server._annotate_verify_fields).
+    assert "qr_asset" not in result
+
+    persisted = store.load_receipt(result["output_asset"])
+    assert persisted["verify_url"] == verify_url
+    stripped = {k: v for k, v in persisted.items() if k != "verify_url"}
+    digest = hashlib.sha256(
+        server._canonical_receipt_json(stripped).encode("utf-8")
+    ).hexdigest()
+    assert digest == fragment
