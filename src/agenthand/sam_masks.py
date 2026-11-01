@@ -16,10 +16,14 @@ text is one line per frame, ``<Nf>`` then comma-separated records
 ``id<|box;x1=..;y1=..;x2=..;y2=..;w=<frameW>;h=<frameH>|><|mask;x=0;y=0;data=<H>,<W>,<payload>|>``.
 Box corners are inclusive on the wire; the parser normalizes them to
 half-open bounds. The mask raster is BOX-LOCAL: its own height/width,
-placed at the record's bounds inside the frame. The payload's first
-character selects the encoding: ``~`` lossless (coverage raster,
-thresholded at >= 129 by the decoder) or ``!`` one_bit. An empty lane
-(no records) is a valid response meaning "nothing matched".
+placed at the record's bounds inside the frame. SAM caps the raster's
+long side at 1024 px, so the raster may be SMALLER than its box; it is
+scaled to the box (bilinear, on the unthresholded coverage) and
+thresholded once at >= 129 before placement (`_fit_raster_to_box`).
+The payload's first character selects the encoding: ``~`` lossless
+(coverage raster, thresholded at >= 129 by the decoder) or ``!``
+one_bit. An empty lane (no records) is a valid response meaning
+"nothing matched".
 
 Assumption recorded for the live verification: image responses use the
 same ``<0f>`` frame-zero line as video frame 0 (the parser's image
@@ -35,6 +39,16 @@ from PIL import Image
 
 # Byte-translation table: any nonzero raster byte becomes 255.
 _TO_FULL = bytes(0 if i == 0 else 255 for i in range(256))
+
+# Coverage at or above this value is "on" (more than half covered);
+# the one threshold both encodings share, applied once after the
+# raster is scaled to its box. Mirrors the Rust MASK_ON_COVERAGE.
+MASK_ON_COVERAGE = 129
+
+# Largest box area `_fit_raster_to_box` will scale to. No honest SAM
+# frame holds a bigger box, and scaling to it would allocate without
+# bound. Mirrors the Rust MAX_MASK_RASTER_PIXELS.
+MAX_MASK_RASTER_PIXELS = 1 << 26  # 67,108,864
 
 
 class SamOutputError(RuntimeError):
@@ -54,10 +68,63 @@ class DecodedMask:
     object_id: str
     # Half-open bounds inside the frame, in pixels: (left, top, right, bottom).
     bounds: tuple[int, int, int, int]
-    # Mask pixels inside the record's own raster (before frame placement).
+    # Mask pixels in the record's raster after it was scaled to its
+    # box (before frame placement).
     mask_pixels: int
     # Full-frame binary mask, mode "L": 255 where the mask is on, else 0.
     image: Image.Image
+
+
+def _fit_raster_to_box(mask, bounds: tuple[int, int, int, int]) -> bytes | None:
+    """Scale a record's box-local raster to its box, then threshold once.
+
+    Mirror of the Rust `fit_coverage_to_box`. SAM caps the raster's
+    long side at 1024 px; placing the raster 1:1 at the box origin (the
+    old behaviour) put a shrunken mask in the box's top-left corner.
+    The scaling runs on the UNTHRESHOLDED coverage (Pillow BILINEAR,
+    the same filter the SAM-frame-to-photo mapping uses) and the
+    >= 129 threshold is applied once, afterwards. A raster that
+    already matches its box is thresholded unchanged, so those records
+    decode exactly as before.
+
+    Returns the 0/1 raster at box size, or None when the box area is
+    zero or over MAX_MASK_RASTER_PIXELS — no honest SAM frame holds
+    such a box, and scaling to it would allocate without bound; the
+    caller skips the record, as the Rust parse path does. Decode
+    failures raise, like the strict decoder this replaces.
+    """
+    # Behind the swap boundary like every other wire-format detail:
+    # the lossless coverage decoder is the official package's own,
+    # the same function its public decode_mask_to_raster thresholds.
+    from meta_sam_parser import decode_mask_to_raster
+    from meta_sam_parser._mask_codec import _decode_lossless_raster
+
+    width, height = int(mask.width), int(mask.height)
+    if width <= 0 or height <= 0:
+        raise ValueError("Mask dimensions must be positive safe integers.")
+    box_width = bounds[2] - bounds[0]
+    box_height = bounds[3] - bounds[1]
+    if mask.encoding == "lossless":
+        if not mask.payload.startswith("~"):
+            raise ValueError("lossless mask payloads must start with ~.")
+        coverage = _decode_lossless_raster(mask.payload, width, height)
+    else:
+        # one_bit coverage is 0/255 by construction; the public
+        # decoder also enforces the canonical-payload check.
+        coverage = bytes(255 if v else 0 for v in decode_mask_to_raster(mask))
+    area = width * height
+    box_area = box_width * box_height
+    if box_area == 0 or box_area > MAX_MASK_RASTER_PIXELS:
+        return None
+    if len(coverage) != area:
+        coverage = (coverage + bytes(area))[:area]
+    if (width, height) != (box_width, box_height):
+        coverage = (
+            Image.frombytes("L", (width, height), coverage)
+            .resize((box_width, box_height), Image.BILINEAR)
+            .tobytes()
+        )
+    return bytes(1 if v >= MASK_ON_COVERAGE else 0 for v in coverage)
 
 
 def _place_in_frame(
@@ -107,7 +174,6 @@ def parse_sam_masks(
     from meta_sam_parser import (
         CompletedOutcome,
         SegmentationMaskRecord,
-        decode_mask_to_raster,
         image_segmentation_format,
     )
 
@@ -124,19 +190,23 @@ def parse_sam_masks(
     for record in result.records:
         if not isinstance(record, SegmentationMaskRecord):
             continue
-        try:
-            raster = decode_mask_to_raster(record.mask)
-        except Exception as exc:
-            raise SamOutputError(
-                f"SAM mask for object {record.object_id!r} failed strict "
-                f"decoding: {exc}"
-            ) from exc
         bounds = (
             int(record.bounds.left),
             int(record.bounds.top),
             int(record.bounds.right),
             int(record.bounds.bottom),
         )
+        try:
+            raster = _fit_raster_to_box(record.mask, bounds)
+        except Exception as exc:
+            raise SamOutputError(
+                f"SAM mask for object {record.object_id!r} failed strict "
+                f"decoding: {exc}"
+            ) from exc
+        if raster is None:
+            # A box no honest frame can hold; the Rust parse path
+            # skips the record the same way.
+            continue
         masks.append(
             DecodedMask(
                 object_id=record.object_id,
@@ -144,8 +214,8 @@ def parse_sam_masks(
                 mask_pixels=sum(raster),
                 image=_place_in_frame(
                     raster,
-                    record.mask.width,
-                    record.mask.height,
+                    bounds[2] - bounds[0],
+                    bounds[3] - bounds[1],
                     bounds,
                     frame_width,
                     frame_height,

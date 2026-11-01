@@ -51,6 +51,21 @@ DOCS_LOSSLESS_TEXT = (
     "<|mask;x=0;y=0;data=27,60,~!!!!M!0c[0o91w?q1!pIH4pPRVp2B3'7`e.ioeAf6-k/"
     "#Xd8%dX9x(|>\n"
 )
+# SCALED: a 2x3 all-ones one_bit raster (payload built with the
+# official encoder) inside a 4x6 box: SAM's 1024-px raster cap in
+# miniature. Fitted to the box it covers all 24 box pixels; placed
+# 1:1 (the old behaviour) it would cover only the top-left 2x3.
+SCALED_ONEBIT_TEXT = (
+    "<0f>0<|box;x1=0;y1=0;x2=3;y2=5;w=8;h=6|>"
+    "<|mask;x=0;y=0;data=3,2,!!!!!&w{Dcs|>\n"
+)
+# SCALED LOSSLESS: the docs payload (60x27 raster) declared over a
+# box twice its size (120x54) in a 440x334 frame.
+SCALED_LOSSLESS_TEXT = (
+    "<0f>0<|box;x1=211;y1=228;x2=330;y2=281;w=440;h=334|>"
+    "<|mask;x=0;y=0;data=27,60,~!!!!M!0c[0o91w?q1!pIH4pPRVp2B3'7`e.ioeAf6-k/"
+    "#Xd8%dX9x(|>\n"
+)
 
 
 def _mask_image(text=GOOD_TEXT, size=(8, 6)):
@@ -149,6 +164,42 @@ def test_parse_multiple_records_keeps_all_in_order():
     masks = parse_sam_masks(TWO_RECORDS_TEXT, 8, 6)
     assert [m.object_id for m in masks] == ["0", "1"]
     assert [m.mask_pixels for m in masks] == [4, 24]
+
+
+def test_parse_scaled_onebit_raster_is_fitted_to_its_box():
+    # The mask-placement fix: a raster smaller than its box is scaled
+    # to the box (bilinear on the coverage, thresholded once), not
+    # pasted 1:1 at the box origin.
+    mask = _mask_image(SCALED_ONEBIT_TEXT)
+    assert mask.bounds == (0, 0, 4, 6)
+    assert mask.mask_pixels == 24
+    assert segmentation.mask_iou(mask.image, _left_half_mask()) == 1.0
+
+
+def test_parse_scaled_lossless_raster_matches_an_independent_fit():
+    # Expected value built without sam_masks: the official codec's
+    # coverage, Pillow's bilinear resize to the box, one threshold.
+    from meta_sam_parser._mask_codec import _decode_lossless_raster
+
+    payload = DOCS_LOSSLESS_TEXT.split("data=27,60,", 1)[1].split("|>", 1)[0]
+    coverage = _decode_lossless_raster(payload, 60, 27)
+    fitted = (
+        Image.frombytes("L", (60, 27), coverage)
+        .resize((120, 54), Image.BILINEAR)
+        .tobytes()
+    )
+    expected = Image.new("L", (440, 334), 0)
+    expected.paste(
+        Image.frombytes(
+            "L", (120, 54), bytes(255 if v >= 129 else 0 for v in fitted)
+        ),
+        (211, 228),
+    )
+    masks = parse_sam_masks(SCALED_LOSSLESS_TEXT, 440, 334)
+    assert len(masks) == 1
+    assert masks[0].bounds == (211, 228, 331, 282)
+    assert masks[0].mask_pixels == sum(1 for v in fitted if v >= 129)
+    assert masks[0].image.tobytes() == expected.tobytes()
 
 
 # -- mask QA --------------------------------------------------------------------
