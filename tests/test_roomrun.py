@@ -694,11 +694,12 @@ def test_room_run_spends_against_its_own_ledger(tmp_path, monkeypatch):
 
 
 def test_sample_video_frames_without_ffmpeg(tmp_path):
-    frames, note = roomrun.sample_video_frames(
+    frames, note, dropped = roomrun.sample_video_frames(
         tmp_path / "nope.mp4", tmp_path / "frames", ffmpeg=""
     )
     assert frames == []
     assert note and "ffmpeg" in note
+    assert dropped == []
 
 
 # ---------------------------------------------------------------------------
@@ -811,7 +812,7 @@ def test_probe_wav_and_cost_projection():
     # 150 tokens/s plus the fixed prompt allowance, output at the cap.
     projected = roomrun.project_narration_cost_usd(10.0)
     assert projected == pytest.approx(
-        (10.0 * 150 + 512) * 1.25e-6 + 4096 * 4.25e-6
+        (10.0 * 150 + 512) * 1.25e-6 + 16384 * 4.25e-6
     )
     assert roomrun.narration_cost_usd(
         {"prompt_tokens": 1_000_000, "completion_tokens": 1_000_000}
@@ -908,6 +909,238 @@ def test_narration_failure_is_a_row_and_the_stills_run_continues(tmp_path):
     assert manifest["mode"] == "named"
     assert manifest["items"][0]["status"] == "staged"  # stills-only mode intact
     assert any("NARRATION_FAILED" in n for n in manifest["notes"])
+
+
+# The diagnostics behind the token-budget fix (film run P12,
+# 2026-10-31): on Daniel's real 58.9 s backyard clip the model's
+# reasoning ran 5,474 tokens and the full reply took 5,668 completion
+# tokens, while the shipped cap was 4096 -- so the shipped call could
+# only ever return an empty reply. The same call at an 8000 cap
+# recovered the full transcript and sort.
+_DIAGNOSTIC_REASONING_TOKENS = 5474
+_DIAGNOSTIC_COMPLETION_TOKENS = 5668
+
+_DIAGNOSTIC_REPLY = (
+    "TRANSCRIPT\n"
+    "Keeping the cornhole. Probably selling this white bike.\n\n"
+    "SELLING\n"
+    "this white bike\n\n"
+    "KEEP\n"
+    "the cornhole\n\n"
+    "MENTIONED\n"
+    "NONE\n"
+)
+
+
+def test_narration_budget_covers_the_diagnostic_clip():
+    payload = roomrun.narration_payload("data:audio/wav;base64,AAAA")
+    # The shipped request must leave room for the diagnostic clip's
+    # reasoning AND its answer; under the old 4096 cap this exact
+    # response could never have been produced.
+    assert payload["max_tokens"] == roomrun.NARRATION_MAX_TOKENS
+    assert payload["max_tokens"] > _DIAGNOSTIC_COMPLETION_TOKENS
+    # And the raise must not break the cost gate for the supported
+    # envelope: a 5-minute file's worst-case projection (5 pieces,
+    # each priced at the full cap) stays under the refusal cap.
+    five_min = roomrun.project_narration_cost_usd(300.0)
+    assert five_min < roomrun.NARRATION_MAX_PROJECTED_USD
+
+
+def test_narration_reply_with_heavy_reasoning_still_yields_its_answer():
+    body = {
+        "model": roomrun.NARRATION_MODEL,
+        "choices": [
+            {
+                "message": {"content": _DIAGNOSTIC_REPLY},
+                "finish_reason": "stop",
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 1102,
+            "completion_tokens": _DIAGNOSTIC_COMPLETION_TOKENS,
+            "completion_tokens_details": {
+                "reasoning_tokens": _DIAGNOSTIC_REASONING_TOKENS
+            },
+        },
+    }
+    result = roomrun.interpret_narration_body(body, latency_ms=42)
+    assert result["reply"] == _DIAGNOSTIC_REPLY
+    parsed = roomrun.parse_narration_reply(result["reply"])
+    assert parsed["selling"] == ["this white bike"]
+    assert parsed["keep"] == ["the cornhole"]
+
+
+def test_narration_empty_reply_is_a_loud_error_with_a_correction_path():
+    body = {
+        "choices": [{"message": {"content": ""}, "finish_reason": "length"}],
+        "usage": {"prompt_tokens": 1102, "completion_tokens": 16384},
+    }
+    with pytest.raises(RuntimeError) as excinfo:
+        roomrun.interpret_narration_body(body, latency_ms=42)
+    message = str(excinfo.value)
+    assert "empty reply" in message
+    assert "16384 completion tokens" in message
+    assert "Trim the recording to about a minute or less" in message
+
+
+def test_narration_cut_off_reply_is_a_loud_error_with_a_correction_path():
+    body = {
+        "choices": [
+            {
+                "message": {"content": "TRANSCRIPT\nKeeping the corn"},
+                "finish_reason": "length",
+            }
+        ],
+        "usage": {"prompt_tokens": 1102, "completion_tokens": 16384},
+    }
+    with pytest.raises(RuntimeError) as excinfo:
+        roomrun.interpret_narration_body(body, latency_ms=42)
+    message = str(excinfo.value)
+    assert "cut off by the token budget" in message
+    assert "Trim the recording to about a minute or less" in message
+
+
+def test_plan_narration_chunks_shapes():
+    # The diagnostic clip stays a single call, exactly as it ran.
+    assert roomrun.plan_narration_chunks(58.88) == [(0.0, 58.88)]
+    # Five minutes (Daniel, 2026-10-31: judges may try a long clip
+    # live) plans to exactly five minute-sized pieces.
+    assert roomrun.plan_narration_chunks(300.0) == [
+        (0.0, 60.0),
+        (60.0, 120.0),
+        (120.0, 180.0),
+        (180.0, 240.0),
+        (240.0, 300.0),
+    ]
+    # A sliver remainder joins the previous piece instead of calling
+    # on its own; a real remainder gets its own piece.
+    assert roomrun.plan_narration_chunks(61.0) == [(0.0, 61.0)]
+    assert roomrun.plan_narration_chunks(134.0) == [(0.0, 60.0), (60.0, 134.0)]
+    assert roomrun.plan_narration_chunks(135.0) == [
+        (0.0, 60.0),
+        (60.0, 120.0),
+        (120.0, 135.0),
+    ]
+
+
+def _piece_durations(data_urls):
+    """Decode the piece data URLs a fake call received; sum durations."""
+    import base64
+    import io
+    import wave as wave_mod
+
+    durations = []
+    for url in data_urls:
+        raw = base64.b64decode(url.split(",", 1)[1])
+        with wave_mod.open(io.BytesIO(raw), "rb") as wav:
+            durations.append(wav.getnframes() / wav.getframerate())
+    return durations
+
+
+def test_long_clip_narration_calls_per_piece_and_merges(monkeypatch, tmp_path):
+    wav_path = _wav_file(tmp_path / "long.wav", seconds=130.0, rate=8000)
+    replies = [
+        "TRANSCRIPT\nFirst part.\n\nSELLING\nbike\n\nKEEP\nNONE\n\nMENTIONED\nNONE\n",
+        "TRANSCRIPT\nSecond part.\n\nSELLING\ngrill\n\nKEEP\ncornhole\n\nMENTIONED\nbubbles\n",
+    ]
+    calls: list[str] = []
+
+    def fake_call(data_url):
+        calls.append(data_url)
+        return {
+            "reply": replies[len(calls) - 1],
+            "usage": {"prompt_tokens": 100, "completion_tokens": 5000},
+            "latency_ms": 7,
+            "model": roomrun.NARRATION_MODEL,
+        }
+
+    monkeypatch.setattr(roomrun, "_call_narration", fake_call)
+    result = roomrun._default_narration_fn(wav_path)
+    # 130 s plans to two pieces: the 10 s remainder merges into the
+    # second piece rather than calling on its own.
+    assert len(calls) == 2
+    # No audio is dropped or repeated at the boundaries: the pieces
+    # the model heard cover the whole 130 s exactly once.
+    assert _piece_durations(calls) == pytest.approx([60.0, 70.0], abs=0.01)
+    parsed = roomrun.parse_narration_reply(result["reply"])
+    assert "First part." in parsed["transcript"]
+    assert "Second part." in parsed["transcript"]
+    assert parsed["selling"] == ["bike", "grill"]
+    assert parsed["keep"] == ["cornhole"]
+    assert parsed["mentioned"] == ["bubbles"]
+    assert result["usage"] == {"prompt_tokens": 200, "completion_tokens": 10000}
+    assert result["latency_ms"] == 14
+    # Piece files are transport; only the source WAV remains.
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["long.wav"]
+
+
+def test_five_minute_clip_narration_is_five_calls_covering_it_all(
+    monkeypatch, tmp_path
+):
+    wav_path = _wav_file(tmp_path / "five.wav", seconds=300.0, rate=8000)
+    calls: list[str] = []
+
+    def fake_call(data_url):
+        calls.append(data_url)
+        return {
+            "reply": "TRANSCRIPT\npart\n\nSELLING\nNONE\n\nKEEP\nNONE\n\nMENTIONED\nNONE\n",
+            "usage": {"prompt_tokens": 1100, "completion_tokens": 5600},
+            "latency_ms": 5,
+            "model": roomrun.NARRATION_MODEL,
+        }
+
+    monkeypatch.setattr(roomrun, "_call_narration", fake_call)
+    result = roomrun._default_narration_fn(wav_path)
+    assert len(calls) == 5
+    assert sum(_piece_durations(calls)) == pytest.approx(300.0, abs=0.05)
+    assert result["usage"]["completion_tokens"] == 5 * 5600
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["five.wav"]
+
+
+def test_long_clip_piece_failure_names_the_piece(monkeypatch, tmp_path):
+    wav_path = _wav_file(tmp_path / "long.wav", seconds=130.0, rate=8000)
+    state = {"n": 0}
+
+    def fake_call(data_url):
+        state["n"] += 1
+        if state["n"] == 2:
+            raise RuntimeError("Baseten narration call returned an empty reply")
+        return {
+            "reply": "TRANSCRIPT\npart\n\nSELLING\nNONE\n",
+            "usage": {},
+            "latency_ms": 1,
+            "model": roomrun.NARRATION_MODEL,
+        }
+
+    monkeypatch.setattr(roomrun, "_call_narration", fake_call)
+    with pytest.raises(RuntimeError, match="narration piece 2 of 2 failed"):
+        roomrun._default_narration_fn(wav_path)
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["long.wav"]
+
+
+def test_over_limit_clip_gets_a_polite_refusal_naming_the_limit(tmp_path):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "case.jpg", (200, 90, 10))]
+    fake = FakeChain(
+        store,
+        plans=[_plan("orange suitcase")],
+        contents={(0, "orange suitcase"): "case1"},
+    )
+    narration = FakeNarration(_NARRATION_REPLY)
+    manifest = _run_narrated(
+        tmp_path, photos, fake, narration,
+        item_names=["orange suitcase"],
+        narrated_audios=[_wav_file(tmp_path / "toolong.wav", seconds=301.0)],
+    )
+    record = manifest["narration"]["files"][0]
+    assert record["error"]["code"] == "NARRATION_TOO_LONG"
+    message = record["error"]["message"]
+    # The refusal is the correction path (decision 114): it names the
+    # 5-minute limit and says what to do instead. No call was made.
+    assert "5-minute limit" in message
+    assert "upload a shorter video" in message
+    assert narration.calls == []
+    assert manifest["items"][0]["status"] == "staged"  # stills run intact
 
 
 def test_silent_track_never_reaches_the_model(tmp_path):
@@ -1016,12 +1249,172 @@ def test_sample_video_frames_extracts(tmp_path):
         ],
         check=True,
     )
-    frames, note = roomrun.sample_video_frames(
+    frames, note, dropped = roomrun.sample_video_frames(
         video, tmp_path / "frames", every_seconds=1.0, max_frames=4
     )
     assert note is None
     assert [t for _, t in frames] == [0.0, 1.0, 2.0]
     assert all(p.exists() for p, _ in frames)
+    assert dropped == []
+
+
+# ---------------------------------------------------------------------------
+# Token savers (2026-10-31): narration audio prep + sampled-frame
+# dedupe. Measured savings are asserted, not assumed: audio duration
+# before/after the trim, frames dropped vs kept on a synthetic
+# sequence.
+# ---------------------------------------------------------------------------
+
+
+def _speech_pause_wav(path: Path, *, rate: int) -> Path:
+    """6 s clip: 0.5 s tone, 3 s silence, 0.5 s tone, 2 s silence."""
+    import math
+    import struct
+    import wave as wave_mod
+
+    total = 6 * rate
+    samples = []
+    for i in range(total):
+        t = i / rate
+        if t < 0.5 or 3.5 <= t < 4.0:
+            samples.append(int(0.30 * 32767 * math.sin(2 * math.pi * 440 * t)))
+        else:
+            samples.append(0)
+    with wave_mod.open(str(path), "wb") as wav:
+        wav.setnchannels(1)
+        wav.setsampwidth(2)
+        wav.setframerate(rate)
+        wav.writeframes(b"".join(struct.pack("<h", s) for s in samples))
+    return path
+
+
+def _read_wav(path: Path):
+    import array
+    import wave as wave_mod
+
+    with wave_mod.open(str(path), "rb") as wav:
+        params = (wav.getnchannels(), wav.getsampwidth(), wav.getframerate())
+        raw = wav.readframes(wav.getnframes())
+    samples = array.array("h")
+    samples.frombytes(raw)
+    return params, samples
+
+
+def test_prepare_narration_audio_keeps_speech_sample_exact(tmp_path):
+    # At the 16 kHz target rate no resampling happens, so the
+    # prepared file must be the original speech slices byte for byte:
+    # [0, 0.7s] and [3.3s, 4.2s] (200 ms pads on both regions; the
+    # 2.6 s padded gap is far over the 800 ms bridge). 6.0 s -> 1.6 s.
+    rate = 16000
+    source = _speech_pause_wav(tmp_path / "clip.wav", rate=rate)
+    _, original = _read_wav(source)
+    prepared_path, prepared_s = roomrun.prepare_narration_audio(source)
+    assert prepared_path != source
+    assert prepared_s is not None and abs(prepared_s - 1.6) < 0.02
+    (channels, width, out_rate), prepared = _read_wav(prepared_path)
+    assert (channels, width, out_rate) == (1, 2, 16000)
+    expected = original[: int(0.7 * rate)] + original[int(3.3 * rate) : int(4.2 * rate)]
+    assert list(prepared) == list(expected)
+
+
+def test_prepare_narration_audio_downsamples_48k_to_16k(tmp_path):
+    source = _speech_pause_wav(tmp_path / "clip48.wav", rate=48000)
+    prepared_path, prepared_s = roomrun.prepare_narration_audio(source)
+    assert prepared_path != source
+    (channels, _, out_rate), prepared = _read_wav(prepared_path)
+    assert (channels, out_rate) == (1, 16000)
+    assert prepared_s is not None and abs(prepared_s - 1.6) < 0.02
+    # Both tone segments survive the box downsample near full level.
+    seg = len(prepared) // 2
+    assert max(prepared[:seg]) > 0.2 * 32767
+    assert max(prepared[seg:]) > 0.2 * 32767
+
+
+def test_prepare_narration_audio_silent_clip_falls_back(tmp_path):
+    silent = _wav_file(tmp_path / "silent.wav", seconds=2.0, rate=16000, peak=0.0)
+    prepared_path, prepared_s = roomrun.prepare_narration_audio(silent)
+    assert prepared_path == silent
+    assert prepared_s is None
+
+
+def test_narrate_one_records_prepared_duration(tmp_path):
+    source = _speech_pause_wav(tmp_path / "walk.wav", rate=16000)
+    narration = FakeNarration("TRANSCRIPT\nSeller talks.\nSELLING\nNONE\nKEEP\nNONE\nMENTIONED\nNONE")
+    record = roomrun._narrate_one(
+        source, "audio", tmp_path / "work", narration,
+        max_projected_usd=roomrun.NARRATION_MAX_PROJECTED_USD,
+    )
+    assert record["error"] is None
+    assert record["duration_s"] == 6.0
+    assert record["prepared_duration_s"] is not None
+    assert abs(record["prepared_duration_s"] - 1.6) < 0.05
+    # The model receives the prepared (shorter) file, not the raw one.
+    sent = narration.calls[0]
+    assert sent.name.endswith("-prepared.wav")
+
+
+def _frame_image(path: Path, *, box_x: int, noise: bool = False) -> Path:
+    """A 128x96 synthetic 'photo': gray wall, one dark box at box_x."""
+    import random
+
+    from PIL import Image
+
+    img = Image.new("RGB", (128, 96), (170, 170, 170))
+    px = img.load()
+    for y in range(24, 72):
+        for x in range(box_x, box_x + 32):
+            px[x, y] = (40, 40, 40)
+    if noise:
+        rng = random.Random(7)
+        for y in range(96):
+            for x in range(128):
+                r, g, b = px[x, y]
+                d = rng.randint(-2, 2)
+                px[x, y] = (r + d, g + d, b + d)
+    img.save(path, quality=92)
+    return path
+
+
+def test_frame_dedupe_drops_near_duplicate_keeps_new_angle(tmp_path):
+    # The P12 constraint as a test pair: a recompressed, lightly
+    # noised copy of the same view IS a near-duplicate and drops; the
+    # same object from a different position is information and stays.
+    a = _frame_image(tmp_path / "a.jpg", box_x=16)
+    b = _frame_image(tmp_path / "b.jpg", box_x=16, noise=True)
+    c = _frame_image(tmp_path / "c.jpg", box_x=80)
+    ta = roomrun.frame_gray_thumbnail(a)
+    tb = roomrun.frame_gray_thumbnail(b)
+    tc = roomrun.frame_gray_thumbnail(c)
+    assert ta is not None and tb is not None and tc is not None
+    near = roomrun.frame_mean_abs_diff(ta, tb)
+    angle = roomrun.frame_mean_abs_diff(ta, tc)
+    assert near <= roomrun.FRAME_DEDUPE_MAX_MEAN_ABS_DIFF, near
+    assert angle > roomrun.FRAME_DEDUPE_MAX_MEAN_ABS_DIFF, angle
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_sample_video_frames_dedupes_static_video(tmp_path):
+    # A 6 s static scene sampled every second: 6 candidate frames,
+    # 5 near-duplicates dropped with scores in the record, 1 kept.
+    video = tmp_path / "static.mp4"
+    still = _frame_image(tmp_path / "still.jpg", box_x=16)
+    subprocess.run(
+        [
+            "ffmpeg", "-v", "error", "-loop", "1", "-i", str(still),
+            "-t", "6", "-pix_fmt", "yuv420p", str(video), "-y",
+        ],
+        check=True,
+    )
+    frames, note, dropped = roomrun.sample_video_frames(
+        video, tmp_path / "frames", every_seconds=1.0, max_frames=8
+    )
+    assert note is None
+    assert len(frames) == 1, frames
+    assert len(dropped) == 5, dropped
+    assert all(d["similarity"] > 0.98 for d in dropped)
+    assert [d["timestamp_s"] for d in dropped] == [1.0, 2.0, 3.0, 4.0, 5.0]
+    # Dropped frame files are removed; the kept one remains.
+    assert frames[0][0].exists()
 
 
 # ---------------------------------------------------------------------------

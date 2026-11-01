@@ -441,6 +441,55 @@ def collect_stills(paths: list[Path]) -> list[Path]:
     return found
 
 
+# -- sampled-frame dedupe (token saver, 2026-10-31) -----------------------
+# Frames are compared against the last KEPT frame as 16x16 grayscale
+# box-mean thumbnails; a candidate whose mean absolute thumbnail
+# difference is at most FRAME_DEDUPE_MAX_MEAN_ABS_DIFF gray levels is
+# a near-duplicate and is dropped before any paid identify call. The
+# bar is deliberately strict: the P12 run showed a second angle of
+# the same item is information, not duplication, and a moved camera
+# or repositioned object scores far above this bound (see the test
+# pair in tests/test_roomrun.py). Every drop is logged with its
+# similarity score in the run record ("frames_dropped").
+FRAME_DEDUPE_CELLS = 16
+FRAME_DEDUPE_MAX_MEAN_ABS_DIFF = 3.0
+
+
+def frame_gray_thumbnail(path: Path) -> list[float] | None:
+    """16x16 grayscale box-mean thumbnail of an image, or None.
+
+    Gray uses integer Rec. 601 luma ((299R + 587G + 114B) // 1000);
+    each cell averages the source box [c*W//16, (c+1)*W//16) on both
+    axes. The Rust build computes the identical values; the two
+    builds' drop decisions match on the same frames.
+    """
+    try:
+        import numpy as np
+        from PIL import Image
+
+        with Image.open(path) as img:
+            rgb = np.asarray(img.convert("RGB"), dtype=np.int64)
+    except Exception:  # noqa: BLE001 - an undecodable frame is kept, never dropped
+        return None
+    height, width = rgb.shape[0], rgb.shape[1]
+    if height == 0 or width == 0:
+        return None
+    gray = (rgb[:, :, 0] * 299 + rgb[:, :, 1] * 587 + rgb[:, :, 2] * 114) // 1000
+    cells = FRAME_DEDUPE_CELLS
+    thumb: list[float] = []
+    for cy in range(cells):
+        y0, y1 = cy * height // cells, max(cy * height // cells + 1, (cy + 1) * height // cells)
+        for cx in range(cells):
+            x0, x1 = cx * width // cells, max(cx * width // cells + 1, (cx + 1) * width // cells)
+            thumb.append(float(gray[y0:y1, x0:x1].mean()))
+    return thumb
+
+
+def frame_mean_abs_diff(a: list[float], b: list[float]) -> float:
+    """Mean absolute difference between two grayscale thumbnails."""
+    return sum(abs(x - y) for x, y in zip(a, b)) / len(a)
+
+
 def sample_video_frames(
     video_path: Path,
     out_dir: Path,
@@ -448,17 +497,19 @@ def sample_video_frames(
     every_seconds: float = 2.0,
     max_frames: int = 8,
     ffmpeg: str | None = None,
-) -> tuple[list[tuple[Path, float]], str | None]:
+) -> tuple[list[tuple[Path, float]], str | None, list[dict]]:
     """Sample frames from a video with ffmpeg at a fixed interval.
 
-    Returns (frames, note): frames are (path, timestamp_s) pairs.
-    When ffmpeg is unavailable or the video cannot be probed, returns
-    ([], reason) — video intake degrades to stills-only, loudly, in
-    the manifest notes rather than failing the room.
+    Returns (frames, note, dropped): frames are (path, timestamp_s)
+    pairs that survived near-duplicate dedupe; dropped carries one
+    {"timestamp_s", "similarity"} record per dropped frame. When
+    ffmpeg is unavailable or the video cannot be probed, returns
+    ([], reason, []) — video intake degrades to stills-only, loudly,
+    in the manifest notes rather than failing the room.
     """
     ffmpeg = ffmpeg if ffmpeg is not None else shutil.which("ffmpeg")
     if not ffmpeg:
-        return [], "ffmpeg not found on PATH; video frames not sampled"
+        return [], "ffmpeg not found on PATH; video frames not sampled", []
     probe = subprocess.run(
         [
             "ffprobe", "-v", "error", "-show_entries", "format=duration",
@@ -469,9 +520,11 @@ def sample_video_frames(
     try:
         duration = float(json.loads(probe.stdout)["format"]["duration"])
     except Exception:
-        return [], f"ffprobe could not read {video_path}; frames not sampled"
+        return [], f"ffprobe could not read {video_path}; frames not sampled", []
     out_dir.mkdir(parents=True, exist_ok=True)
     frames: list[tuple[Path, float]] = []
+    dropped: list[dict] = []
+    last_thumb: list[float] | None = None
     t = 0.0
     while t < duration and len(frames) < max_frames:
         frame_path = out_dir / f"{video_path.stem}-t{t:05.1f}s.jpg"
@@ -483,11 +536,28 @@ def sample_video_frames(
             capture_output=True, text=True, timeout=60,
         )
         if result.returncode == 0 and frame_path.exists() and frame_path.stat().st_size:
-            frames.append((frame_path, round(t, 2)))
+            thumb = frame_gray_thumbnail(frame_path)
+            diff = (
+                frame_mean_abs_diff(thumb, last_thumb)
+                if thumb is not None and last_thumb is not None
+                else None
+            )
+            if diff is not None and diff <= FRAME_DEDUPE_MAX_MEAN_ABS_DIFF:
+                dropped.append(
+                    {
+                        "timestamp_s": round(t, 2),
+                        "similarity": round(1.0 - diff / 255.0, 4),
+                    }
+                )
+                frame_path.unlink(missing_ok=True)
+            else:
+                frames.append((frame_path, round(t, 2)))
+                if thumb is not None:
+                    last_thumb = thumb
         t += every_seconds
     if not frames:
-        return [], f"ffmpeg extracted no frames from {video_path}"
-    return frames, None
+        return [], f"ffmpeg extracted no frames from {video_path}", dropped
+    return frames, None, dropped
 
 
 # ---------------------------------------------------------------------------
@@ -503,10 +573,34 @@ def sample_video_frames(
 
 NARRATION_MODEL = "meta-models/muse-spark-open-1026"
 NARRATION_BASE_URL = "https://inference.baseten.co/v1"
-# Spark Open always reasons before it answers; the voice spike showed
-# a 1024-token cap fully consumed by reasoning, leaving an empty
-# reply. 4096 leaves room for the reasoning AND the transcript.
-NARRATION_MAX_TOKENS = 4096
+# Spark Open always reasons before it answers, and the reasoning grows
+# with the clip. The voice spike showed a 1024-token cap fully consumed
+# by reasoning, leaving an empty reply; 4096 covered the short spikes
+# but not a real walkthrough: on Daniel's 58.9 s backyard clip the
+# model's reasoning alone ran 5,474 tokens (5,668 completion total)
+# before any answer text, so the shipped 4096 cap returned an empty
+# reply (film run P12, 2026-10-31; the same call at an 8000 cap
+# recovered the full transcript and sort). The cap is 16384 PER PIECE:
+# narration splits any clip longer than NARRATION_CHUNK_SECONDS into
+# pieces (below), so no single call ever faces more than a minute of
+# audio. A minute at the worst observed reasoning rate (~121 tokens/s,
+# the 24 s voice spike) needs ~7,300 reasoning tokens plus its share
+# of transcript, so 16384 carries >2x headroom per piece; for the
+# 58.9 s diagnostic clip in one piece it is ~2.9x the whole observed
+# completion. The cap is a fixed constant rather than duration-scaled
+# on purpose: billing is per token actually used, so the cap only
+# feeds the cost projection; a formula would add cross-build parity
+# surface for no billing benefit. A piece whose reasoning still eats
+# the whole budget fails loudly with a correction path (see
+# interpret_narration_body), never a silent empty result.
+NARRATION_MAX_TOKENS = 16384
+# Pieces are a minute because that is the proven envelope: the
+# diagnostic clip (58.9 s, one call) is the longest single call ever
+# observed end to end, request size and latency included. A trailing
+# remainder shorter than the merge bound joins the previous piece
+# instead of becoming a sliver call of its own.
+NARRATION_CHUNK_SECONDS = 60.0
+NARRATION_CHUNK_MERGE_REMAINDER_S = 15.0
 # Baseten's published Model API rates for Muse Spark Open (Baseten
 # model library page, checked 2026-10-28). Estimates in the manifest
 # use exactly these; the API returns tokens, not dollars.
@@ -517,12 +611,22 @@ NARRATION_OUTPUT_USD_PER_TOKEN = 4.25 / 1_000_000
 # 150/s so it errs high, and adds a fixed prompt allowance.
 NARRATION_AUDIO_TOKENS_PER_SECOND = 150.0
 NARRATION_PROMPT_TOKENS = 512
-# A single narration call whose projection exceeds this is refused
-# before it is made. At the published rates an in-limits clip
-# (Baseten caps files at 5 minutes) projects to ~$0.08, so this only
-# trips on a pathological input or a misprobed duration.
-NARRATION_MAX_PROJECTED_USD = 0.25
-NARRATION_MAX_DURATION_S = 600.0  # probe sanity bound
+# A narration file whose worst-case projection exceeds this is
+# refused before any call is made. The projection is honestly
+# worst-case (every piece priced at the full token cap), so the bound
+# is sized for the supported envelope: clips up to 5 minutes are a
+# product requirement (Daniel, 2026-10-31), and a 5-minute file
+# projects to ~$0.41 worst case against ~$0.13 of expected actual
+# usage at observed rates, so $0.50 covers the whole supported
+# envelope with headroom and the gate only trips on a pathological
+# input or a misprobed duration.
+NARRATION_MAX_PROJECTED_USD = 0.50
+# The narration limit: clips up to 5 minutes are accepted (chunked
+# into per-minute calls); a longer clip gets the polite
+# NARRATION_TOO_LONG refusal naming this limit (Daniel, 2026-10-31).
+# Baseten caps files at 5 minutes too, so the limit also matches the
+# upstream ceiling.
+NARRATION_MAX_DURATION_S = 300.0
 # A track whose peak never reaches 1% of full scale (-40 dBFS)
 # carries no speech anyone could transcribe.
 SILENCE_PEAK_FRACTION = 0.01
@@ -611,14 +715,43 @@ def parse_narration_reply(text: str | None) -> dict:
     }
 
 
+def plan_narration_chunks(duration_s: float) -> list[tuple[float, float]]:
+    """Split a clip's timeline into narration pieces.
+
+    Pure. A clip at or under NARRATION_CHUNK_SECONDS is one piece (the
+    only shape older runs ever made). Longer clips cut into
+    chunk-sized windows; a trailing remainder under
+    NARRATION_CHUNK_MERGE_REMAINDER_S joins the previous window
+    instead of becoming a sliver call. A 5-minute clip plans to
+    exactly 5 pieces.
+    """
+    if duration_s <= NARRATION_CHUNK_SECONDS:
+        return [(0.0, duration_s)]
+    chunks: list[tuple[float, float]] = []
+    start = 0.0
+    while duration_s - start > NARRATION_CHUNK_SECONDS:
+        chunks.append((start, start + NARRATION_CHUNK_SECONDS))
+        start += NARRATION_CHUNK_SECONDS
+    if chunks and duration_s - start < NARRATION_CHUNK_MERGE_REMAINDER_S:
+        chunks[-1] = (chunks[-1][0], duration_s)
+    else:
+        chunks.append((start, duration_s))
+    return chunks
+
+
 def project_narration_cost_usd(
     duration_s: float, *, max_tokens: int = NARRATION_MAX_TOKENS
 ) -> float:
-    """Worst-case price of one narration call at the published rates."""
+    """Worst-case price of narrating one file at the published rates.
+
+    Output is priced per planned piece at the full token cap: with
+    chunking, a long file's worst case is pieces x cap, not one cap.
+    """
     input_tokens = duration_s * NARRATION_AUDIO_TOKENS_PER_SECOND + NARRATION_PROMPT_TOKENS
+    pieces = len(plan_narration_chunks(duration_s))
     return (
         input_tokens * NARRATION_INPUT_USD_PER_TOKEN
-        + max_tokens * NARRATION_OUTPUT_USD_PER_TOKEN
+        + pieces * max_tokens * NARRATION_OUTPUT_USD_PER_TOKEN
     )
 
 
@@ -634,6 +767,110 @@ def narration_cost_usd(usage: dict | None) -> float | None:
         prompt * NARRATION_INPUT_USD_PER_TOKEN
         + completion * NARRATION_OUTPUT_USD_PER_TOKEN
     )
+
+
+# -- narration audio prep (token saver, 2026-10-31) -----------------------
+# The narration model is billed per token of audio it processes, and
+# walkthrough clips carry long pauses. Before the call, the extracted
+# WAV is trimmed of silence and downsampled to a speech-appropriate
+# rate. Detection is deliberately conservative: a 10 ms frame counts
+# as speech when its PEAK reaches the same -40 dBFS floor the silence
+# gate uses (SILENCE_PEAK_FRACTION), every kept region is padded
+# 200 ms on both sides, and gaps up to 800 ms are bridged, so nothing
+# at or above the floor can be clipped. Prep failure falls back to
+# the original WAV: prep is an optimization, never a new failure mode.
+NARRATION_PREP_TARGET_RATE = 16000
+NARRATION_PREP_FRAME_S = 0.01
+NARRATION_PREP_PAD_S = 0.2
+NARRATION_PREP_BRIDGE_S = 0.8
+
+
+def prepare_narration_audio(wav_path: Path) -> tuple[Path, float | None]:
+    """Trim silence from a narration WAV and downsample it for the call.
+
+    Returns (path to send, prepared duration in seconds). The 5-minute
+    refusal and the cost projection stay priced on the ORIGINAL
+    duration (the caller probes before prepping); this only shrinks
+    what is actually sent. On any prep failure, or when nothing would
+    be saved, the original path comes back with None.
+    """
+    try:
+        with wave.open(str(wav_path), "rb") as handle:
+            channels = handle.getnchannels()
+            width = handle.getsampwidth()
+            rate = handle.getframerate()
+            raw = handle.readframes(handle.getnframes())
+    except Exception:  # noqa: BLE001 - prep must never become a failure mode
+        return wav_path, None
+    if width != 2 or channels not in (1, 2) or rate <= 0 or not raw:
+        return wav_path, None
+    samples = array.array("h")
+    samples.frombytes(raw[: len(raw) - len(raw) % 2])
+    if sys.byteorder == "big":
+        samples.byteswap()
+    if channels == 2:
+        mono = array.array("h", bytes(2 * (len(samples) // 2)))
+        for i in range(0, len(samples) - 1, 2):
+            # Truncation toward zero, mirroring the Rust build's i32
+            # division exactly (Python // floors negative sums).
+            mono[i // 2] = int((samples[i] + samples[i + 1]) / 2)
+        samples = mono
+    total = len(samples)
+    if total == 0:
+        return wav_path, None
+    frame_len = max(1, int(rate * NARRATION_PREP_FRAME_S))
+    floor_peak = SILENCE_PEAK_FRACTION * 32767.0
+    speech_frames: list[bool] = []
+    for start in range(0, total, frame_len):
+        chunk = samples[start : start + frame_len]
+        speech_frames.append(
+            bool(chunk) and max(max(chunk), -min(chunk)) >= floor_peak
+        )
+    if not any(speech_frames):
+        # A (near-)silent clip: the silence gate upstream owns that
+        # verdict; prep has nothing to trim.
+        return wav_path, None
+    pad = int(rate * NARRATION_PREP_PAD_S)
+    bridge = int(rate * NARRATION_PREP_BRIDGE_S)
+    regions: list[tuple[int, int]] = []
+    for index, is_speech in enumerate(speech_frames):
+        if not is_speech:
+            continue
+        lo = max(0, index * frame_len - pad)
+        hi = min(total, (index + 1) * frame_len + pad)
+        if regions and lo - regions[-1][1] <= bridge:
+            regions[-1] = (regions[-1][0], hi)
+        else:
+            regions.append((lo, hi))
+    kept = array.array("h")
+    for lo, hi in regions:
+        kept.extend(samples[lo:hi])
+    factor = 1
+    if rate % NARRATION_PREP_TARGET_RATE == 0:
+        factor = rate // NARRATION_PREP_TARGET_RATE
+    out_rate = rate
+    if factor > 1:
+        usable = len(kept) - len(kept) % factor
+        down = array.array("h", bytes(2 * (usable // factor)))
+        for i in range(0, usable, factor):
+            mean = sum(kept[i : i + factor]) / factor
+            down[i // factor] = max(-32768, min(32767, round(mean)))
+        kept = down
+        out_rate = rate // factor
+    if len(kept) >= total and out_rate == rate:
+        return wav_path, None
+    out_path = wav_path.with_name(f"{wav_path.stem}-prepared.wav")
+    try:
+        with wave.open(str(out_path), "wb") as handle:
+            handle.setnchannels(1)
+            handle.setsampwidth(2)
+            handle.setframerate(out_rate)
+            if sys.byteorder == "big":
+                kept.byteswap()
+            handle.writeframes(kept.tobytes())
+    except Exception:  # noqa: BLE001 - same fallback rule as above
+        return wav_path, None
+    return out_path, len(kept) / out_rate
 
 
 def probe_wav(path: Path) -> tuple[float, float]:
@@ -730,8 +967,138 @@ def extract_narration_audio(
     return wav_path, None
 
 
-def _default_narration_fn(audio_path: Path) -> dict:
-    """Production narration: ONE Muse Spark Open call via Baseten.
+def narration_payload(data_url: str) -> dict:
+    """The narration request body. Pure, so tests can pin the budget.
+
+    The max_tokens value is the fix for the P12 failure: it must stay
+    well above the reasoning a real walkthrough generates before any
+    answer text (5,474 tokens on the 58.9 s diagnostic clip).
+    """
+    return {
+        "model": NARRATION_MODEL,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": NARRATION_PROMPT},
+                    {"type": "audio_url", "audio_url": {"url": data_url}},
+                ],
+            }
+        ],
+        "max_tokens": NARRATION_MAX_TOKENS,
+    }
+
+
+def _narration_budget_remedy(usage: dict) -> str:
+    """Usage parenthetical for the budget error, when it was reported."""
+    completion = usage.get("completion_tokens")
+    if isinstance(completion, int):
+        return f" (usage: {completion} completion tokens, budget {NARRATION_MAX_TOKENS})"
+    return ""
+
+
+def interpret_narration_body(body: dict, *, latency_ms: int) -> dict:
+    """Turn a Baseten chat-completions body into the narration record.
+
+    Pure, so tests can drive it with stubbed bodies. The failure this
+    guards is silent degradation: a reply whose reasoning ate the
+    whole budget comes back empty (or cut off mid-answer), and an
+    empty transcript would otherwise flow into the manifest as if
+    the seller said nothing. Both shapes raise with the cause and a
+    correction path (decision 114); _narrate_one records the failure
+    as a NARRATION_FAILED row and the stills run continues.
+    """
+    choices = body.get("choices") or []
+    choice = choices[0] if choices else {}
+    content = (choice.get("message") or {}).get("content") or ""
+    usage = body.get("usage") or {}
+    remedy = (
+        "Trim the recording to about a minute or less and narrate "
+        "that, or re-record a shorter walkthrough."
+    )
+    if not content.strip():
+        raise RuntimeError(
+            "Baseten narration call returned an empty reply: the "
+            "model's reasoning spent the token budget before any "
+            f"transcript was written{_narration_budget_remedy(usage)}. "
+            + remedy
+        )
+    if choice.get("finish_reason") == "length":
+        raise RuntimeError(
+            "Baseten narration call was cut off by the token budget "
+            "before the reply finished (finish_reason 'length'"
+            f"{_narration_budget_remedy(usage)}); the transcript "
+            "would be incomplete. " + remedy
+        )
+    return {
+        "reply": content,
+        "usage": usage,
+        "latency_ms": latency_ms,
+        "model": body.get("model") or NARRATION_MODEL,
+    }
+
+
+def _data_url_for(audio_path: Path) -> str:
+    mime = _NARRATION_MIME.get(audio_path.suffix.lower(), "audio/wav")
+    return f"data:{mime};base64," + base64.b64encode(audio_path.read_bytes()).decode("ascii")
+
+
+def slice_wav_pieces(
+    wav_path: Path, chunks: list[tuple[float, float]]
+) -> list[Path]:
+    """Write one WAV per planned chunk, beside the source WAV.
+
+    Stdlib wave only, so it accepts what probe_wav accepts (PCM).
+    The caller owns the piece files and deletes them; pieces are
+    transport, never deliverables.
+    """
+    with wave.open(str(wav_path), "rb") as wav:
+        params = wav.getparams()
+        rate = wav.getframerate()
+        frames = wav.readframes(wav.getnframes())
+    frame_bytes = params.sampwidth * params.nchannels
+    pieces: list[Path] = []
+    for i, (start_s, end_s) in enumerate(chunks):
+        start_f = int(round(start_s * rate))
+        end_f = int(round(end_s * rate))
+        piece = wav_path.with_name(f"{wav_path.stem}.piece{i + 1:02d}.wav")
+        with wave.open(str(piece), "wb") as out:
+            out.setparams(params)
+            out.writeframes(frames[start_f * frame_bytes : end_f * frame_bytes])
+        pieces.append(piece)
+    return pieces
+
+
+def merge_narration_replies(results: list[dict]) -> dict:
+    """Fold per-piece narration records into the file's one record.
+
+    Replies join in timeline order; parse_narration_reply reads the
+    repeated headings as one document, so the transcript reads
+    continuously (a sentence can straddle a piece boundary) and the
+    item lists union. Usage sums the pieces' prompt/completion
+    tokens, which is what the cost estimate prices.
+    """
+    usage: dict = {}
+    if any(r.get("usage") for r in results):
+        usage = {
+            "prompt_tokens": sum(
+                (r.get("usage") or {}).get("prompt_tokens") or 0 for r in results
+            ),
+            "completion_tokens": sum(
+                (r.get("usage") or {}).get("completion_tokens") or 0
+                for r in results
+            ),
+        }
+    return {
+        "reply": "\n".join(r["reply"] for r in results),
+        "usage": usage,
+        "latency_ms": sum(r.get("latency_ms") or 0 for r in results),
+        "model": results[0].get("model") or NARRATION_MODEL,
+    }
+
+
+def _call_narration(data_url: str) -> dict:
+    """ONE Muse Spark Open call via Baseten for one piece of audio.
 
     The voice-spike shape, verbatim where it matters: an audio_url
     content part carrying a base64 data: URL, the stored
@@ -758,21 +1125,7 @@ def _default_narration_fn(audio_path: Path) -> dict:
             "narration cannot run on this machine"
         ) from exc
 
-    mime = _NARRATION_MIME.get(audio_path.suffix.lower(), "audio/wav")
-    data_url = f"data:{mime};base64," + base64.b64encode(audio_path.read_bytes()).decode("ascii")
-    payload = {
-        "model": NARRATION_MODEL,
-        "messages": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": NARRATION_PROMPT},
-                    {"type": "audio_url", "audio_url": {"url": data_url}},
-                ],
-            }
-        ],
-        "max_tokens": NARRATION_MAX_TOKENS,
-    }
+    payload = narration_payload(data_url)
     request = urllib.request.Request(
         f"{NARRATION_BASE_URL}/chat/completions",
         data=json.dumps(payload).encode("utf-8"),
@@ -796,16 +1149,44 @@ def _default_narration_fn(audio_path: Path) -> dict:
             f"Baseten narration call failed: HTTP {exc.code}: {detail}"
         ) from exc
     latency_ms = round((time.monotonic() - started) * 1000)
-    choices = body.get("choices") or []
-    content = ((choices[0].get("message") or {}).get("content") or "") if choices else ""
-    if not content.strip():
-        raise RuntimeError("Baseten narration call returned an empty reply")
-    return {
-        "reply": content,
-        "usage": body.get("usage") or {},
-        "latency_ms": latency_ms,
-        "model": body.get("model") or NARRATION_MODEL,
-    }
+    return interpret_narration_body(body, latency_ms=latency_ms)
+
+
+def _default_narration_fn(audio_path: Path) -> dict:
+    """Production narration for one extracted WAV.
+
+    Clips up to a minute make the single call older runs always made.
+    Longer clips are sliced into planned pieces, one call per piece,
+    and the replies merge into the file's one record, so a 5-minute
+    walkthrough narrates end to end instead of dying on the first
+    call's token budget. A WAV the stdlib cannot slice (a non-PCM
+    original used as-is) falls back to the single call, which then
+    succeeds or fails loudly on its own budget.
+    """
+    try:
+        duration_s, _peak = probe_wav(audio_path)
+    except Exception:  # noqa: BLE001 — unprobeable: the single call decides
+        duration_s = 0.0
+    chunks = plan_narration_chunks(duration_s)
+    if len(chunks) <= 1:
+        return _call_narration(_data_url_for(audio_path))
+    try:
+        pieces = slice_wav_pieces(audio_path, chunks)
+    except Exception:  # noqa: BLE001 — unslicable: the single call decides
+        return _call_narration(_data_url_for(audio_path))
+    try:
+        results: list[dict] = []
+        for i, piece in enumerate(pieces):
+            try:
+                results.append(_call_narration(_data_url_for(piece)))
+            except Exception as exc:  # noqa: BLE001 — re-raised with piece context
+                raise RuntimeError(
+                    f"narration piece {i + 1} of {len(pieces)} failed: {exc}"
+                ) from exc
+        return merge_narration_replies(results)
+    finally:
+        for piece in pieces:
+            piece.unlink(missing_ok=True)
 
 
 def _narrate_one(
@@ -827,6 +1208,7 @@ def _narrate_one(
         "kind": kind,
         "audio_file": None,
         "duration_s": None,
+        "prepared_duration_s": None,
         "peak_fraction": None,
         "transcript": None,
         "named_items": [],
@@ -857,8 +1239,10 @@ def _narrate_one(
         record["error"] = {
             "code": "NARRATION_TOO_LONG",
             "message": (
-                f"narration runs {duration_s:.0f}s; the per-call sanity "
-                f"bound is {NARRATION_MAX_DURATION_S:.0f}s"
+                f"narration runs {duration_s:.0f}s, over the 5-minute "
+                "limit for a narrated clip; upload a shorter video "
+                "(5 minutes or less), or trim this one to the part "
+                "that matters, and run it again"
             ),
         }
         return record
@@ -869,8 +1253,8 @@ def _narrate_one(
             "code": "NARRATION_COST_REFUSED",
             "message": (
                 f"projected narration cost ${projected:.4f} exceeds the "
-                f"per-call cap ${max_projected_usd:.2f}; the call was "
-                "refused before it was made"
+                f"per-file cap ${max_projected_usd:.2f}; the narration "
+                "was refused before any call was made"
             ),
         }
         return record
@@ -883,8 +1267,11 @@ def _narrate_one(
             ),
         }
         return record
+    send_path, prepared_s = prepare_narration_audio(wav_path)
+    if prepared_s is not None:
+        record["prepared_duration_s"] = round(prepared_s, 2)
     try:
-        result = narration_fn(wav_path)
+        result = narration_fn(send_path)
     except Exception as exc:  # noqa: BLE001 — the call boundary, as elsewhere here
         record["error"] = {
             "code": "NARRATION_FAILED",
@@ -2664,7 +3051,7 @@ def _run_room_body(
     frames_dir = out_dir / "frames"
     for video in video_paths:
         video = Path(video)
-        frames, note = sample_video_frames(
+        frames, note, dropped = sample_video_frames(
             video,
             frames_dir / video.stem,
             every_seconds=frame_every_seconds,
@@ -2674,6 +3061,7 @@ def _run_room_body(
             {
                 "path": str(video),
                 "frames_sampled": len(frames),
+                "frames_dropped": dropped,
                 "frame_every_seconds": frame_every_seconds,
                 "note": note,
             }

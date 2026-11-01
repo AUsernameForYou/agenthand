@@ -196,7 +196,7 @@ def _with_frames(monkeypatch, frame_paths):
     """Fake video sampling: the given files become the video's frames."""
 
     def fake_sample(video_path, out_dir, **kwargs):
-        return [(p, float(2 * i)) for i, p in enumerate(frame_paths)], None
+        return [(p, float(2 * i)) for i, p in enumerate(frame_paths)], None, []
 
     monkeypatch.setattr(roomrun, "sample_video_frames", fake_sample)
 
