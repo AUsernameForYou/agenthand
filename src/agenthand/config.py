@@ -115,6 +115,21 @@ def _load_dotenv() -> None:
                 os.environ.setdefault(name, value)
 
 
+def get_comps_file() -> Path:
+    """The category comps file the pricing post-pass reads.
+
+    AGENTHAND_COMPS_FILE when set and non-empty (``~`` expands), else
+    ``pricing-comps.json`` inside the data dir. The file is operator
+    data, never committed: a missing or malformed file degrades
+    pricing to a noted no_comps block, never an error (see comps.py).
+    """
+    _load_dotenv()
+    raw = os.environ.get("AGENTHAND_COMPS_FILE", "").strip()
+    if raw:
+        return Path(raw).expanduser()
+    return get_data_dir() / "pricing-comps.json"
+
+
 def get_meta_api_key() -> str | None:
     """The Meta Model API key, from META_API_KEY (environment or .env).
 

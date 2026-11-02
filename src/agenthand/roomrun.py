@@ -166,7 +166,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import backdrop, config, ingest, ledger, market_pricing
+from . import backdrop, comps, config, ingest, ledger, market_pricing
 from .assets import KIND_CROP, KIND_PLATE, AssetStore
 
 # The shared plate style for a room run: one scene prompt for every
@@ -1898,6 +1898,11 @@ def _stage_primary(
         "backdrop": receipt.get("backdrop"),
         "cost_usd": draw_result.get("cost_usd"),
     }
+    # Angle lock (staging.py): the draw result's record rides on the
+    # item record when the draw produced one. It never enters the
+    # fidelity receipt.
+    if draw_result.get("angle_lock") is not None:
+        record["angle_lock"] = draw_result["angle_lock"]
     receipt_path = ctx.store.receipt_path(record["output_asset"])
     record["receipt_file"] = str(receipt_path) if receipt_path.exists() else None
 
@@ -3380,6 +3385,33 @@ def _run_room_body(
     # item gains its pricing record, comps or no comps.
     for record in records:
         record["pricing"] = market_pricing.pricing_for_item(record["name"], comps_data)
+
+    # Comps pricing (category comps file, comps.py): each record's
+    # listing also carries listing.pricing (range + recommended),
+    # matched code-side from the item name and the identify-written
+    # listing title. A --comps document in the category format (a
+    # local `categories` list and/or a wider-area `categories_wide`
+    # list) is used directly; otherwise the configured comps file is
+    # read. Local comps price first; a category with none falls back
+    # to its wide tier and its block says so (scope "wide" + note).
+    if isinstance(comps_data, dict) and (
+        "categories" in comps_data or "categories_wide" in comps_data
+    ):
+        try:
+            comps_book: comps.LoadedBook = (comps.parse_book(comps_data), None)
+        except comps.CompsFileError as exc:
+            comps_book = (None, comps._one_line(str(exc)))
+    else:
+        comps_book = comps.load_configured_book()
+    for record in records:
+        listing = record.get("listing")
+        if isinstance(listing, dict):
+            title = listing.get("title")
+            listing["pricing"] = comps.pricing_for_item_name(
+                comps_book,
+                record["name"],
+                title if isinstance(title, str) else None,
+            )
 
     total_cost = round(spend_probe() - spend_before, 6)
     narration_section = None

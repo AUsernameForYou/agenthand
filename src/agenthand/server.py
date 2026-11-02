@@ -72,7 +72,7 @@ from io import BytesIO
 from mcp.server.mcpserver import Image, MCPServer
 from PIL.PngImagePlugin import PngInfo
 
-from . import composite, config, ingest, meta_client, segmentation
+from . import composite, comps, config, ingest, meta_client, segmentation, staging
 from . import __version__ as _package_version
 from .assets import (
     HANDLE_PREFIX,
@@ -349,6 +349,16 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
             "was composited untouched and never sent to the image model."
         ),
     }
+    # Angle lock (staging.py, decision 123): the estimate is read from
+    # the foreground's mask geometry and recorded on the RESULT only,
+    # never in the fidelity receipt. Python's plate is text-only (the
+    # generated mode), so the clause takes the steering form, as in
+    # the Rust build's generated branch.
+    _geometry = staging.analyze_subject(store.read_image(asset))
+    _estimate = staging.estimate_shot_angle(_geometry)
+    result["angle_lock"] = staging.angle_lock_record(
+        _estimate, staging.generated_angle_steer(_estimate)
+    )
     result.update(_annotate_verify_fields(store, handle, full_receipt))
     preview = Image(data=store.read_bytes(handle), format="png")
     return [result, preview]
@@ -859,7 +869,7 @@ def identify(image: str) -> dict:
             "model": IDENTIFY_MODEL,
             "error": result["error"],
         }
-    return {
+    ok_result = {
         "status": "ok",
         "tool": "identify",
         "image": handle,
@@ -875,6 +885,13 @@ def identify(image: str) -> dict:
         "usage": result["usage"],
         "call_id": result["call_id"],
     }
+    # Pricing is a pure post-pass over fields identify already
+    # produced (comps.py): it never touches the identify prompt or
+    # schema, and a missing comps file degrades to a noted no_comps
+    # block rather than an error. Error results above are left
+    # exactly as they were.
+    comps.attach_identify_pricing(ok_result, comps.load_configured_book())
+    return ok_result
 
 
 def main() -> None:

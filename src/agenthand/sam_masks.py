@@ -33,8 +33,10 @@ Responses API's ``output_text``.
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 
+import numpy as np
 from PIL import Image
 
 # Byte-translation table: any nonzero raster byte becomes 255.
@@ -49,6 +51,12 @@ MASK_ON_COVERAGE = 129
 # frame holds a bigger box, and scaling to it would allocate without
 # bound. Mirrors the Rust MAX_MASK_RASTER_PIXELS.
 MAX_MASK_RASTER_PIXELS = 1 << 26  # 67,108,864
+
+# A SAM record joins the union in `_union_masks` only when it alone
+# would clear this coverage floor (a fraction of the frame); smaller
+# records are specks (a bolt, a leaf, a glint) and are dropped.
+# Mirrors the Rust REGION_MIN_COVERAGE (= MIN_COVERAGE).
+REGION_MIN_COVERAGE = 0.001
 
 
 class SamOutputError(RuntimeError):
@@ -157,6 +165,58 @@ def _place_in_frame(
     )
     frame.paste(local.crop(src_box), (dst_left, dst_top))
     return frame
+
+
+def _union_masks(
+    masks: list[DecodedMask], frame_width: int, frame_height: int
+) -> dict:
+    """Union every record that clears the speck floor.
+
+    Mirror of the Rust ``union_masks`` (segmentation.rs), replacing
+    the largest-record ``max()``: one phrase can legitimately return
+    several regions of one item (a bike's two wheels and frame), and
+    taking only the largest record discards the rest. When no record
+    clears the floor, the largest record alone is returned so the
+    quality gate rejects it with its real numbers instead of the
+    attempt reading as a zero-match. ``masks`` must be non-empty.
+
+    Returns {"image": full-frame "L" union (0/255), "object_ids":
+    kept records' ids, largest first, "dropped": records dropped
+    under the speck floor, "bounds": half-open union of the kept
+    records' bounds}.
+    """
+    if not masks:
+        raise ValueError("_union_masks requires at least one mask record")
+    frame_pixels = frame_width * frame_height
+    floor = max(1, math.ceil(REGION_MIN_COVERAGE * frame_pixels))
+    counts = [
+        int(np.count_nonzero(np.asarray(m.image))) for m in masks
+    ]
+    # Largest first; ties keep wire order (a stable sort).
+    order = sorted(range(len(masks)), key=lambda i: (-counts[i], i))
+    kept = [i for i in order if counts[i] >= floor]
+    dropped = len(masks) - len(kept)
+    if not kept:
+        kept = [order[0]]
+    union = np.zeros((frame_height, frame_width), dtype=bool)
+    bounds = masks[kept[0]].bounds
+    for i in kept:
+        m = masks[i]
+        union |= np.asarray(m.image) != 0
+        bounds = (
+            min(bounds[0], m.bounds[0]),
+            min(bounds[1], m.bounds[1]),
+            max(bounds[2], m.bounds[2]),
+            max(bounds[3], m.bounds[3]),
+        )
+    return {
+        "image": Image.fromarray(
+            np.where(union, 255, 0).astype(np.uint8), "L"
+        ),
+        "object_ids": [masks[i].object_id for i in kept],
+        "dropped": dropped - 1 if dropped == len(masks) else dropped,
+        "bounds": bounds,
+    }
 
 
 def parse_sam_masks(

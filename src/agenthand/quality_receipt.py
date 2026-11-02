@@ -321,7 +321,22 @@ def verify_quality(store, foreground_handle, receipt):
         if reconstruction["layer_asset"]
         else None
     )
-    rebuilt, _, _ = composite.composite_images(fg, plate, layer)
+    edge_fix = receipt.get("edge_fix")
+    if isinstance(edge_fix, dict) and edge_fix.get("applied"):
+        # A source-derived plate's delivered composite carries the
+        # edge fix (composite.py); reproduce it from the same stored
+        # layers and the record's thin-structure flag. The record is
+        # never graded — the pixel recount above is the grade — but
+        # the reproduction must rebuild what draw actually delivered.
+        rebuilt, _, _, _ = composite.composite_images_with_edge_fix(
+            fg,
+            plate,
+            source,
+            bool(edge_fix.get("thin_structure")),
+            layer,
+        )
+    else:
+        rebuilt, _, _ = composite.composite_images(fg, plate, layer)
     delivered = store.read_image(receipt["output_asset"])
     check(
         "quality_layer_reproduction",

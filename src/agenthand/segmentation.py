@@ -339,20 +339,38 @@ def mask_iou(a: Image.Image, b: Image.Image) -> float:
 def extract_foreground(source: Image.Image, mask_image: Image.Image) -> Image.Image:
     """The product layer: source pixels through the mask, nothing else.
 
-    Where the mask is on, the source pixel is copied byte-for-byte;
-    where it is off, the pixel becomes transparent black. The mask is
-    binary (0/255), so the composite is an exact selection, not a blend.
+    Binary masks select exactly: where the mask is fully on, the
+    source pixel is copied byte-for-byte; where it is off, the pixel
+    becomes transparent black. A partial mask value keeps the source
+    RGB straight and scales only alpha (never produced by the SAM
+    path, whose rasters are binary by construction). The former
+    ``Image.composite`` blend against transparent black also scaled
+    RGB — a premultiplied colour stored as straight alpha, which
+    composited as a dark fringe. Mirror of the Rust
+    ``extract_foreground``.
     """
     from .assets import carry_color_profile
 
     source_rgba = source.convert("RGBA")
-    transparent = Image.new("RGBA", source_rgba.size, (0, 0, 0, 0))
-    # Image.composite builds a fresh image and drops the source's ICC
-    # profile; re-attach it so the product layer keeps the photo's
-    # colour space (see assets.carry_color_profile).
-    return carry_color_profile(
-        source_rgba, Image.composite(source_rgba, transparent, mask_image)
-    )
+    if mask_image.size != source_rgba.size:
+        raise ValueError(
+            f"Mask size {mask_image.size} differs from source size "
+            f"{source_rgba.size}."
+        )
+    src = np.asarray(source_rgba).astype(np.uint32)
+    m = np.asarray(mask_image.convert("L")).astype(np.uint32)
+    out = np.zeros_like(src)
+    full = m == 255
+    out[full] = src[full]
+    partial = (m > 0) & ~full
+    if partial.any():
+        out[partial, :3] = src[partial, :3]
+        out[partial, 3] = (src[partial, 3] * m[partial]) // 255
+    foreground = Image.fromarray(out.astype(np.uint8), "RGBA")
+    # fromarray drops the source's ICC profile; re-attach it so the
+    # product layer keeps the photo's colour space (see
+    # assets.carry_color_profile).
+    return carry_color_profile(source_rgba, foreground)
 
 
 PIPELINE_VERSION = "agenthand.cut-pipeline/3"
@@ -640,3 +658,262 @@ def run_attempts(
     if source.size != (frame_width, frame_height):
         raise ValueError("SAM frame mismatch")
     return run_cut_pipeline(source, png_bytes, phrases, model=model, client=client)
+
+
+# ---------------------------------------------------------------------------
+# Edge band decontamination (docs/EDGE-FIX.md; mirror of the Rust
+# segmentation.rs EdgeField). A cut-out's soft edge pixels
+# (0 < alpha < 255) are blends of the product and the ORIGINAL
+# background; over a darker scene that sliver of original light reads
+# as a bright rim. The band is un-blended against the local original
+# background (sampled from the source just outside the footprint) so
+# it carries product colour only. Product pixels (alpha 255) are
+# never read for writing and never written: the receipt's pixel set
+# is the same set, byte for byte.
+# ---------------------------------------------------------------------------
+
+#: Distances in an EdgeField saturate here (chessboard px).
+EDGE_DIST_CAP = 32
+#: Margin around the footprint bbox that the edge field covers.
+EDGE_FIELD_MARGIN = 16
+#: Original-background sample ring: source pixels outside the
+#: footprint at this chessboard distance range (ring 1 is skipped: in
+#: the photo it is itself part of the soft edge).
+BACKGROUND_RING = (2, 4)
+#: Product-colour sample depth inside the product set (1 = boundary).
+#: The boundary rings carry the original background's blend (and
+#: SAM's staircase misfit), so the estimate prefers pixels 3-5 deep.
+PRODUCT_DEPTH = (3, 5)
+#: Window radius for the local colour estimates (px), and the wider
+#: fallback when the near window holds no sample.
+EDGE_SAMPLE_RADIUS = 6
+EDGE_SAMPLE_RADIUS_WIDE = 12
+
+
+def _chessboard_distance(target: np.ndarray, border_is_target: bool) -> np.ndarray:
+    """Exact chessboard distance (8-connected, unit steps) to the nearest
+    target pixel, two-pass chamfer, saturating at EDGE_DIST_CAP. With
+    ``border_is_target``, the area beyond the window is target.
+
+    The Rust implementation walks pixels sequentially; here each pass
+    is vectorised per row (the within-row dependency is a running
+    minimum, computed with an accumulate over ``value - index``), and
+    the result is identical: saturation at the cap commutes with the
+    min-plus steps because every step adds exactly 1.
+    """
+    cap = EDGE_DIST_CAP
+    h, w = target.shape
+    d = np.where(target, 0, cap).astype(np.int64)
+    if border_is_target and h and w:
+        border = np.ones((h, w), dtype=bool)
+        if h > 2 and w > 2:
+            border[1:-1, 1:-1] = False
+        d = np.where(border & (d > 1), 1, d)
+    idx = np.arange(w)
+    # Forward pass: neighbours left, up, up-left, up-right.
+    for y in range(h):
+        row = d[y]
+        if y > 0:
+            up = d[y - 1]
+            row = np.minimum(row, up + 1)
+            if w > 1:
+                row[1:] = np.minimum(row[1:], up[:-1] + 1)
+                row[:-1] = np.minimum(row[:-1], up[1:] + 1)
+        row = np.minimum.accumulate(row - idx) + idx
+        d[y] = np.minimum(row, cap)
+    # Backward pass: neighbours right, down, down-right, down-left.
+    for y in range(h - 1, -1, -1):
+        row = d[y]
+        if y + 1 < h:
+            down = d[y + 1]
+            row = np.minimum(row, down + 1)
+            if w > 1:
+                row[1:] = np.minimum(row[1:], down[:-1] + 1)
+                row[:-1] = np.minimum(row[:-1], down[1:] + 1)
+        row = np.minimum.accumulate((row + idx)[::-1])[::-1] - idx
+        d[y] = np.minimum(row, cap)
+    return d.astype(np.uint8)
+
+
+@dataclass
+class EdgeField:
+    """Distance maps of a foreground's alpha, over the footprint bbox grown
+    by EDGE_FIELD_MARGIN (window coordinates; ``x0``/``y0`` place the
+    window in the frame). Footprint = alpha > 0, product set = alpha 255.
+    """
+
+    x0: int
+    y0: int
+    w: int
+    h: int
+    frame_w: int
+    frame_h: int
+    #: Foreground alpha in the window.
+    alpha: np.ndarray
+    #: Chessboard distance to the footprint (0 on it).
+    out_fp: np.ndarray
+    #: Chessboard distance to the product set (0 on it).
+    out_o: np.ndarray
+    #: Depth inside the product set (1 = boundary pixel; 0 outside).
+    #: Beyond the window counts as outside.
+    in_o: np.ndarray
+
+    @classmethod
+    def create(cls, foreground: Image.Image) -> "EdgeField | None":
+        """Build the field, or None when the foreground has no visible pixel."""
+        fg = foreground.convert("RGBA")
+        frame_w, frame_h = fg.size
+        alpha_full = np.asarray(fg.getchannel("A"))
+        visible = alpha_full > 0
+        if not visible.any():
+            return None
+        ys, xs = np.nonzero(visible)
+        bx0, by0 = int(xs.min()), int(ys.min())
+        bx1, by1 = int(xs.max()) + 1, int(ys.max()) + 1
+        m = EDGE_FIELD_MARGIN
+        x0, y0 = max(0, bx0 - m), max(0, by0 - m)
+        x1, y1 = min(frame_w, bx1 + m), min(frame_h, by1 + m)
+        alpha = alpha_full[y0:y1, x0:x1].copy()
+        fp = alpha > 0
+        o = alpha == 255
+        return cls(
+            x0=x0,
+            y0=y0,
+            w=x1 - x0,
+            h=y1 - y0,
+            frame_w=frame_w,
+            frame_h=frame_h,
+            alpha=alpha,
+            out_fp=_chessboard_distance(fp, border_is_target=False),
+            out_o=_chessboard_distance(o, border_is_target=False),
+            in_o=_chessboard_distance(~o, border_is_target=True),
+        )
+
+    def local_mean(
+        self,
+        img: np.ndarray,
+        cx: int,
+        cy: int,
+        r: int,
+        keep: np.ndarray,
+    ) -> tuple[int, int, int] | None:
+        """Rounded mean RGB of ``img`` (frame-sized RGBA array) over the
+        window pixels within Chebyshev radius ``r`` of (cx, cy) whose
+        window position is set in ``keep`` (a window-shaped boolean
+        array); None when there are none. Integer math: (sum + n/2) / n,
+        like the Rust implementation."""
+        x_lo, x_hi = max(0, cx - r), min(self.w, cx + r + 1)
+        y_lo, y_hi = max(0, cy - r), min(self.h, cy + r + 1)
+        if x_hi <= x_lo or y_hi <= y_lo:
+            return None
+        mask = keep[y_lo:y_hi, x_lo:x_hi]
+        n = int(np.count_nonzero(mask))
+        if n == 0:
+            return None
+        region = img[
+            self.y0 + y_lo : self.y0 + y_hi, self.x0 + x_lo : self.x0 + x_hi, :3
+        ]
+        sums = region[mask].astype(np.uint64).sum(axis=0)
+        return tuple(int((int(s) + n // 2) // n) for s in sums)
+
+    def product_colour(
+        self, foreground: np.ndarray, cx: int, cy: int
+    ) -> tuple[int, int, int] | None:
+        """Local product colour near (cx, cy) from the product layer: the
+        mean of product pixels PRODUCT_DEPTH deep, falling back to 2+
+        deep, then any product pixel (thin parts have no depth), all in
+        the EDGE_SAMPLE_RADIUS window."""
+        lo, hi = PRODUCT_DEPTH
+        return (
+            self.local_mean(
+                foreground, cx, cy, EDGE_SAMPLE_RADIUS,
+                (self.in_o >= lo) & (self.in_o <= hi),
+            )
+            or self.local_mean(
+                foreground, cx, cy, EDGE_SAMPLE_RADIUS, self.in_o >= 2
+            )
+            or self.local_mean(
+                foreground, cx, cy, EDGE_SAMPLE_RADIUS, self.in_o >= 1
+            )
+        )
+
+    def background_colour(
+        self, source: np.ndarray, cx: int, cy: int
+    ) -> tuple[int, int, int] | None:
+        """Local ORIGINAL background colour near (cx, cy): the mean of the
+        source photo over the BACKGROUND_RING outside the footprint,
+        near window first, then the wide one."""
+        lo, hi = BACKGROUND_RING
+        ring = (self.out_fp >= lo) & (self.out_fp <= hi)
+        return self.local_mean(
+            source, cx, cy, EDGE_SAMPLE_RADIUS, ring
+        ) or self.local_mean(source, cx, cy, EDGE_SAMPLE_RADIUS_WIDE, ring)
+
+
+def unblend_edge_pixel(
+    observed: tuple[int, int, int],
+    alpha: int,
+    background: tuple[int, int, int],
+    product: tuple[int, int, int] | None,
+) -> tuple[int, int, int]:
+    """Un-blend one soft edge pixel: ``observed = a*F + (1-a)*B``, so
+    ``F = (observed*255 - (255-a)*B) / a``, clamped. Low-coverage pixels
+    amplify noise by 255/a, so the result leans on the local product
+    colour there: weight ``min(255, 2a)`` on the un-blend, the rest on
+    ``product`` (when known). Integer math throughout."""
+    if alpha == 0:
+        return product if product is not None else observed
+    a = alpha
+    w = min(255, 2 * a)
+    out = []
+    for c in range(3):
+        num = observed[c] * 255 - (255 - a) * background[c]
+        f = min(255, max(0, (num + a // 2) // a))
+        if product is not None:
+            out.append((f * w + product[c] * (255 - w) + 127) // 255)
+        else:
+            out.append(f)
+    return tuple(out)
+
+
+def decontaminate_edge_band(
+    source: Image.Image,
+    foreground: Image.Image,
+    field: "EdgeField | None" = None,
+) -> tuple[Image.Image, int, int]:
+    """The product layer with its soft edge band decontaminated: every
+    pixel with 0 < alpha < 255 keeps its alpha and gets the un-blended
+    colour (``unblend_edge_pixel`` against the local original background
+    from ``source``); product pixels (alpha 255) and transparent pixels
+    are copied unchanged. Returns (layer, edge band pixels,
+    decontaminated pixels). A band pixel with no background sample in
+    reach is left as it was. ``source`` must share the frame."""
+    from .assets import carry_color_profile
+
+    if source.size != foreground.size:
+        raise ValueError("source and foreground frames differ")
+    fg_rgba = foreground.convert("RGBA")
+    src = np.asarray(source.convert("RGBA"))
+    fg = np.asarray(fg_rgba)
+    out = fg.copy()
+    if field is None:
+        field = EdgeField.create(foreground)
+        if field is None:
+            return fg_rgba, 0, 0
+    band = 0
+    fixed = 0
+    ys, xs = np.nonzero((field.alpha > 0) & (field.alpha < 255))
+    for y, x in zip(ys.tolist(), xs.tolist()):
+        band += 1
+        bg = field.background_colour(src, x, y)
+        if bg is None:
+            continue
+        product = field.product_colour(fg, x, y)
+        gy, gx = field.y0 + y, field.x0 + x
+        observed = (int(fg[gy, gx, 0]), int(fg[gy, gx, 1]), int(fg[gy, gx, 2]))
+        out[gy, gx, :3] = unblend_edge_pixel(
+            observed, int(field.alpha[y, x]), bg, product
+        )
+        fixed += 1
+    layer = Image.fromarray(out, "RGBA")
+    return carry_color_profile(fg_rgba, layer), band, fixed

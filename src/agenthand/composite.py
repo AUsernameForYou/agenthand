@@ -29,7 +29,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
+from dataclasses import dataclass
 from io import BytesIO
 
 import cv2
@@ -262,6 +264,391 @@ def composite_images(
     # must carry the product's colour profile, not the plate's silence.
     carry_color_profile(fg, out)
     return out, _measure(fg, out), transformations
+
+
+# ---------------------------------------------------------------------------
+# Edge fix (docs/EDGE-FIX.md; mirror of the Rust composite.rs edge fix):
+# kill the cut-out rim on source-derived plates. Three steps, none of
+# which writes a product pixel (alpha 255):
+# 1. decontaminate the layer's soft edge band against the ORIGINAL
+#    background (segmentation.decontaminate_edge_band);
+# 2. rebuild the plate's 2-3 px band hugging the product from the plate
+#    just beyond it (wiping any plate-side rim, including the old
+#    contaminated matte ring) and darken it softly with the contact
+#    shadow's colour (a contact band);
+# 3. feather the boundary by one outward ring of local product colour
+#    at <= 50% (about 1 px), never softer than the source photo's own
+#    edge, measured from the source.
+# The receipt's pixel set and count are unchanged; the receipt carries
+# an `edge_fix` record with every parameter and count.
+# ---------------------------------------------------------------------------
+
+#: Kill switch env var: AGENTHAND_EDGE_FIX=off (or 0 / false / no)
+#: restores the previous composite exactly.
+EDGE_FIX_ENV = "AGENTHAND_EDGE_FIX"
+#: The `edge_fix` receipt record's version.
+EDGE_FIX_VERSION = 1
+#: Feather: one outward ring, at most this opacity (128 ~ 50%): the
+#: composite boundary ramp spans at most 2 px, i.e. about 1 px of
+#: feather beyond the hard cut.
+FEATHER_MAX_ALPHA = 128
+#: Source edge-width samples: a boundary profile needs at least this
+#: luma step across it to count.
+EDGE_WIDTH_MIN_CONTRAST = 32
+#: Fewer qualifying samples than this and the source edge is treated
+#: as hard (no feather): the cap never assumes softness it cannot see.
+EDGE_WIDTH_MIN_SAMPLES = 64
+#: Upper clamp of one sample's ramp width (x256 fixed point, 5 px).
+EDGE_WIDTH_MAX_FX = 5 * 256
+#: A source ramp up to 1.125 px counts as pixel-hard (no feather): one
+#: luma level of noise on a 32-level step reads as ~1.03 px.
+EDGE_WIDTH_HARD_FX = 288
+#: Contact band: the contact shadow's colour, alpha per ring (ring 1
+#: hugs the product). Thin subjects get the 2-ring band.
+CONTACT_BAND_RGB = (58, 50, 40)
+CONTACT_BAND_ALPHA = (30, 18, 8)
+CONTACT_BAND_ALPHA_THIN = (18, 8)
+#: Plate rim rebuild: share (of 256) of the clean plate colour (mean of
+#: the plate `band+1 ..= band+3` px out) that replaces each band ring.
+RIM_REBUILD = (256, 256, 160)
+RIM_REBUILD_THIN = (256, 160)
+
+#: The plate kinds the edge fix applies to: the source-derived plates
+#: (the product sits back in its own photo's geometry). Legacy,
+#: placeholder and code-rendered draws keep their exact composite.
+EDGE_FIX_PLATE_KINDS = ("source_edit", "source_blur")
+
+
+def edge_fix_enabled() -> bool:
+    """Whether the edge fix runs at all (the kill switch)."""
+    raw = os.environ.get(EDGE_FIX_ENV, "").strip().lower()
+    return raw not in ("0", "off", "false", "no")
+
+
+def edge_fix_applies_to(plate_kind: str | None) -> bool:
+    return plate_kind in EDGE_FIX_PLATE_KINDS
+
+
+def _shift_for_div_255(a: int) -> int:
+    """Pillow's fast divide-by-255: ``(((a >> 8) + a) >> 8)``."""
+    return ((a >> 8) + a) >> 8
+
+
+def composite_pixel(d: tuple[int, int, int, int], s: tuple[int, int, int, int]):
+    """One pixel of ``Image.alpha_composite`` (src over dst), the same
+    integer math (Pillow PRECISION_BITS = 7), so band/feather writes
+    match a whole-image composite exactly."""
+    if s[3] == 0:
+        return d
+    sa = s[3]
+    blend = d[3] * (255 - sa)
+    outa255 = sa * 255 + blend
+    coef1 = sa * 255 * 255 * (1 << 7) // outa255
+    coef2 = 255 * (1 << 7) - coef1
+    out = [0, 0, 0, 0]
+    for c in range(3):
+        tmp = s[c] * coef1 + d[c] * coef2
+        out[c] = _shift_for_div_255(tmp + (0x80 << 7)) >> 7
+    out[3] = _shift_for_div_255(outa255 + 0x80)
+    return tuple(out)
+
+
+def estimate_source_edge_width(source: Image.Image, field) -> tuple[int, int]:
+    """The source photo's own edge softness across the product boundary,
+    as a linear-ramp width (x256 fixed point; 256 = a pixel-hard step),
+    and the number of profiles it was read from. Each product boundary
+    pixel with a non-product 4-neighbour gives one luma profile along
+    that direction, 2 px inside to 3 px outside; a profile counts when
+    its end-to-end step C is at least EDGE_WIDTH_MIN_CONTRAST and it
+    is not texture (range <= 1.5 C). Width = C / steepest single step;
+    the median over all profiles is returned. Under
+    EDGE_WIDTH_MIN_SAMPLES profiles, 256 (hard) is returned."""
+    src = np.asarray(source.convert("RGBA")).astype(np.int64)
+    luma = (
+        src[:, :, 0] * 19595 + src[:, :, 1] * 38470 + src[:, :, 2] * 7471 + 0x8000
+    ) >> 16
+    frame_w, frame_h = field.frame_w, field.frame_h
+    alpha = field.alpha
+    # Alpha padded with a non-product border: a neighbour outside the
+    # window counts as non-product, exactly as the Rust field check.
+    padded = np.zeros((field.h + 2, field.w + 2), dtype=np.uint8)
+    padded[1:-1, 1:-1] = alpha
+    widths: list[int] = []
+    for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+        neigh = padded[1 + dy : 1 + dy + field.h, 1 + dx : 1 + dx + field.w]
+        ys, xs = np.nonzero((alpha == 255) & (neigh != 255))
+        if len(xs) == 0:
+            continue
+        gx = field.x0 + xs.astype(np.int64)
+        gy = field.y0 + ys.astype(np.int64)
+        offs = np.arange(-2, 4, dtype=np.int64)
+        sx = gx[:, None] + offs[None, :] * dx
+        sy = gy[:, None] + offs[None, :] * dy
+        valid = (
+            (sx >= 0) & (sx < frame_w) & (sy >= 0) & (sy < frame_h)
+        ).all(axis=1)
+        if not valid.any():
+            continue
+        sx = np.clip(sx[valid], 0, frame_w - 1)
+        sy = np.clip(sy[valid], 0, frame_h - 1)
+        prof = luma[sy, sx]  # (n, 6)
+        c = np.abs(prof[:, 0] - prof[:, 5])
+        lo = prof.min(axis=1)
+        hi = prof.max(axis=1)
+        g = np.abs(np.diff(prof, axis=1)).max(axis=1)
+        keep = (c >= EDGE_WIDTH_MIN_CONTRAST) & (2 * (hi - lo) <= 3 * c) & (g > 0)
+        if keep.any():
+            w = (c[keep] * 256 // g[keep]).clip(256, EDGE_WIDTH_MAX_FX)
+            widths.extend(int(v) for v in w)
+    n = len(widths)
+    if n < EDGE_WIDTH_MIN_SAMPLES:
+        return 256, n
+    widths.sort()
+    return widths[n // 2], n
+
+
+def feather_alpha_for_width(width_fx: int) -> int:
+    """Feather ring opacity for a source ramp width (x256): the composite
+    profile product | ring a | plate has ramp width 1 / (1 - a) for
+    a <= 0.5, so a = 1 - 1/w matches the source exactly and never
+    exceeds it; capped at FEATHER_MAX_ALPHA (about 1 px). A
+    pixel-hard source edge (<= EDGE_WIDTH_HARD_FX) gets no feather."""
+    if width_fx <= EDGE_WIDTH_HARD_FX:
+        return 0
+    inv = (255 * 256 + width_fx // 2) // width_fx
+    return min(max(0, 255 - inv), FEATHER_MAX_ALPHA)
+
+
+@dataclass
+class EdgeFixReport:
+    """What the edge fix did; ``to_json`` is the receipt's ``edge_fix`` record."""
+
+    applied: bool = False
+    reason: str | None = None
+    thin_structure: bool = False
+    source_edge_width_fx: int = 0
+    source_edge_samples: int = 0
+    feather_alpha: int = 0
+    feather_pixels: int = 0
+    edge_band_pixels: int = 0
+    decontaminated_pixels: int = 0
+    contact_band_width_px: int = 0
+    contact_band_pixels: int = 0
+    rim_rebuilt_pixels: int = 0
+
+    @classmethod
+    def skipped(cls, reason: str) -> "EdgeFixReport":
+        return cls(applied=False, reason=reason)
+
+    def to_json(self) -> dict:
+        from .segmentation import BACKGROUND_RING
+
+        if not self.applied:
+            return {
+                "version": EDGE_FIX_VERSION,
+                "applied": False,
+                "reason": self.reason,
+            }
+        band = self.contact_band_width_px
+        if self.thin_structure:
+            alphas, rebuild = list(CONTACT_BAND_ALPHA_THIN), list(RIM_REBUILD_THIN)
+        else:
+            alphas, rebuild = list(CONTACT_BAND_ALPHA), list(RIM_REBUILD)
+        return {
+            "version": EDGE_FIX_VERSION,
+            "applied": True,
+            "stage": "composite",
+            "product_pixels_written": 0,
+            "edge_band": {
+                "pixels": self.edge_band_pixels,
+                "decontaminated": self.decontaminated_pixels,
+                "method": "un-blend against the local original background: F = (observed - (1-a) B) / a, B = mean source colour 2-4 px outside the footprint, leaning on the local product colour as a -> 0",
+                "background_ring_px": [BACKGROUND_RING[0], BACKGROUND_RING[1]],
+            },
+            "feather": {
+                "rings": 1,
+                "alpha": self.feather_alpha,
+                "max_alpha": FEATHER_MAX_ALPHA,
+                "pixels": self.feather_pixels,
+                "colour": "local product colour (product pixels 3-5 px deep), never the original background",
+            },
+            "source_edge": {
+                "ramp_width_px": round(self.source_edge_width_fx / 256.0, 6),
+                "samples": self.source_edge_samples,
+                "min_contrast": EDGE_WIDTH_MIN_CONTRAST,
+                "rule": "feather alpha = min(max_alpha, 1 - 1/ramp_width): never softer than the source edge",
+            },
+            "contact_band": {
+                "width_px": self.contact_band_width_px,
+                "rgb": list(CONTACT_BAND_RGB),
+                "alpha": alphas,
+                "rim_rebuild_share_256": rebuild,
+                "rebuilt_from_ring_px": [band + 1, band + 3],
+                "pixels": self.contact_band_pixels,
+                "rim_rebuilt_pixels": self.rim_rebuilt_pixels,
+            },
+            "thin_structure": self.thin_structure,
+        }
+
+
+@dataclass
+class EdgeFixOutput:
+    """The edge fix's outputs: the dressed plate (contact band, rim rebuild
+    and feather ring; plate-side pixels only) and the product layer with
+    its soft edge band decontaminated (product pixels copied unchanged)."""
+
+    plate: Image.Image
+    foreground: Image.Image
+    report: EdgeFixReport
+
+
+def apply_edge_fix(
+    source: Image.Image,
+    foreground: Image.Image,
+    plate: Image.Image,
+    thin: bool,
+) -> EdgeFixOutput:
+    """Run the edge fix. ``source`` is the original photo the layer was cut
+    from, ``plate`` is already at the layer's frame. ``thin`` (the
+    subject's thin-structure flag) narrows the contact band to 2 px."""
+    from .segmentation import EdgeField, decontaminate_edge_band
+
+    def unchanged(reason: str) -> EdgeFixOutput:
+        return EdgeFixOutput(
+            plate=plate.copy(),
+            foreground=foreground.copy(),
+            report=EdgeFixReport.skipped(reason),
+        )
+
+    if source.size != foreground.size or plate.size != foreground.size:
+        return unchanged("source, plate and product layer frames differ")
+    field = EdgeField.create(foreground)
+    if field is None:
+        return unchanged("the product layer has no visible pixel")
+    dressed_fg, edge_band_pixels, decontaminated_pixels = decontaminate_edge_band(
+        source, foreground, field
+    )
+    width_fx, samples = estimate_source_edge_width(source, field)
+    feather = feather_alpha_for_width(width_fx)
+
+    if thin:
+        alphas, rebuild = CONTACT_BAND_ALPHA_THIN, RIM_REBUILD_THIN
+    else:
+        alphas, rebuild = CONTACT_BAND_ALPHA, RIM_REBUILD
+    band = len(alphas)
+    plate_arr = np.asarray(plate.convert("RGBA")).copy()
+    src_plate = np.asarray(plate.convert("RGBA"))
+    band_px = 0
+    rebuilt = 0
+    clean_lo, clean_hi = band + 1, band + 3
+    clean_keep = (field.out_o >= clean_lo) & (field.out_o <= clean_hi)
+    band_ys, band_xs = np.nonzero((field.out_o >= 1) & (field.out_o <= band))
+    for y, x in zip(band_ys.tolist(), band_xs.tolist()):
+        d = int(field.out_o[y, x])
+        band_px += 1
+        gy, gx = field.y0 + y, field.x0 + x
+        px = tuple(int(v) for v in plate_arr[gy, gx])
+        # Rim rebuild: read from the untouched plate, so the result
+        # does not depend on visiting order.
+        clean = field.local_mean(src_plate, x, y, clean_hi, clean_keep)
+        if clean is not None:
+            s = rebuild[d - 1]
+            px = tuple(
+                (px[c] * (256 - s) + clean[c] * s + 128) >> 8 for c in range(3)
+            ) + (px[3],)
+            rebuilt += 1
+        # Contact band: the contact shadow's colour over the ring,
+        # per channel never brighter than the plate (on a plate
+        # darker than the shadow colour it is a no-op, not a glow).
+        shaded = composite_pixel(px, CONTACT_BAND_RGB + (alphas[d - 1],))
+        px = tuple(min(px[c], shaded[c]) for c in range(3)) + (px[3],)
+        plate_arr[gy, gx] = px
+
+    feather_px = 0
+    if feather > 0:
+        fg_arr = np.asarray(foreground.convert("RGBA"))
+        f_ys, f_xs = np.nonzero((field.alpha == 0) & (field.out_o == 1))
+        for y, x in zip(f_ys.tolist(), f_xs.tolist()):
+            # Coverage-weighted: a straight edge (3 product px in
+            # the 3x3) gets the full ring alpha, a staircase corner
+            # touched only diagonally a third, which rounds SAM's
+            # steps instead of outlining them.
+            y_lo, y_hi = max(0, y - 1), min(field.h, y + 2)
+            x_lo, x_hi = max(0, x - 1), min(field.w, x + 2)
+            k = int(
+                np.count_nonzero(field.alpha[y_lo:y_hi, x_lo:x_hi] == 255)
+            )
+            a = (feather * min(k, 3) + 1) // 3
+            if a == 0:
+                continue
+            colour = field.product_colour(fg_arr, x, y)
+            if colour is None:
+                continue
+            gy, gx = field.y0 + y, field.x0 + x
+            d = tuple(int(v) for v in plate_arr[gy, gx])
+            plate_arr[gy, gx] = composite_pixel(d, colour + (a,))
+            feather_px += 1
+
+    out_plate = Image.fromarray(plate_arr, "RGBA")
+    carry_color_profile(plate, out_plate)
+    return EdgeFixOutput(
+        plate=out_plate,
+        foreground=dressed_fg,
+        report=EdgeFixReport(
+            applied=True,
+            reason=None,
+            thin_structure=thin,
+            source_edge_width_fx=width_fx,
+            source_edge_samples=samples,
+            feather_alpha=feather,
+            feather_pixels=feather_px,
+            edge_band_pixels=edge_band_pixels,
+            decontaminated_pixels=decontaminated_pixels,
+            contact_band_width_px=band,
+            contact_band_pixels=band_px,
+            rim_rebuilt_pixels=rebuilt,
+        ),
+    )
+
+
+def composite_images_with_edge_fix(
+    foreground: Image.Image,
+    plate: Image.Image,
+    source: Image.Image,
+    thin: bool,
+    reconstruction: Image.Image | None = None,
+) -> tuple[Image.Image, dict, list[str], dict]:
+    """``composite_images`` with the edge fix: the plate is fitted first
+    (exactly as ``composite_images`` does, reconstruction layer and
+    all), dressed, and the decontaminated layer composited over it.
+    Counts are measured against the STORED layer, so the receipt's
+    product set and count are the same as without the fix. Returns
+    (image, counts, transformations, edge_fix record)."""
+    fg = foreground.convert("RGBA")
+    fitted, transformations = _fit_plate(plate.convert("RGBA"), fg.size)
+    if reconstruction is not None:
+        layer = reconstruction.convert("RGBA")
+        if layer.size != fg.size:
+            raise FidelityLockError(
+                f"reconstruction layer is {layer.size}, foreground is "
+                f"{fg.size}; paper is rendered on the product's frame"
+            )
+        overlap = _measure_reconstruction(fg, layer)[
+            "reconstruction_overlap_product_pixels"
+        ]
+        if overlap:
+            raise FidelityLockError(
+                f"reconstruction layer places paper on {overlap} "
+                "pixels the foreground occupies; paper may only fill "
+                "where the cut is empty (decision 93)"
+            )
+        fitted = Image.alpha_composite(fitted, layer)
+    fix = apply_edge_fix(source, fg, fitted, thin)
+    out = Image.alpha_composite(fix.plate, fix.foreground)
+    # alpha_composite drops the foreground's ICC profile; the composite
+    # must carry the product's colour profile, not the plate's silence.
+    carry_color_profile(fg, out)
+    return out, _measure(fg, out), transformations, fix.report.to_json()
 
 
 # The mask scale methods cut_out can record (segmentation.MASK_SCALE_*;
@@ -628,9 +1015,36 @@ def draw_product(
         "stage_spec": None,
     }
 
-    composite, _in_memory_counts, transformations = composite_images(
-        foreground, plate, layer_image
-    )
+    # Edge fix (docs/EDGE-FIX.md) for source-derived plates only;
+    # every other draw keeps its exact composite. The source photo
+    # comes from the layer's own lineage; the thin-structure flag
+    # from the subject geometry of the foreground.
+    edge_fix_record: dict | None = None
+    if edge_fix_applies_to(plate_kind):
+        if edge_fix_enabled():
+            from .staging import analyze_subject
+
+            source_image = store.read_image(HANDLE_PREFIX + source_record.asset_id)
+            thin = analyze_subject(foreground).thin
+            (
+                composite,
+                _in_memory_counts,
+                transformations,
+                edge_fix_record,
+            ) = composite_images_with_edge_fix(
+                foreground, plate, source_image, thin, layer_image
+            )
+        else:
+            composite, _in_memory_counts, transformations = composite_images(
+                foreground, plate, layer_image
+            )
+            edge_fix_record = EdgeFixReport.skipped(
+                f"disabled by {EDGE_FIX_ENV}"
+            ).to_json()
+    else:
+        composite, _in_memory_counts, transformations = composite_images(
+            foreground, plate, layer_image
+        )
     if _in_memory_counts["opaque_pixels"] == 0:
         # Draw and verify share one contract (badass Gauntlet defect
         # 4): the verifier refuses a receipt covering zero opaque
@@ -801,6 +1215,11 @@ def draw_product(
             "separately, and is not product evidence."
         ),
     }
+    if edge_fix_record is not None:
+        # Additive record (never graded): what the edge fix drew
+        # around the product. The counts above are over the stored
+        # layer's pixel set, unchanged by it.
+        receipt["edge_fix"] = edge_fix_record
     receipt["reconstruction"] = reconstruction_block
     from .plate_quality import VERSION as PLATE_QUALITY_VERSION
     from .cut_quality import VERSION as CUT_QUALITY_VERSION
@@ -1052,7 +1471,14 @@ _RECEIPT_FIELDS_V4 = {
     ),
     "scene_prompt": lambda v: isinstance(v, str),
     "plate_kind": lambda v: (
-        v in ("model_generated", "code_rendered", "local_placeholder")
+        v
+        in (
+            "model_generated",
+            "code_rendered",
+            "local_placeholder",
+            "source_edit",
+            "source_blur",
+        )
     ),
     "plate_asset": lambda v: v is None or _is_handle(v),
     "plate_sha256": _is_hash_or_none,
