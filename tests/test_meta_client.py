@@ -327,3 +327,93 @@ def test_mirror_naming_the_cumulative_ledger_is_written_once(tmp_path, monkeypat
     meta_client.billed_call("draw", "muse-image-1.0", 0.01, lambda: {"images": 1})
     rows = _jsonl_rows(tmp_path / "ledger.jsonl")
     assert [r["phase"] for r in rows] == ["pending", "settled"]
+
+
+# ---------------------------------------------------------------------------
+# Fix pass F5: settle is cap-checked. A reservation is a projection and a
+# call can cost more than projected; an over-cap settle is recorded
+# truthfully (status over_cap, the overage in its note), billed_call
+# raises naming the breach, and the next reservation is refused. (Mirror
+# of the Rust build's settle_over_the_cap_is_recorded_and_fails_loudly
+# and settle_within_the_cap_excludes_its_own_reservation, JSONL store.)
+# ---------------------------------------------------------------------------
+
+
+def test_settle_over_the_cap_is_recorded_and_fails_loudly(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTHAND_TOTAL_SPEND_CAP_USD", "1.00")
+    mirror = tmp_path / "room" / "ledger.jsonl"
+    monkeypatch.setenv("AGENTHAND_LEDGER_PATH", str(mirror))
+
+    # 1000 in + 1,000,000 out on muse-spark-1.3:
+    # 1000 x $1.25/M + 1,000,000 x $4.25/M = $4.25125.
+    raised = None
+    try:
+        meta_client.billed_call(
+            "identify",
+            "muse-spark-1.3",
+            0.01,
+            lambda: {"input_tokens": 1000, "output_tokens": 1_000_000},
+        )
+    except ledger.SpendCapExceeded as exc:
+        raised = exc
+    assert raised is not None, "a $4.25125 settle under a $1.00 cap returned normally"
+    message = str(raised)
+    assert message.startswith("SPEND CAP EXCEEDED at settle:"), message
+    assert "4.251250" in message and "over the $1.00 cap" in message, message
+    assert isinstance(raised, ledger.SpendCapExceededAtSettle)
+    assert raised.actual_usd == pytest.approx(4.25125)
+    assert raised.overage_usd == pytest.approx(3.25125)
+
+    # The settle row is present, truthful, and marked over_cap, in the
+    # cumulative ledger and its mirror alike.
+    cumulative = config.get_cumulative_ledger_path()
+    rows = _jsonl_rows(cumulative)
+    assert [r["phase"] for r in rows] == ["pending", "settled"]
+    settled = rows[1]
+    assert settled["status"] == ledger.STATUS_OVER_CAP == "over_cap"
+    assert settled["usd_estimate"] == pytest.approx(4.25125)
+    assert "3.251250 over the $1.00 cap" in settled["note"], settled["note"]
+    assert _jsonl_rows(mirror) == rows
+    assert ledger.ledger_total_usd(cumulative) == pytest.approx(4.25125)
+
+    # Every later reservation is refused, before its call runs.
+    ran = []
+
+    def next_call():
+        ran.append(True)
+        return {"images": 1}
+
+    with pytest.raises(ledger.SpendCapExceeded, match="Spend cap"):
+        meta_client.billed_call("cut_out", "sam-3.1", 0.0025, next_call)
+    assert ran == []
+
+
+def test_settle_within_the_cap_excludes_its_own_reservation(monkeypatch):
+    # $0.50 open elsewhere + a $0.40 call settling at $0.45 stays under
+    # $1.00 and settles cleanly: the call's own reservation is not
+    # counted twice.
+    monkeypatch.setenv("AGENTHAND_TOTAL_SPEND_CAP_USD", "1.00")
+
+    def boom():
+        raise RuntimeError("simulated failure")
+
+    with pytest.raises(RuntimeError):
+        meta_client.billed_call("draw", "muse-image-1.0", 0.50, boom)
+    ok = meta_client.billed_call("draw", "muse-image-1.0", 0.40, lambda: {"images": 45})
+    assert ok["actual_usd"] == pytest.approx(0.45)
+    rows = _records()
+    assert rows[-1]["phase"] == "settled" and rows[-1]["status"] == "ok"
+    assert ledger.ledger_total_usd(config.get_ledger_path()) == pytest.approx(0.95)
+
+
+def test_apply_settle_cap_matches_the_rust_wording():
+    receipt = ledger.Receipt(tool="draw", model="muse-image-1.0", usd_estimate=0.5, note="n")
+    assert ledger.apply_settle_cap(receipt, 0.5, 1.0) is None  # landing on the cap is allowed
+    assert receipt.status == "ok" and receipt.note == "n"
+    over = ledger.apply_settle_cap(receipt, 0.75, 1.0)
+    assert over == ledger.SettleOverage(total_usd=1.25, overage_usd=0.25, cap_usd=1.0)
+    assert receipt.status == "over_cap"
+    assert receipt.note == (
+        "n; over_cap: settled $0.500000 brought the ledger to $1.250000, "
+        "$0.250000 over the $1.00 cap"
+    )

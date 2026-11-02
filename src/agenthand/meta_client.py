@@ -47,6 +47,15 @@ room runner's <room>/ledger.jsonl), each row is ALSO appended to that
 JSONL file, so a room's own spend stays readable from its directory
 without the room ever owning the cap. A mirror that names the
 cumulative ledger itself is not written twice.
+
+Settle is capped too (fix pass F5): at settle, the ledger total
+WITHOUT this call's own rows (every other settled actual plus every
+other open reservation) plus the actual cost is checked against the
+cap, under the same file lock. Over the cap, the settle is still
+recorded truthfully (status "over_cap", the overage in its note, the
+mirror gets the same row), billed_call raises
+ledger.SpendCapExceededAtSettle naming the breach, and every later
+reservation is refused because the ledger total exceeds the cap.
 """
 
 from __future__ import annotations
@@ -134,9 +143,12 @@ def billed_call(
     the usage fn reported.
 
     Raises ledger.SpendCapExceeded if the reservation would exceed the
-    cap, pricing.UnknownModelError for an unpriced model, and whatever fn
-    raises (with the reservation left counted for unknown failures; completed
-    SAM cut failures settle their observed image count before re-raising).
+    cap, ledger.SpendCapExceededAtSettle (a SpendCapExceeded) when the
+    call ran but its actual cost pushed the ledger over the cap (the
+    settle is recorded first, status over_cap), pricing.UnknownModelError
+    for an unpriced model, and whatever fn raises (with the reservation
+    left counted for unknown failures; completed SAM cut failures settle
+    their observed image count before re-raising).
     """
     if model is not None and not pricing.is_known_model(model):
         raise pricing.UnknownModelError(
@@ -212,7 +224,8 @@ def billed_call(
         )
         settle_note = f"{note} | {suffix}" if note else suffix
 
-    # Settle: append the actual, with the usage counts stored on the receipt.
+    # Settle: append the actual, with the usage counts stored on the
+    # receipt, cap-checked (fix pass F5) under the same lock.
     with _lock_file(ledger_path.parent) as lock_fh:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
         settled = ledger.Receipt(
@@ -228,6 +241,8 @@ def billed_call(
             call_id=call_id,
             note=settle_note,
         )
+        others = ledger.ledger_total_excluding_call_usd(ledger_path, call_id)
+        overage = ledger.apply_settle_cap(settled, others, cap_usd)
         ledger.append_receipt(ledger_path, settled)
         if mirror_path is not None:
             ledger.append_receipt(mirror_path, settled)
@@ -235,6 +250,25 @@ def billed_call(
     if cut_failure is not None:
         cut_failure.cost_counted_usd = actual_usd
         cut_failure.call_id = call_id
+    if overage is not None:
+        breach = ledger.SpendCapExceededAtSettle(
+            f"SPEND CAP EXCEEDED at settle: {tool} call {call_id} reserved "
+            f"${float(projected_usd):.6f} but actually cost ${actual_usd:.6f}, "
+            f"bringing the ledger to ${overage.total_usd:.6f}, "
+            f"${overage.overage_usd:.6f} over the ${overage.cap_usd:.2f} cap. "
+            f'The settle is recorded truthfully with status "{ledger.STATUS_OVER_CAP}"; '
+            "every further billable call will be refused until the cap is raised.",
+            call_id=call_id,
+            projected_usd=float(projected_usd),
+            actual_usd=actual_usd,
+            total_usd=overage.total_usd,
+            overage_usd=overage.overage_usd,
+            cap_usd=overage.cap_usd,
+        )
+        # The breach is the louder failure: it outranks a decoded cut
+        # failure, which rides along as the cause.
+        raise breach from cut_failure
+    if cut_failure is not None:
         raise cut_failure
 
     return {

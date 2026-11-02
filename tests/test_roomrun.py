@@ -1729,3 +1729,30 @@ def test_room_runs_share_one_spend_cap(tmp_path, monkeypatch):
     assert ledger.ledger_total_usd(cumulative) == pytest.approx(heavy_usd)
     assert _ledger_rows(tmp_path / "run1" / "ledger.jsonl") == _ledger_rows(cumulative)
     assert _ledger_rows(tmp_path / "run2" / "ledger.jsonl") == []
+
+
+def test_narration_settle_over_the_cap_is_a_billing_failure_row(tmp_path, monkeypatch):
+    """Fix pass F5: a narration whose actual cost pushes the ledger over
+    the cap (reserved ~$0.0705, settled $0.085 under a $0.08 cap) is
+    recorded truthfully and reported as NARRATION_BILLING_FAILED."""
+
+    class _OverNarration(FakeNarration):
+        def __call__(self, audio_path: Path) -> dict:
+            result = super().__call__(audio_path)
+            result["usage"] = {"prompt_tokens": 0, "completion_tokens": 20_000}
+            return result
+
+    monkeypatch.setenv("AGENTHAND_TOTAL_SPEND_CAP_USD", "0.08")
+    audio = _wav_file(tmp_path / "walk.wav")
+    narration = _OverNarration(_NARRATION_REPLY)
+    manifest, _ = _narration_room(tmp_path, "out", narration, audio=audio)
+    record = manifest["narration"]["files"][0]
+    assert record["error"] is not None, "a $0.085 settle under a $0.08 cap passed"
+    assert record["error"]["code"] == "NARRATION_BILLING_FAILED", record["error"]
+    assert record["error"]["message"].startswith("SPEND CAP EXCEEDED at settle:")
+    assert len(narration.calls) == 1  # the call ran; its cost is counted
+    rows = _ledger_rows(config.get_cumulative_ledger_path())
+    assert [r["phase"] for r in rows] == ["pending", "settled"]
+    assert rows[1]["status"] == "over_cap"
+    assert rows[1]["usd_estimate"] == pytest.approx(20_000 * 4.25e-6)
+    assert _ledger_rows(tmp_path / "out" / "ledger.jsonl") == rows

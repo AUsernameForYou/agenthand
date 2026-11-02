@@ -15,6 +15,15 @@ ledger_total_usd therefore counts, per call_id, the settled actual when a
 settlement exists and the pending projection otherwise. Receipts without a
 call_id (phase "final") count at face value.
 
+Settle is capped too (fix pass F5): a reservation is a projection, and
+a call can cost more than projected. At settle, billed_call recomputes
+everything else in the ledger (settled actuals plus other open
+reservations, excluding the call's own rows) plus the call's actual
+cost. Over the cap, the settle is STILL recorded truthfully, with
+status "over_cap" and the overage in its note, billed_call raises
+SpendCapExceededAtSettle naming the breach, and every later
+reservation is refused because the ledger total exceeds the cap.
+
 Fail-closed means exactly that: a missing ledger reads as $0.00 (nothing
 has been spent yet), but a ledger line that cannot be parsed, or whose
 amount is negative or non-finite, raises. When spend state is unknown or
@@ -46,10 +55,52 @@ PHASE_FINAL = "final"      # one-shot receipt; counts at face value
 PHASE_PENDING = "pending"  # reservation written before a billable call
 PHASE_SETTLED = "settled"  # actual cost written after the call returns
 
+# Receipt status of a settle whose actual cost pushed the ledger over
+# the spend cap (fix pass F5). The amount is recorded truthfully and
+# counts like any other settle; the status (and the overage in the
+# note) makes the breach visible in the ledger itself.
+STATUS_OVER_CAP = "over_cap"
+
 
 class SpendCapExceeded(RuntimeError):
     """Raised when a billable call would push total spend past the cap,
     or when spend state is invalid and no call may proceed."""
+
+
+class SpendCapExceededAtSettle(SpendCapExceeded):
+    """Raised AFTER a call ran, when its actual cost pushed the ledger
+    over the cap (fix pass F5). The settle is already recorded
+    (status over_cap); the call happened and its cost is counted.
+    Every later reservation is refused."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        call_id: str,
+        projected_usd: float,
+        actual_usd: float,
+        total_usd: float,
+        overage_usd: float,
+        cap_usd: float,
+    ):
+        super().__init__(message)
+        self.call_id = call_id
+        self.projected_usd = projected_usd
+        self.actual_usd = actual_usd
+        self.total_usd = total_usd
+        self.overage_usd = overage_usd
+        self.cap_usd = cap_usd
+
+
+@dataclass(frozen=True)
+class SettleOverage:
+    """A settle-time cap breach: the ledger total after the settle, how
+    far over the cap that is, and the cap."""
+
+    total_usd: float
+    overage_usd: float
+    cap_usd: float
 
 
 @dataclass
@@ -111,6 +162,16 @@ def ledger_total_usd(ledger_path: Path) -> float:
     Per call_id, a settled receipt supersedes its pending reservation;
     an unsettled reservation counts at its projected cost.
     """
+    return _ledger_total(ledger_path, None)
+
+
+def ledger_total_excluding_call_usd(ledger_path: Path, call_id: str) -> float:
+    """The counted ledger total with every row of `call_id` left out:
+    the settle-time cap check's "everything else" (fix pass F5)."""
+    return _ledger_total(ledger_path, call_id)
+
+
+def _ledger_total(ledger_path: Path, exclude_call: str | None) -> float:
     if not ledger_path.exists():
         return 0.0
     standalone = 0.0
@@ -137,6 +198,8 @@ def ledger_total_usd(ledger_path: Path) -> float:
             amount = _validate_amount(record["usd_estimate"], where)
             call_id = record.get("call_id")
             phase = record.get("phase", PHASE_FINAL)
+            if exclude_call is not None and call_id == exclude_call:
+                continue
             if call_id and phase == PHASE_SETTLED:
                 calls[call_id] = amount
                 settled.add(call_id)
@@ -146,6 +209,37 @@ def ledger_total_usd(ledger_path: Path) -> float:
             else:
                 standalone += amount
     return round(standalone + sum(calls.values()), 6)
+
+
+def _round6_half_away(x: float) -> float:
+    """Round to the micro-dollar the way the Rust build does
+    ((x * 1e6).round() / 1e6, ties away from zero), so both builds
+    compute the same over_cap totals and notes."""
+    v = x * 1e6
+    f = math.floor(abs(v))
+    r = f + 1.0 if abs(v) - f >= 0.5 else f
+    return math.copysign(r, v) / 1e6
+
+
+def apply_settle_cap(receipt: Receipt, others_usd: float, cap_usd: float) -> SettleOverage | None:
+    """The settle-time cap check (fix pass F5): `others_usd` is the
+    ledger total EXCLUDING this call's own rows (every other settled
+    actual plus every other open reservation). When others + actual
+    exceeds the cap, the receipt is marked over_cap with the overage
+    in its note, and the breach returned; the caller still records the
+    receipt (truthfully) and then fails. Same rule and wording as the
+    Rust build's ledger::apply_settle_cap."""
+    total = _round6_half_away(others_usd + receipt.usd_estimate)
+    if total <= cap_usd:
+        return None
+    overage = _round6_half_away(total - cap_usd)
+    flag = (
+        f"over_cap: settled ${receipt.usd_estimate:.6f} brought the ledger to "
+        f"${total:.6f}, ${overage:.6f} over the ${cap_usd:.2f} cap"
+    )
+    receipt.status = STATUS_OVER_CAP
+    receipt.note = f"{receipt.note}; {flag}" if receipt.note else flag
+    return SettleOverage(total_usd=total, overage_usd=overage, cap_usd=cap_usd)
 
 
 def check_spend_cap(ledger_path: Path, projected_usd: float, cap_usd: float) -> float:
