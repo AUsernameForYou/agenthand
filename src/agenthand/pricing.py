@@ -27,6 +27,19 @@ PRICING_TABLE_VERSION = "2026-10-26.2"
 TOKEN_PRICES_USD_PER_1M: dict[str, dict[str, float]] = {
     "muse-spark-1.3": {"input": 1.25, "output": 4.25, "cached_input": 0.15},
     "muse-wonder-1.0": {"input": 4.00, "output": 20.00, "cached_input": 0.20},
+    # Baseten Spark Open, the narration model (roomrun.NARRATION_MODEL):
+    # the published $1.25/M in, $4.25/M out that
+    # roomrun.narration_cost_usd and the narration projection already
+    # price at. Baseten reports no cached tokens; any that ever appear
+    # are priced as fresh input (no discount assumed), so the ledger
+    # never under-counts. Added in fix pass F3 so narration can run
+    # inside meta_client.billed_call; no existing rate changed, so the
+    # table version (shared with the Rust build) is unchanged.
+    "meta-models/muse-spark-open-1026": {
+        "input": 1.25,
+        "output": 4.25,
+        "cached_input": 1.25,
+    },
 }
 
 # USD per generated image.

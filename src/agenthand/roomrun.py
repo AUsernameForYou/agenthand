@@ -127,13 +127,17 @@ Honesty notes (v1 limits, stated rather than smoothed over):
 
 Spend discipline: every Meta model call goes through the shipped
 tools, so every Meta dollar flows through meta_client.billed_call
-under its fail-closed cap. The ONE exception is the narration call,
-which is not a Meta API call: it runs on Baseten's Muse Spark Open
-deployment and draws on the $100 Baseten partner credit pool, a pool
-separate from the Meta ledger. Its usage and estimated cost are
-recorded in the manifest's narration section, never in the room
-total, and a per-call projection cap refuses an absurd call before
-it is made. Room
+under its fail-closed cap. The narration call is not a Meta API
+call: it runs on Baseten's Muse Spark Open deployment and draws on
+the $100 Baseten partner credit pool. Since fix pass F3 it runs
+inside meta_client.billed_call too (tool NARRATION_TOOL, model
+NARRATION_MODEL, priced in pricing.py at the published rates), so
+it reserves its worst-case projection against the spend cap before
+the call and leaves pending + settled ledger rows like every other
+billable call. Its usage and estimated cost are still recorded in
+the manifest's narration section, never in the room total (the
+room's spend baseline is taken after narration), and a per-call
+projection cap refuses an absurd call before it is made. Room
 runs keep their OWN ledger (default: ledger.jsonl inside the output
 dir; --ledger overrides): during a run, AGENTHAND_LEDGER_PATH points
 at the room ledger so every receipt the run causes lands there, and
@@ -567,11 +571,16 @@ def sample_video_frames(
 # proven by the 2026-10-28 voice spike): the audio rides as an
 # audio_url content part carrying a base64 data: URL, and the reply
 # carries the verbatim transcript plus the SELLING / MENTIONED item
-# split. Baseten spend lives in the $100 partner pool, entirely
-# outside the Meta ledger; the manifest records it separately.
+# split. Baseten spend draws on the $100 partner pool. Since fix pass
+# F3 each call runs inside meta_client.billed_call (tool
+# NARRATION_TOOL), so the spend cap sees it and the ledger holds its
+# pending + settled rows; the manifest still records it separately
+# from the room's Meta total.
 # ---------------------------------------------------------------------------
 
 NARRATION_MODEL = "meta-models/muse-spark-open-1026"
+# Ledger tool name for narration receipts (fix pass F3).
+NARRATION_TOOL = "narration"
 NARRATION_BASE_URL = "https://inference.baseten.co/v1"
 # Spark Open always reasons before it answers, and the reasoning grows
 # with the clip. The voice spike showed a 1024-token cap fully consumed
@@ -767,6 +776,39 @@ def narration_cost_usd(usage: dict | None) -> float | None:
         prompt * NARRATION_INPUT_USD_PER_TOKEN
         + completion * NARRATION_OUTPUT_USD_PER_TOKEN
     )
+
+
+def _usage_count(usage: dict | None, key: str) -> int:
+    value = (usage or {}).get(key) if isinstance(usage, dict) else None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return 0
+    if not math.isfinite(value) or value <= 0:
+        return 0
+    return int(round(value))
+
+
+def narration_billing_usage(usage: dict | None, duration_s: float) -> dict:
+    """The token usage a narration call settles at in the ledger.
+
+    The provider's reported prompt / completion tokens, or, when the
+    reply reports none, the worst-case projection's own token counts
+    (audio at NARRATION_AUDIO_TOKENS_PER_SECOND plus the prompt
+    allowance, the full cap per planned piece). An unreported call
+    therefore settles at its projected cost, never at $0: money that
+    may have been spent is counted as spent. Fix pass F3; the same
+    rule as the Rust build's narration_billing_usage.
+    """
+    prompt = _usage_count(usage, "prompt_tokens")
+    completion = _usage_count(usage, "completion_tokens")
+    if prompt == 0 and completion == 0:
+        pieces = len(plan_narration_chunks(duration_s))
+        return {
+            "input_tokens": math.ceil(
+                duration_s * NARRATION_AUDIO_TOKENS_PER_SECOND + NARRATION_PROMPT_TOKENS
+            ),
+            "output_tokens": pieces * NARRATION_MAX_TOKENS,
+        }
+    return {"input_tokens": prompt, "output_tokens": completion}
 
 
 # -- narration audio prep (token saver, 2026-10-31) -----------------------
@@ -1270,14 +1312,55 @@ def _narrate_one(
     send_path, prepared_s = prepare_narration_audio(wav_path)
     if prepared_s is not None:
         record["prepared_duration_s"] = round(prepared_s, 2)
-    try:
+    # Billing (fix pass F3): the Baseten call runs inside
+    # meta_client.billed_call, like every Meta call. The worst-case
+    # projection is reserved against the spend cap BEFORE the call (a
+    # pending ledger row, or a refusal with no call made) and the
+    # reported usage settles it after (a settled row). A failed call
+    # leaves its reservation counted. The record's own fields are
+    # unchanged: cost_usd_estimate is still priced from the usage.
+    from . import meta_client
+
+    outcome: dict = {}
+
+    def _call() -> dict:
+        outcome["started"] = True
         result = narration_fn(send_path)
+        outcome["result"] = result
+        return narration_billing_usage(result.get("usage"), duration_s)
+
+    try:
+        meta_client.billed_call(
+            NARRATION_TOOL,
+            NARRATION_MODEL,
+            projected,
+            _call,
+            note=f"narration of {source_path.name}",
+        )
     except Exception as exc:  # noqa: BLE001 — the call boundary, as elsewhere here
-        record["error"] = {
-            "code": "NARRATION_FAILED",
-            "message": f"{type(exc).__name__}: {exc}",
-        }
+        if "result" in outcome:
+            # The call ran but its settle failed (for example, the
+            # actual cost pushed the ledger over the cap).
+            record["error"] = {"code": "NARRATION_BILLING_FAILED", "message": str(exc)}
+        elif outcome.get("started"):
+            record["error"] = {
+                "code": "NARRATION_FAILED",
+                "message": f"{type(exc).__name__}: {exc}",
+            }
+        else:
+            # Refused before the call ran: the spend cap cannot cover
+            # the projection (or the ledger state is unusable).
+            code = (
+                "SPEND_CAP_REFUSED"
+                if str(exc).startswith("Spend cap")
+                else "NARRATION_BILLING_FAILED"
+            )
+            record["error"] = {
+                "code": code,
+                "message": f"the narration was refused before any call was made: {exc}",
+            }
         return record
+    result = outcome["result"]
     parsed = parse_narration_reply(result.get("reply") or "")
     record["transcript"] = parsed["transcript"]
     record["named_items"] = parsed["selling"]
@@ -2948,9 +3031,11 @@ def run_room(
     extracted and measured; the call's projection is refused above
     narration_max_projected_usd. Selling items from the transcript
     join the work list as named items; mentioned items join flagged,
-    for the visual pipeline to confirm or refute. Narration spend is
-    Baseten-pool only and lands in the manifest's narration section,
-    never in total_cost_usd (the Meta ledger delta).
+    for the visual pipeline to confirm or refute. Narration is
+    billed through meta_client.billed_call (reserved against the spend
+    cap, pending + settled ledger rows; fix pass F3) and lands in the
+    manifest's narration section, never in total_cost_usd: the room's
+    spend baseline is taken after narration.
 
     stage_mode: "scene" (default) stages through the model draw
     chain; "wallpaper" / "studio_gray" stage on code-rendered
@@ -3046,8 +3131,6 @@ def _run_room_body(
         def spend_probe() -> float:  # noqa: F811 — closure default
             return ledger.ledger_total_usd(room_ledger)
 
-    spend_before = spend_probe()
-
     # -- sources ------------------------------------------------------------
     sources: list[PhotoSource] = []
     video_notes: list[dict] = []
@@ -3122,6 +3205,12 @@ def _run_room_body(
                 + "\n",
                 encoding="utf-8",
             )
+
+    # The room's Meta spend baseline, measured AFTER narration: the
+    # Baseten narration calls are billed through the ledger (fix pass
+    # F3, so the spend cap sees them) but stay out of the room's Meta
+    # total and run budget, exactly as before.
+    spend_before = spend_probe()
 
     # -- worst-case projection gate -----------------------------------------
     from . import meta_client

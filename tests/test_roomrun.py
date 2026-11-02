@@ -1539,3 +1539,148 @@ def test_narrated_run_with_keep_item_issues_ownership_record(tmp_path):
     assert "brass lamp" in sheet
     assert "data:image/png;base64," in sheet
     assert entry["receipt_sha256"] in sheet
+
+
+# ---------------------------------------------------------------------------
+# Narration billing (fix pass F3; mirror of the Rust build's tests): the
+# Baseten narration call runs inside meta_client.billed_call — a pending
+# row before the call, a settled row after, and a refusal (no call made)
+# when the spend cap cannot cover the projection. The room's Meta total
+# still excludes narration.
+# ---------------------------------------------------------------------------
+
+
+def _ledger_rows(path: Path) -> list[dict]:
+    import json
+
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+class _NoUsageNarration(FakeNarration):
+    """A narration reply that reports no usage at all."""
+
+    def __call__(self, audio_path: Path) -> dict:
+        result = super().__call__(audio_path)
+        result["usage"] = {}
+        return result
+
+
+def _narration_room(tmp_path, out_name, narration, *, audio):
+    store = AssetStore(tmp_path)
+    photos = [_photo(tmp_path, "purifier.jpg")]
+    fake = FakeChain(
+        store,
+        plans=[_plan("air purifier")],
+        contents={(0, "filter"): "filter1"},
+    )
+    manifest = roomrun.run_room(
+        photos,
+        [],
+        tmp_path / out_name,
+        store=fake.store,
+        chain=fake.chain(),
+        verify_fn=_verify_ok,
+        budget_usd=5.00,
+        narration_fn=narration,
+        narrated_audios=[audio],
+        # no spend_probe: the room ledger's own delta is the total
+    )
+    return manifest, fake
+
+
+def test_narration_is_billed_through_the_ledger_and_refused_over_the_cap(
+    tmp_path, monkeypatch
+):
+    audio = _wav_file(tmp_path / "walk.wav")
+    monkeypatch.delenv("AGENTHAND_TOTAL_SPEND_CAP_USD", raising=False)
+
+    # Under the cap: one pending + one settled narration row, same call.
+    narration = FakeNarration(_NARRATION_REPLY)
+    manifest, fake = _narration_room(tmp_path, "out1", narration, audio=audio)
+    record = manifest["narration"]["files"][0]
+    assert record["error"] is None, record["error"]
+    rows = [
+        r for r in _ledger_rows(tmp_path / "out1" / "ledger.jsonl")
+        if r["tool"] == "narration"
+    ]
+    assert len(rows) == 2, f"pending + settled narration rows, got {rows}"
+    assert [r["phase"] for r in rows] == ["pending", "settled"]
+    assert rows[0]["call_id"] == rows[1]["call_id"]
+    assert rows[1]["model"] == roomrun.NARRATION_MODEL
+    # The reservation is the worst-case projection (the record shows it
+    # rounded to the micro-dollar).
+    assert rows[0]["usd_estimate"] == pytest.approx(
+        record["projected_cost_usd"], abs=1e-6
+    )
+    assert rows[1]["input_tokens"] == 1000
+    assert rows[1]["output_tokens"] == 500
+    actual = 1000 * 1.25e-6 + 500 * 4.25e-6
+    assert rows[1]["usd_estimate"] == pytest.approx(actual)
+    # The record's fields are unchanged, and the room's Meta total
+    # still excludes the narration spend (the fake chain bills nothing
+    # to the ledger, so the room ledger's delta is $0 even though it
+    # now holds the narration rows).
+    assert record["cost_usd_estimate"] == pytest.approx(actual)
+    assert manifest["total_cost_usd"] == 0.0
+    assert manifest["baseten_cost_usd_estimate"] == pytest.approx(actual)
+
+    # Over the cap: refused before the Baseten call is made.
+    monkeypatch.setenv("AGENTHAND_TOTAL_SPEND_CAP_USD", "0.0001")
+    narration = FakeNarration(_NARRATION_REPLY)
+    manifest, _ = _narration_room(tmp_path, "out2", narration, audio=audio)
+    record = manifest["narration"]["files"][0]
+    assert record["error"]["code"] == "SPEND_CAP_REFUSED", record
+    assert "Spend cap" in record["error"]["message"]
+    assert narration.calls == [], "no Baseten call over the cap"
+    assert all(
+        r["tool"] != "narration"
+        for r in _ledger_rows(tmp_path / "out2" / "ledger.jsonl")
+    )
+
+
+def test_unreported_narration_usage_settles_at_the_projection(tmp_path):
+    from agenthand import pricing
+
+    usage = roomrun.narration_billing_usage(None, 1.0)
+    assert usage == {"input_tokens": 662, "output_tokens": roomrun.NARRATION_MAX_TOKENS}
+    billed = pricing.estimate_cost_usd(roomrun.NARRATION_MODEL, **usage)
+    assert billed == pytest.approx(roomrun.project_narration_cost_usd(1.0), abs=1e-6)
+    assert roomrun.narration_billing_usage(
+        {"prompt_tokens": 1000, "completion_tokens": 500}, 1.0
+    ) == {"input_tokens": 1000, "output_tokens": 500}
+    assert roomrun.narration_billing_usage({}, 1.0) == usage
+
+    # End to end: a reply with no usage settles at the projection, not $0.
+    audio = _wav_file(tmp_path / "walk.wav")
+    manifest, _ = _narration_room(
+        tmp_path, "out", _NoUsageNarration(_NARRATION_REPLY), audio=audio
+    )
+    record = manifest["narration"]["files"][0]
+    assert record["error"] is None
+    rows = [
+        r for r in _ledger_rows(tmp_path / "out" / "ledger.jsonl")
+        if r["tool"] == "narration"
+    ]
+    assert [r["phase"] for r in rows] == ["pending", "settled"]
+    assert rows[1]["input_tokens"] == 662
+    assert rows[1]["output_tokens"] == roomrun.NARRATION_MAX_TOKENS
+    assert rows[1]["usd_estimate"] == pytest.approx(record["projected_cost_usd"], abs=1e-6)
+    assert ledger.ledger_total_usd(tmp_path / "out" / "ledger.jsonl") > 0.0
+
+
+def test_failed_narration_keeps_its_reservation_counted(tmp_path):
+    audio = _wav_file(tmp_path / "walk.wav")
+    narration = FakeNarration(error=RuntimeError("baseten is down"))
+    manifest, _ = _narration_room(tmp_path, "out", narration, audio=audio)
+    record = manifest["narration"]["files"][0]
+    assert record["error"]["code"] == "NARRATION_FAILED"
+    assert "baseten is down" in record["error"]["message"]
+    rows = [
+        r for r in _ledger_rows(tmp_path / "out" / "ledger.jsonl")
+        if r["tool"] == "narration"
+    ]
+    # The call may have billed: its reservation stays counted.
+    assert [r["phase"] for r in rows] == ["pending"]
+    assert rows[0]["usd_estimate"] == pytest.approx(record["projected_cost_usd"], abs=1e-6)
