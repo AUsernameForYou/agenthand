@@ -164,3 +164,97 @@ def test_completed_cut_failure_settles_three_images_from_eight_image_reservation
     assert [r["phase"] for r in rows] == ["pending", "settled"]
     assert rows[-1]["images"] == 3 and rows[-1]["status"] == "error"
     assert ledger.ledger_total_usd(config.get_ledger_path()) == 0.0075
+
+
+# ---------------------------------------------------------------------------
+# Fix pass F0: the Meta HTTP client's timeout. The openai SDK default
+# (600 s read, 5 s connect) is replaced by 180 s per call and 20 s to
+# connect, the Rust build's values; AGENTHAND_HTTP_TIMEOUT_S (whole
+# seconds, > 0) overrides the per-call value. Loopback only: no test
+# here leaves the machine.
+# ---------------------------------------------------------------------------
+
+
+def _slow_server(delay_s: float) -> str:
+    """A loopback HTTP server that accepts one connection, reads the
+    request, and answers 200 only after `delay_s`."""
+    import socket
+    import time
+
+    srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(1)
+    port = srv.getsockname()[1]
+
+    def serve():
+        try:
+            conn, _ = srv.accept()
+            with conn:
+                conn.recv(65536)
+                time.sleep(delay_s)
+                body = b'{"object":"list","data":[]}'
+                conn.sendall(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\n".encode()
+                    + b"Connection: close\r\n\r\n"
+                    + body
+                )
+        except OSError:
+            pass
+        finally:
+            srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return f"http://127.0.0.1:{port}/v1"
+
+
+def test_build_client_honours_the_env_timeout(monkeypatch):
+    import time
+
+    import openai
+
+    for var in ("HTTP_PROXY", "http_proxy", "ALL_PROXY", "all_proxy"):
+        monkeypatch.delenv(var, raising=False)
+    monkeypatch.setenv("META_API_KEY", "test-key-loopback-only")
+    monkeypatch.setenv("AGENTHAND_HTTP_TIMEOUT_S", "1")
+    client = meta_client.build_client()
+
+    # A 1 s override must cut off a response that takes 4 s.
+    url = _slow_server(4.0)
+    started = time.monotonic()
+    try:
+        response = client.with_options(base_url=url).models.list()
+    except openai.APITimeoutError:
+        response = None
+    elapsed = time.monotonic() - started
+    assert response is None, (
+        f"a 1 s timeout must cut off a 4 s response; got {response!r} "
+        f"after {elapsed:.1f} s"
+    )
+    assert elapsed < 3.0, f"took {elapsed:.1f} s"
+
+    assert client.timeout.read == 1.0
+    assert client.timeout.connect == meta_client.HTTP_CONNECT_TIMEOUT_S == 20
+    monkeypatch.setenv("AGENTHAND_HTTP_TIMEOUT_S", "7")
+    assert meta_client.build_client().timeout.read == 7.0
+    monkeypatch.delenv("AGENTHAND_HTTP_TIMEOUT_S")
+    default = meta_client.build_client().timeout
+    assert (default.connect, default.read, default.write, default.pool) == (
+        20.0,
+        180.0,
+        180.0,
+        180.0,
+    )
+
+
+def test_timeout_defaults_to_180_seconds():
+    assert meta_client.DEFAULT_HTTP_TIMEOUT_S == 180
+    assert meta_client.HTTP_TIMEOUT_ENV == "AGENTHAND_HTTP_TIMEOUT_S"
+    # Unset, empty, unparseable, fractional, zero and negative values
+    # keep the default; a positive whole number of seconds wins
+    # (surrounding whitespace allowed), matching the Rust parser.
+    for raw in (None, "", "   ", "abc", "1.5", "0", "-5", "1_000", "99999999999999999999999"):
+        assert meta_client.http_timeout_from(raw) == 180, raw
+    assert meta_client.http_timeout_from("1") == 1
+    assert meta_client.http_timeout_from(" 42 ") == 42
+    assert meta_client.http_timeout_from("+7") == 7

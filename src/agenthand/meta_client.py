@@ -23,6 +23,18 @@ The live Meta client below IS constructed with SDK retries disabled
 the gate's back. Every attempt, including our own explicit repair
 attempt, passes through billed_call so it is reserved and counted.
 
+Timeouts (fix pass F0, Rust parity): every Meta call runs under a
+per-call timeout of DEFAULT_HTTP_TIMEOUT_S (180 s) and a connect
+timeout of HTTP_CONNECT_TIMEOUT_S (20 s), replacing the openai SDK
+default (600 s read, 5 s connect). AGENTHAND_HTTP_TIMEOUT_S (a whole
+number of seconds, > 0) overrides the per-call timeout; an empty,
+unparseable or zero value keeps the 180 s default. The value is read
+when the client is built (build_client). The SDK's timeout is per
+phase (read, write, pool), not one whole-request deadline as in the
+Rust build; for these non-streaming calls the provider sends nothing
+until its reply is ready, so the 180 s read bound caps the provider's
+think time the same way.
+
 The key check happens BEFORE billed_call is invoked: a call attempted
 with no META_API_KEY configured raises NotConfiguredError before any
 reservation is written, so a missing key can never leave phantom spend
@@ -216,6 +228,19 @@ def billed_call(
 
 META_BASE_URL = "https://api.meta.ai/v1"
 
+# Default per-call timeout for every Meta API request, in seconds (see
+# the module docstring; overridable via HTTP_TIMEOUT_ENV). A live
+# identify call measured 28.3 s, so a tight bound would cut off
+# healthy, already-billable calls.
+DEFAULT_HTTP_TIMEOUT_S = 180
+# Connect timeout for every Meta API request, in seconds.
+HTTP_CONNECT_TIMEOUT_S = 20
+# Environment variable that overrides DEFAULT_HTTP_TIMEOUT_S.
+HTTP_TIMEOUT_ENV = "AGENTHAND_HTTP_TIMEOUT_S"
+
+_HTTP_TIMEOUT_RE = re.compile(r"\+?[0-9]+")
+_U64_MAX = 2**64 - 1
+
 # Bounded output for the identify call: the structured result is a short
 # description, a few phrases, and listing copy. The bound is set
 # explicitly on every request because the reservation is priced from
@@ -295,19 +320,47 @@ def require_meta_api_key() -> str:
     return key
 
 
+def http_timeout_from(raw: str | None) -> int:
+    """Resolve the per-call timeout from a raw AGENTHAND_HTTP_TIMEOUT_S
+    value: a whole number of seconds greater than zero (surrounding
+    whitespace and a leading '+' allowed), else DEFAULT_HTTP_TIMEOUT_S.
+    Pure, and the same rule as the Rust build's http_timeout_from."""
+    value = (raw or "").strip()
+    if not _HTTP_TIMEOUT_RE.fullmatch(value):
+        return DEFAULT_HTTP_TIMEOUT_S
+    secs = int(value)
+    if secs <= 0 or secs > _U64_MAX:
+        return DEFAULT_HTTP_TIMEOUT_S
+    return secs
+
+
+def http_timeout_s() -> int:
+    """The per-call timeout build_client applies, read from the
+    environment (AGENTHAND_HTTP_TIMEOUT_S) at call time."""
+    import os
+
+    return http_timeout_from(os.environ.get(HTTP_TIMEOUT_ENV))
+
+
 def build_client():
     """Construct the OpenAI-compatible client for the Meta Model API.
 
     max_retries=0 is load-bearing: SDK retries would re-run a billable
     call behind the spend gate's back. Raises NotConfiguredError when no
     key is configured.
-    """
-    from openai import OpenAI
 
+    The timeout is http_timeout_s() (180 s unless
+    AGENTHAND_HTTP_TIMEOUT_S overrides it) with a 20 s connect timeout
+    (fix pass F0): the SDK default allowed 600 s per read.
+    """
+    from openai import OpenAI, Timeout
+
+    api_key = require_meta_api_key()  # loads .env before the timeout is read
     return OpenAI(
         base_url=META_BASE_URL,
-        api_key=require_meta_api_key(),
+        api_key=api_key,
         max_retries=0,
+        timeout=Timeout(float(http_timeout_s()), connect=float(HTTP_CONNECT_TIMEOUT_S)),
     )
 
 
