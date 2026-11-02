@@ -1237,43 +1237,135 @@ def attach_public_copy(block: dict, store, data: bytes, parent_asset_id=None) ->
 
 
 # ---------------------------------------------------------------------------
-# The metadata-free public copy
+# The metadata-free public copy. JPEG and PNG copies are pure container
+# surgery: the image data moves byte for byte, and only the segments /
+# chunks on an explicit ALLOWLIST (decode and colour rendering needs)
+# are kept; everything else, known metadata carrier or not, is dropped
+# (fix pass F1/F2, Rust parity: the old denylist let C2PA, Photoshop
+# IRB, private chunks and inter-scan APPn through). HEIC has no
+# byte-level surgery available, so its copy is a lossless decode
+# re-encoded as PNG with no metadata at all.
 # ---------------------------------------------------------------------------
+
+
+def _jpeg_segment_allowed(marker: int, payload: bytes, after_first_scan: bool) -> bool:
+    """Is a JPEG marker segment allowed in the public copy? An
+    ALLOWLIST: anything not named here (every other APPn, COM, and
+    any marker we do not recognise) is dropped.
+
+    Before the first scan the copy keeps only what decoding and
+    colour rendering need: quantisation and Huffman tables (DQT,
+    DHT), arithmetic-coding conditioning (DAC), restart interval
+    (DRI), the frame header (SOFn, 0xC0-0xCF minus the DHT / JPG /
+    DAC codes), JFIF/JFXX in APP0, the ICC profile in APP2 (colour
+    rendering, not provenance) and the Adobe colour-transform flag
+    in APP14. Between scans (progressive and multi-scan files) only
+    table segments (DHT, DQT, DAC, DRI, DNL) survive: every APPn and
+    COM there is dropped too. Mirrors the Rust jpeg_segment_allowed.
+    """
+    if marker in (0xDB, 0xC4, 0xCC, 0xDD):  # DQT, DHT, DAC, DRI
+        return True
+    if marker == 0xDC:  # DNL only follows a scan
+        return after_first_scan
+    if after_first_scan:
+        return False
+    if 0xC0 <= marker <= 0xCF:
+        # SOFn (0xC4 / 0xCC matched above; 0xC8 is JPG, reserved).
+        return marker != 0xC8
+    if marker == 0xE0:
+        return payload.startswith(b"JFIF\x00") or payload.startswith(b"JFXX\x00")
+    if marker == 0xE2:
+        return payload.startswith(b"ICC_PROFILE\x00")
+    if marker == 0xEE:
+        return payload.startswith(b"Adobe")
+    return False
+
+
+def _strip_jpeg(data: bytes) -> bytes:
+    """The JPEG public copy: an allowlist walk over the whole stream,
+    scans included. Segments are kept or dropped by
+    _jpeg_segment_allowed; each scan's entropy-coded data moves byte
+    for byte (0xFF00 stuffing and RST0-7 are data, not markers); the
+    walk ends at EOI, which is emitted, and anything after it
+    (trailing data) is dropped. A stream that ends inside scan data
+    keeps the data it has and gains an EOI. Raises ValueError when
+    the stream cannot be walked. Mirrors the Rust strip_jpeg.
+    """
+    n = len(data)
+    out = bytearray(b"\xff\xd8")
+    pos = 2
+    after_first_scan = False
+    while True:
+        if pos >= n:
+            # Ran out without an EOI: close the stream.
+            if not after_first_scan:
+                raise ValueError("JPEG has no SOS segment")
+            out += b"\xff\xd9"
+            return bytes(out)
+        if data[pos] != 0xFF:
+            raise ValueError(f"JPEG marker expected at byte {pos}")
+        # Fill bytes: any run of 0xFF before the marker code.
+        while pos + 1 < n and data[pos + 1] == 0xFF:
+            pos += 1
+        if pos + 1 >= n:
+            pos = n
+            continue
+        marker = data[pos + 1]
+        if marker == 0xD9:
+            if not after_first_scan:
+                raise ValueError("JPEG has no SOS segment")
+            out += b"\xff\xd9"
+            return bytes(out)
+        if marker == 0x01 or 0xD0 <= marker <= 0xD8:
+            # Standalone markers outside scan data (TEM, a stray RSTn,
+            # a repeated SOI): no payload, not needed, dropped.
+            pos += 2
+            continue
+        if pos + 4 > n:
+            raise ValueError("JPEG segment header is truncated")
+        seg_len = struct.unpack(">H", data[pos + 2 : pos + 4])[0]
+        if seg_len < 2 or pos + 2 + seg_len > n:
+            raise ValueError("JPEG segment runs past the end of the file")
+        seg_end = pos + 2 + seg_len
+        if marker == 0xDA:
+            # SOS header, then its entropy-coded data up to the next
+            # real marker.
+            out += data[pos:seg_end]
+            i = seg_end
+            while i < n:
+                if data[i] == 0xFF:
+                    if i + 1 >= n:
+                        break
+                    nxt = data[i + 1]
+                    if nxt == 0x00 or 0xD0 <= nxt <= 0xD7:
+                        i += 2
+                        continue
+                    break
+                i += 1
+            out += data[seg_end:i]
+            after_first_scan = True
+            pos = i
+            continue
+        if _jpeg_segment_allowed(marker, data[pos + 4 : seg_end], after_first_scan):
+            out += data[pos:seg_end]
+        pos = seg_end
 
 
 def metadata_free_public_copy(data: bytes):
     """(copy_bytes, format) with every embedded metadata carrier
-    removed and the image pixels untouched. Raises ValueError
-    when no copy can be produced. Mirrors the Rust build."""
+    removed and the image pixels untouched: JPEG and PNG keep only
+    allowlisted segments / chunks (see the section comment above).
+    Raises ValueError when no copy can be produced. Mirrors the Rust
+    build."""
     fmt = _detect_format(data)
     if fmt == "jpeg":
         walked = _jpeg_walk(data)
         if walked is None:
             raise ValueError("not a readable JPEG")
-        segments, has_scan, _ = walked
+        _, has_scan, _ = walked
         if not has_scan:
             raise ValueError("JPEG carries no image scan to preserve")
-        sos_span = None
-        for seg in segments:
-            if seg.marker == 0xDA:
-                sos_span = seg.span
-                break
-        # Kept segments, then everything from the SOS marker
-        # through the true end of the scan.
-        kept = bytearray(b"\xff\xd8")
-        for seg in segments:
-            if seg.marker == 0xDA:
-                break
-            if seg.marker in (0xE1, 0xFE):
-                continue
-            kept += data[seg.span[0] : seg.span[1]]
-        scan = data[sos_span[0] :]
-        # Trim to true EOI using the walk's trailing count.
-        _, _, trailing = walked
-        if trailing > 0:
-            scan = scan[: len(scan) - trailing]
-        kept += scan
-        return bytes(kept), "jpeg"
+        return _strip_jpeg(data), "jpeg"
     if fmt == "png":
         walked = _png_walk(data)
         if walked is None:
