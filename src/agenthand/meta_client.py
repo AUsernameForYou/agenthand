@@ -1050,7 +1050,7 @@ _IMAGE_SIZE_CANDIDATES: tuple[tuple[int, int], ...] = (
     (1024, 1792),
 )
 
-STAGE_SPEC_VERSION = "agenthand.stage-spec/1"
+STAGE_SPEC_VERSION = "agenthand.stage-spec/2"
 PLATE_MAX_ATTEMPTS = 2
 
 
@@ -1099,7 +1099,8 @@ _PLATE_INSTRUCTION = (
     "junction to every lower frame edge; {wall} wall; {lighting}; "
     "{camera_class}. Mode: {stage_mode}. One continuous floor plane. "
     "No raised slab, plinth, podium, platform, furniture, central object, "
-    "people, animals, text, logos or watermark; no product. "
+    "vehicles, people, animals, text, logos or watermark; no product, and "
+    "no object of the product's kind anywhere in the scene. "
     "Specification: {version}."
 )
 
