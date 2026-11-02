@@ -878,6 +878,37 @@ def _detect_card(
             "Card fit did not converge to a trustworthy homography "
             "(coverage or residual gates failed)."
         )
+
+    # Ring verification of every surviving fit (false-accept hardening,
+    # 2026-11-02). Tick counts are a periodic feature: a fence's boards
+    # counterfeited 12 of them on IMG_1403 and the fitted card width
+    # (135 px) then certified itself against the pixel floor. The ring
+    # is the card's unique, non-periodic feature, and the detector has
+    # already measured it independently (centre + annulus area above),
+    # so a fit only stands if it agrees with that measurement: the
+    # ring centre it projects must land on the detected centroid, and
+    # the annulus area its scale predicts must match the detected area.
+    def ring_verified(H_cand: np.ndarray) -> bool:
+        proj_centre = _project(H_cand, ring_mm[None])[0]
+        if np.linalg.norm(proj_centre - centre) > 30:
+            return False
+        proj_edge = _project(
+            H_cand, (ring_mm + np.array([r_out, 0.0]))[None]
+        )[0]
+        r_out_px = float(np.linalg.norm(proj_edge - proj_centre))
+        r_in_px = r_out_px * (r_in / r_out)
+        predicted_area = math.pi * (r_out_px**2 - r_in_px**2)
+        ratio = predicted_area / ring_area_px
+        return 0.35 <= ratio <= 2.85
+
+    results = [r for r in results if ring_verified(r[0])]
+    if not results:
+        raise MeasureError(
+            "Card fit failed ring verification (the fitted card does "
+            "not sit on the card's ring, or its scale disagrees with "
+            "the ring's measured size) — Retake the shot with the "
+            "whole card in frame, closer and in open shade."
+        )
     results.sort(key=lambda r: (-len(r[1]), r[2]))
     H, tick_pairs, rms = results[0]
     quad = {
@@ -947,6 +978,26 @@ def _object_extent(
     largest = max(contours, key=cv2.contourArea)
     if cv2.contourArea(largest) < 0.0005 * image_bgr.shape[0] * image_bgr.shape[1]:
         raise MeasureError("Auto extent contour is implausibly small.")
+    # Frame-edge guard (false-accept hardening, 2026-11-02): a region
+    # that runs off the frame is not an object extent — on IMG_1403 the
+    # segmentation picked the sky/rooftop band along the top edge and
+    # reported it as a ~1.9 x 2.7 m object. Refuse with the correction
+    # path instead of measuring the scenery. (Mask and bbox callers
+    # return above and are unaffected.)
+    edge_pts = largest.reshape(-1, 2)
+    img_h, img_w = image_bgr.shape[0], image_bgr.shape[1]
+    if (
+        int(edge_pts[:, 0].min()) <= 1
+        or int(edge_pts[:, 1].min()) <= 1
+        or int(edge_pts[:, 0].max()) >= img_w - 2
+        or int(edge_pts[:, 1].max()) >= img_h - 2
+    ):
+        raise MeasureError(
+            "Auto extent ran off the edge of the frame (the largest "
+            "colour region touches the border, so it is scenery, not "
+            "the object) — supply a bbox or mask, or retake with the "
+            "whole object in frame."
+        )
     warnings.append(
         "Extent by colour segmentation (prototype fallback): the object "
         "must be colour-distinct from the surface and the card."
@@ -1046,6 +1097,33 @@ def estimate(
             f"fit stays quiet but the range stops covering the true "
             f"size below ~{MIN_CARD_PX:.0f} px) — Retake the shot "
             "or use a bigger card."
+        )
+
+    # Strict re-verification of the winning fit (false-accept
+    # hardening, 2026-11-02 — the load-bearing gate, placed after the
+    # size gates on purpose). The pipeline's span/count/RMS gates are
+    # computed on the pairs the refit KEPT, and the refit only
+    # replaces its pairs when a strict re-observation finds >= 10
+    # ticks; a phantom fit therefore keeps its non-strict evidence
+    # and certifies itself, and its fitted width (IMG_1403: 135 px)
+    # clears the pixel floor above. A strict recheck at the same H is
+    # the independent witness: the IMG_1403 phantom (fence boards)
+    # collapses to 0 ticks / 0 arms, while real fits hold or grow
+    # (IMG_1491: 15 ticks / 5 arms; battery scenes 12-21 -> 15-21).
+    # Degraded small cards can collapse too (AH-35 mini, blurred at
+    # 133 px: 0 / 0) — which is why this check runs AFTER the size
+    # and envelope gates: those refuse such cards first, with the
+    # actionable reason, and this gate only speaks for fits big
+    # enough to otherwise be believed.
+    s_ticks, s_arms, _, _ = _tick_matches(
+        gray, _ink_mask(gray), card, H, strict=True, with_lines=True
+    )
+    if len(s_ticks) <= 2 and s_arms <= 1:
+        raise MeasureError(
+            "Card fit failed strict tick verification (the fitted "
+            "card's ticks vanish under strict matching, so the fit "
+            "is not on the card) — Retake the shot with the whole "
+            "card in frame, closer and in open shade."
         )
     sys_frac = 0.0
     if card_px < COMFORT_CARD_PX:

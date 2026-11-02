@@ -288,3 +288,26 @@ def test_missing_card_fails_honestly(tmp_path):
     blank = np.full((600, 900, 3), SURFACE_BGR, np.uint8)
     with pytest.raises(measure.MeasureError):
         measure.estimate(_save(tmp_path, blank), "AH-46", PROFILE_PATH)
+
+
+def test_strict_recheck_refuses_a_fit_whose_ticks_vanish(tmp_path, monkeypatch):
+    # False-accept regression (2026-11-02, IMG_1403): a phantom fit
+    # can satisfy every non-strict gate on kept pairs, because the
+    # refit only replaces pairs a strict re-observation confirms.
+    # Pin the wiring of the post-size-gate strict recheck in
+    # estimate(): when strict matching at the winning H finds
+    # essentially nothing, the estimate must refuse with the strict
+    # verification message instead of answering.
+    photo, _, _ = render_scene((262.0, 110.0), (95.0, 60.0), 60)
+    real_tick_matches = measure._tick_matches
+
+    def vanishing(gray, mask, card, H, strict=False, with_lines=False):
+        if strict:
+            return [], 0, [], []
+        return real_tick_matches(
+            gray, mask, card, H, strict=strict, with_lines=with_lines
+        )
+
+    monkeypatch.setattr(measure, "_tick_matches", vanishing)
+    with pytest.raises(measure.MeasureError, match="strict tick verification"):
+        measure.estimate(_save(tmp_path, photo), "AH-46", PROFILE_PATH)
