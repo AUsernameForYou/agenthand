@@ -311,3 +311,18 @@ def test_strict_recheck_refuses_a_fit_whose_ticks_vanish(tmp_path, monkeypatch):
     monkeypatch.setattr(measure, "_tick_matches", vanishing)
     with pytest.raises(measure.MeasureError, match="strict tick verification"):
         measure.estimate(_save(tmp_path, photo), "AH-46", PROFILE_PATH)
+
+
+def test_fallback_extent_touching_the_frame_refuses(tmp_path):
+    # Scenery-guard regression (2026-11-02, IMG_1403): the fallback
+    # extent must refuse when the largest colour region runs out of
+    # the frame. Here a verified synthetic card sits above a
+    # frame-wide saturated band touching the bottom edge; the band
+    # is the largest region, so the guard — not a measurement — must
+    # answer.
+    photo, _, _ = render_scene((262.0, 110.0), (95.0, 60.0), 60)
+    photo[photo.shape[0] - 80 :, :] = OBJ_BGR
+    with pytest.raises(
+        measure.MeasureError, match="ran off the edge of the frame"
+    ):
+        measure.estimate(_save(tmp_path, photo), "AH-46", PROFILE_PATH)

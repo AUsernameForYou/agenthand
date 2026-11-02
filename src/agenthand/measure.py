@@ -444,6 +444,146 @@ def _ink_mask(gray: np.ndarray) -> np.ndarray:
     )
 
 
+def _nearest_px(v: float) -> int:
+    # Round half away from zero (Rust f64::round). Python's round()
+    # is banker's rounding and would disagree with the Rust gate on
+    # .5 samples — the two builds must sample the same pixels.
+    return int(math.floor(abs(v) + 0.5)) * (1 if v >= 0 else -1)
+
+
+def _verify_card_fit(
+    image_bgr: np.ndarray, H: np.ndarray, card: dict, tick_count: int
+) -> None:
+    """M2 acceptance gate on the winning fit (ported from the Rust
+    measurefix, 2026-11-02). Tick counts are a periodic feature:
+    fence boards counterfeited 12 on IMG_1403 and denim seams
+    counterfeited 15 on IMG_1491, and both fits then certified
+    themselves against the pixel floor. So the fit must show the
+    card's own, non-periodic features — in order, first failure
+    reported: a cyan ring at the ring position, a white paper border
+    around dark bracket arms, at least half the tick cuts, and the
+    card's aspect. Raises MeasureError on the first failed check."""
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    cyan = cv2.inRange(
+        hsv, np.array([88, 70, 70]), np.array([104, 255, 255])
+    )
+    gray = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2GRAY)
+    h_img, w_img = gray.shape
+    W = float(card["card_width_mm"])
+    Hh = float(card["card_height_mm"])
+    ring = card["ring"]
+    cx, cy = (float(v) for v in ring["centre_mm"])
+    R = float(ring["outer_radius_mm"])
+    refusal = (
+        " — shoot closer with the card flat and fully in frame."
+    )
+
+    def sample_cyan(mm_pt: tuple[float, float]) -> bool:
+        q = _project(H, np.array(mm_pt, dtype=np.float64)[None])[0]
+        x, y = _nearest_px(q[0]), _nearest_px(q[1])
+        return 0 <= x < w_img and 0 <= y < h_img and cyan[y, x] > 0
+
+    # 1. Ring coverage, radius searched (the printed v4 ring is
+    # ~0.43x the profile radius, so the profile radius is not the
+    # answer — the search spans 0.25-0.95 R).
+    best_f, best_hits = 0.0, [False] * 96
+    for k in range(5, 20):
+        r = k * 0.05 * R
+        hits = [
+            sample_cyan(
+                (
+                    cx + r * math.cos(j * 2 * math.pi / 96),
+                    cy + r * math.sin(j * 2 * math.pi / 96),
+                )
+            )
+            for j in range(96)
+        ]
+        f = sum(hits) / 96
+        if f > best_f:
+            best_f, best_hits = f, hits
+    sectors = sum(
+        1 for s in range(6) if any(best_hits[s * 16 : (s + 1) * 16])
+    )
+    spill_pts = []
+    for rr in (1.2 * R, 1.35 * R, 1.5 * R):
+        for j in range(96):
+            a = j * 2 * math.pi / 96
+            mm = (cx + rr * math.cos(a), cy + rr * math.sin(a))
+            if 0 <= mm[0] <= W and 0 <= mm[1] <= Hh:
+                spill_pts.append(mm)
+    spill = (
+        sum(1 for mm in spill_pts if sample_cyan(mm)) / len(spill_pts)
+        if spill_pts
+        else 0.0
+    )
+    if not (best_f >= 0.30 and sectors >= 4 and spill <= 0.35 * best_f):
+        raise MeasureError(
+            "Card not verified in this photo (no cyan ring at the "
+            "card's ring position)" + refusal
+        )
+
+    # 2. Paper border vs ink: the border band halfway between the
+    # bracket frame and the sheet edge must read white while the
+    # bracket arms read dark.
+    frame = _frame_mm(card)
+    half = float(card["bracket_frame"]["stroke_width_mm"]) / 2
+    xl = (min(frame["TL"][0], frame["BL"][0]) - half) / 2
+    xr = (max(frame["TR"][0], frame["BR"][0]) + half + W) / 2
+    yt = (min(frame["TL"][1], frame["TR"][1]) - half) / 2
+    yb = (max(frame["BL"][1], frame["BR"][1]) + half + Hh) / 2
+    paper_pts: list[tuple[float, float]] = []
+    for t in np.linspace(0, 1, 9):
+        paper_pts.append((xl + t * (xr - xl), yt))
+        paper_pts.append((xl + t * (xr - xl), yb))
+        paper_pts.append((xl, yt + t * (yb - yt)))
+        paper_pts.append((xr, yt + t * (yb - yt)))
+    ink_pts: list[tuple[float, float]] = []
+    for arm in _arms(card):
+        s, e = arm["start_mm"], arm["end_mm"]
+        for f in (0.1, 0.375, 0.625, 0.9):
+            ink_pts.append(tuple(s + f * (e - s)))
+
+    def sample_gray(mm_pt: tuple[float, float]) -> int | None:
+        q = _project(H, np.array(mm_pt, dtype=np.float64)[None])[0]
+        x, y = _nearest_px(q[0]), _nearest_px(q[1])
+        return None if not (0 <= x < w_img and 0 <= y < h_img) else int(gray[y, x])
+
+    paper_vals = [v for v in (sample_gray(p) for p in paper_pts) if v is not None]
+    ink_vals = [v for v in (sample_gray(p) for p in ink_pts) if v is not None]
+    paper_fail = (
+        "Card not verified in this photo (no white paper border "
+        "around dark bracket arms)" + refusal
+    )
+    if len(paper_vals) < len(paper_pts) / 2 or len(ink_vals) < len(ink_pts) / 2:
+        raise MeasureError(paper_fail)
+    paper = float(np.median(paper_vals))
+    ink = float(np.median(ink_vals))
+    if not (paper >= 2.0 * max(ink, 1) and paper - ink >= 40):
+        raise MeasureError(paper_fail)
+
+    # 3. Ticks, secondary.
+    total = len(card["ticks"])
+    if tick_count < 0.5 * total:
+        raise MeasureError(
+            f"Card not verified in this photo (only {tick_count}/"
+            f"{total} tick cuts matched)" + refusal
+        )
+
+    # 4. Aspect.
+    corners = _project(
+        H, np.array([[0, 0], [W, 0], [W, Hh], [0, Hh]], dtype=np.float64)
+    )
+    c0, c1, c2, c3 = corners
+    across = float(np.linalg.norm(c1 - c0) + np.linalg.norm(c2 - c3))
+    down = float(np.linalg.norm(c3 - c0) + np.linalg.norm(c2 - c1))
+    factor = (across / down) / (W / Hh)
+    if not (1 / 1.5 <= factor <= 1.5):
+        raise MeasureError(
+            f"Card not verified in this photo (the fitted quad's "
+            f"aspect is {factor:.2f}x the card's)" + refusal
+        )
+
+
 def _ring_centroid(image_bgr: np.ndarray) -> tuple[np.ndarray, float] | None:
     """(centroid, pixel area) of the lockup's cyan ring, or None."""
     hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
@@ -879,38 +1019,13 @@ def _detect_card(
             "(coverage or residual gates failed)."
         )
 
-    # Ring verification of every surviving fit (false-accept hardening,
-    # 2026-11-02). Tick counts are a periodic feature: a fence's boards
-    # counterfeited 12 of them on IMG_1403 and the fitted card width
-    # (135 px) then certified itself against the pixel floor. The ring
-    # is the card's unique, non-periodic feature, and the detector has
-    # already measured it independently (centre + annulus area above),
-    # so a fit only stands if it agrees with that measurement: the
-    # ring centre it projects must land on the detected centroid, and
-    # the annulus area its scale predicts must match the detected area.
-    def ring_verified(H_cand: np.ndarray) -> bool:
-        proj_centre = _project(H_cand, ring_mm[None])[0]
-        if np.linalg.norm(proj_centre - centre) > 30:
-            return False
-        proj_edge = _project(
-            H_cand, (ring_mm + np.array([r_out, 0.0]))[None]
-        )[0]
-        r_out_px = float(np.linalg.norm(proj_edge - proj_centre))
-        r_in_px = r_out_px * (r_in / r_out)
-        predicted_area = math.pi * (r_out_px**2 - r_in_px**2)
-        ratio = predicted_area / ring_area_px
-        return 0.35 <= ratio <= 2.85
-
-    results = [r for r in results if ring_verified(r[0])]
-    if not results:
-        raise MeasureError(
-            "Card fit failed ring verification (the fitted card does "
-            "not sit on the card's ring, or its scale disagrees with "
-            "the ring's measured size) — Retake the shot with the "
-            "whole card in frame, closer and in open shade."
-        )
     results.sort(key=lambda r: (-len(r[1]), r[2]))
     H, tick_pairs, rms = results[0]
+    # NOTE: the M2 card-verification gate deliberately does NOT run
+    # here. estimate() applies it after the size/envelope gates, so a
+    # too-small card refuses with its actionable size reason instead
+    # of a verification reason (the subfloor battery pins that
+    # message). _detect_card stays a pure detector.
     quad = {
         k: _project(H, v[None])[0] for k, v in frame.items()
     }
@@ -1099,8 +1214,17 @@ def estimate(
             "or use a bigger card."
         )
 
+    # M2 card verification (ported from the Rust measurefix,
+    # 2026-11-02): the winning fit must show the card's own,
+    # non-periodic features. Runs after the size gates on purpose,
+    # so a too-small card keeps its actionable size reason. The
+    # IMG_1491 fit that used to "accept" (15 ticks, 704 px) dies
+    # here: its ring coverage is 0.021, a denim-seam phantom, not
+    # the card.
+    _verify_card_fit(image, H, card, n_ticks)
+
     # Strict re-verification of the winning fit (false-accept
-    # hardening, 2026-11-02 — the load-bearing gate, placed after the
+    # hardening, 2026-11-02 — a second witness, placed after the
     # size gates on purpose). The pipeline's span/count/RMS gates are
     # computed on the pairs the refit KEPT, and the refit only
     # replaces its pairs when a strict re-observation finds >= 10
@@ -1109,7 +1233,9 @@ def estimate(
     # clears the pixel floor above. A strict recheck at the same H is
     # the independent witness: the IMG_1403 phantom (fence boards)
     # collapses to 0 ticks / 0 arms, while real fits hold or grow
-    # (IMG_1491: 15 ticks / 5 arms; battery scenes 12-21 -> 15-21).
+    # (battery scenes 12-21 -> 15-21). The IMG_1491 fit (15 ticks)
+    # is NOT such a witness: it is a denim-seam phantom, killed by
+    # the M2 ring gate above, not by this recheck.
     # Degraded small cards can collapse too (AH-35 mini, blurred at
     # 133 px: 0 / 0) — which is why this check runs AFTER the size
     # and envelope gates: those refuse such cards first, with the
