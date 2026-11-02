@@ -6,6 +6,13 @@
   <img src="assets/logo-rotating-v2.gif" alt="agenthand logo: a robot hand presenting three rotating arcs, framed by registration brackets" width="420">
 </p>
 
+> **Reference implementation only.** This Python build is the reference
+> implementation of agenthand. It is kept public so the product can be
+> checked against it, and it is not the shipped product.
+> The main product is the Rust implementation:
+> [AUsernameForYou/agenthand-rust](https://github.com/AUsernameForYou/agenthand-rust).
+> Start there for the agenthand MCP server. This repo is for reference only.
+
 An MCP server for AI agents that help people sell things.
 
 The seller never opens agenthand. Their agent calls it. A seller hands their
