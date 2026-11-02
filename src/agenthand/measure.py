@@ -598,6 +598,122 @@ def _ring_centroid(image_bgr: np.ndarray) -> tuple[np.ndarray, float] | None:
     return centroid, float(moments["m00"]) / 255.0
 
 
+def _ring_shape_candidates(
+    image_bgr: np.ndarray, card: dict
+) -> list[tuple[np.ndarray, float, int]]:
+    """Ring-shaped cyan blobs, best first: (centre, outer_px, n).
+
+    Port of Rust 96f51e9 (CARDDETECT, 2026-11-02). The all-cyan
+    centroid is a denim/scenery average: on IMG_1491 it sits on the
+    jacket, and under blur+noise its area mis-seeds the scale by
+    ~40%. The printed ring is 3 arcs, so single components are arcs,
+    not rings: nearby components are grouped first (union-find, bbox
+    gap <= half the larger side, sides within 2.5x), then each group
+    must look like an annulus under whitening (eigenvalue ratio <= 4,
+    <= 5% of points outside the [inner-margin, outer+margin] band,
+    fill in [0.5, 1.2], >= 9 of 12 sectors occupied, outer >= 5 px).
+    Returns [] when nothing ring-shaped is present; callers fall
+    back to the centroid path.
+    """
+    hsv = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2HSV)
+    mask = cv2.inRange(hsv, (88, 70, 70), (104, 255, 255))
+    n_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
+        mask, connectivity=8
+    )
+    # stats rows: [left, top, width, height, area]; label 0 is background.
+    comps = []
+    for lab in range(1, n_labels):
+        left, top, w, h, area = (int(v) for v in stats[lab])
+        if area >= 3:
+            comps.append((lab, left, top, w, h, area))
+    if len(comps) > 3000:
+        comps = sorted(comps, key=lambda c: -c[5])[:3000]
+        comps = sorted(comps, key=lambda c: c[0])
+    if not comps:
+        return []
+    parent = list(range(len(comps)))
+
+    def find(a: int) -> int:
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a: int, b: int) -> None:
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for i in range(len(comps)):
+        _, x0a, y0a, wa, ha, _ = comps[i]
+        x1a, y1a = x0a + wa - 1, y0a + ha - 1
+        side_a = max(wa, ha)
+        for j in range(i + 1, len(comps)):
+            _, x0b, y0b, wb, hb, _ = comps[j]
+            side_b = max(wb, hb)
+            if max(side_a, side_b) / min(side_a, side_b) > 2.5:
+                continue
+            x1b, y1b = x0b + wb - 1, y0b + hb - 1
+            gap_x = max(0, x0b - x1a - 1, x0a - x1b - 1)
+            gap_y = max(0, y0b - y1a - 1, y0a - y1b - 1)
+            if max(gap_x, gap_y) <= 0.5 * max(side_a, side_b):
+                union(i, j)
+    groups: dict[int, list[int]] = {}
+    for idx in range(len(comps)):
+        groups.setdefault(find(idx), []).append(idx)
+    r_out = float(card["ring"]["outer_radius_mm"])
+    r_in = float(card["ring"]["inner_radius_mm"])
+    k = r_in / r_out if r_out > 0 else 0.0
+    candidates: list[tuple[np.ndarray, float, int]] = []
+    for members in groups.values():
+        labs = [comps[m][0] for m in members]
+        pts = np.column_stack(np.where(np.isin(labels, labs))).astype(
+            np.float64
+        )[:, ::-1]  # (x, y)
+        n = len(pts)
+        if n < 20:
+            continue
+        mean = pts.mean(axis=0)
+        centred = pts - mean
+        cov = np.cov(centred.T)
+        tr = float(cov[0, 0] + cov[1, 1])
+        det = float(cov[0, 0] * cov[1, 1] - cov[0, 1] ** 2)
+        disc = max(tr * tr / 4 - det, 0.0)
+        l1 = tr / 2 + math.sqrt(disc)
+        l2 = tr / 2 - math.sqrt(disc)
+        if l2 <= 0 or l1 / l2 > 4:
+            continue
+        theta = 0.5 * math.atan2(2 * cov[0, 1], cov[0, 0] - cov[1, 1])
+        ct, st = math.cos(theta), math.sin(theta)
+        a = ct * centred[:, 0] + st * centred[:, 1]
+        b = -st * centred[:, 0] + ct * centred[:, 1]
+        a = a * (l2 / l1) ** 0.25
+        b = b * (l1 / l2) ** 0.25
+        m2 = float(np.mean(a**2 + b**2))
+        outer = math.sqrt(2 * m2 / (1 + k * k)) if k < 1 else 0.0
+        inner = k * outer
+        if outer < 5:
+            continue
+        margin = max(1.0, 0.25 * (outer - inner))
+        r = np.sqrt(a**2 + b**2)
+        if float(np.mean(r < inner - margin)) > 0.05:
+            continue
+        if float(np.mean(r > outer + margin)) > 0.05:
+            continue
+        fill = n / (math.pi * (outer**2 - inner**2))
+        if not (0.5 <= fill <= 1.2):
+            continue
+        sectors = set(
+            min(int((math.atan2(bb, aa) % (2 * math.pi)) / (2 * math.pi) * 12), 11)
+            for aa, bb in zip(a, b)
+        )
+        if len(sectors) < 9:
+            continue
+        candidates.append((mean, outer, n))
+    candidates.sort(key=lambda c: (-c[2], c[0][1], c[0][0]))
+    return candidates[:4]
+
+
 def _sheet_seed(
     mask: np.ndarray, card: dict, ring_centroid: np.ndarray
 ) -> np.ndarray | None:
@@ -788,7 +904,7 @@ def _similarity(
 
 
 def _detect_card(
-    gray: np.ndarray, image_bgr: np.ndarray, card: dict
+    gray: np.ndarray, image_bgr: np.ndarray, card: dict, _use_shape: bool = False
 ) -> tuple[np.ndarray, list[tuple[np.ndarray, np.ndarray]], dict[str, np.ndarray]]:
     mask = _ink_mask(gray)
     ring = _ring_centroid(image_bgr)
@@ -805,6 +921,22 @@ def _detect_card(
     r_in = float(card["ring"]["inner_radius_mm"])
     ring_area_mm2 = math.pi * (r_out**2 - r_in**2)
     scale0 = math.sqrt(ring_area_px / ring_area_mm2)
+    if _use_shape:
+        # Ring-shaped seed (Rust 96f51e9), used ONLY as a fallback
+        # when the centroid-anchored search fails: the all-cyan
+        # centroid is dragged off the card by denim/scenery cyan and
+        # its area mis-seeds the scale under blur+noise (the
+        # corrected thin ring is the worst case), but replacing the
+        # anchor outright regressed a contained mid-distance scene
+        # (ah42_degraded_mid: shape fit RMS 0.38, centre 5% off, range
+        # missed truth; centroid fit RMS 0.31, contained). So the
+        # centroid path stays primary and its result, when it exists,
+        # is never displaced by the shape path.
+        shapes = _ring_shape_candidates(image_bgr, card)
+        if not shapes:
+            raise MeasureError("Cyan ring not found; card not detectable.")
+        centre, outer_px, _ = shapes[0]
+        scale0 = outer_px / r_out if r_out > 0 else scale0
 
     if int((mask > 0).sum()) < 500:
         raise MeasureError("Too little ink; card not detectable.")
@@ -1188,7 +1320,19 @@ def estimate(
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     warnings: list[str] = ["Prototype: flat object in the same plane as the card only."]
-    H, matched, quad_img, rms_px = _detect_card(gray, image, card)
+    try:
+        H, matched, quad_img, rms_px = _detect_card(gray, image, card)
+    except MeasureError as first_err:
+        # Ring-shaped rescue: if the centroid-anchored search found
+        # nothing trustworthy, retry anchored on a ring-shaped cyan
+        # blob. If that also fails, the original refusal stands, so
+        # pinned refusal messages never change behind a rescue.
+        try:
+            H, matched, quad_img, rms_px = _detect_card(
+                gray, image, card, _use_shape=True
+            )
+        except MeasureError:
+            raise first_err from None
     n_ticks = len(matched)
 
     # Pixels-across gate: refuse the silent lying band outright, and
@@ -1309,6 +1453,30 @@ def estimate(
             return f"~{dim / 10:.1f} cm ({lo / 10:.1f}–{hi / 10:.1f} cm)"
         return f"~{dim:.0f} mm ({lo:.0f}–{hi:.0f} mm)"
 
+    # Print-scale assumption (mirrors Rust b882176, 2026-11-02): the
+    # profile describes a 100% print. Detection does not depend on it;
+    # only the sizes do, so every result states it plus the ruler
+    # check. No size ships until the bracket is measured or the card
+    # is reprinted at 100%.
+    frame = _frame_mm(card)
+    stroke = float(card["bracket_frame"]["stroke_width_mm"])
+
+    def _r1(v: float) -> float:
+        # Round to 1 decimal, .x5 up (Rust's epsilon trick): 135.85
+        # must print as 135.9, not banker's 135.8.
+        return math.floor(v * 10.0 + 1e-6 + 0.5) / 10.0
+
+    across = abs(float(frame["TR"][0] - frame["TL"][0])) + stroke
+    down = abs(float(frame["BL"][1] - frame["TL"][1])) + stroke
+    bracket = [_r1(max(across, down)), _r1(min(across, down))]
+    card_print_check = (
+        f"Sizes assume the {card_id} card was printed at 100%: its outer bracket "
+        f"frame (the black corner marks) measures {bracket[0]:.1f} mm along its long side and "
+        f"{bracket[1]:.1f} mm along its short side. Check the long side with a ruler; if it "
+        f"measures M mm instead, the card was printed at M / {bracket[0]:.1f} and every size "
+        f"here scales by that factor."
+    )
+
     return {
         "width_mm": round(width_mm, 1),
         "height_mm": round(height_mm, 1),
@@ -1321,6 +1489,9 @@ def estimate(
         "ticks_matched": n_ticks,
         "card_width_px": round(card_px),
         "reprojection_rms_px": round(rms_px, 2),
+        "card_print_scale_assumed": 1.0,
+        "card_outer_bracket_mm": bracket,
+        "card_print_check": card_print_check,
         "warnings": warnings,
     }
 
