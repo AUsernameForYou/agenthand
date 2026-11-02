@@ -199,3 +199,120 @@ def test_hand_built_two_scan_stream_drops_app1_between_scans():
     assert not _has_marker(copy, 0xE1), "APP1 between scans survived"
     assert not _has_marker(copy, 0xFE), "COM between scans survived"
     assert copy == build(False)
+
+
+def _png_chunk(kind: bytes, payload: bytes) -> bytes:
+    """One PNG chunk: length, type, payload, CRC."""
+    crc = binascii.crc32(kind + payload) & 0xFFFFFFFF
+    return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", crc)
+
+
+def _png_chunk_kinds(data: bytes) -> list[bytes]:
+    """PNG chunk kinds in file order."""
+    kinds = []
+    pos = 8
+    while pos + 12 <= len(data):
+        length = struct.unpack(">I", data[pos : pos + 4])[0]
+        kinds.append(data[pos + 4 : pos + 8])
+        pos += 12 + length
+    return kinds
+
+
+def _rgba_pixels(data: bytes) -> tuple[tuple[int, int], bytes]:
+    with Image.open(BytesIO(data)) as img:
+        img.load()
+        rgba = img.convert("RGBA")
+        return rgba.size, rgba.tobytes()
+
+
+def _clean_png(width: int, height: int, color, first=None) -> bytes:
+    img = Image.new("RGBA", (width, height), color)
+    if first is not None:
+        img.putpixel((0, 0), first)
+    buf = BytesIO()
+    img.save(buf, format="PNG")
+    data = buf.getvalue()
+    # Signature, then IHDR (25 bytes), then the image data: the
+    # splice point below is right after IHDR.
+    assert data[12:16] == b"IHDR"
+    return data
+
+
+def test_png_public_copy_keeps_only_allowlisted_chunks():
+    clean = _clean_png(6, 4, (10, 20, 30, 255), first=(200, 100, 50, 128))
+    gama = _png_chunk(b"gAMA", struct.pack(">I", 45455))
+    phys = _png_chunk(b"pHYs", bytes([0, 0, 0x0B, 0x13, 0, 0, 0x0B, 0x13, 1]))
+    # Splice metadata chunks after IHDR (8-byte signature + 25-byte
+    # IHDR chunk), plus colour chunks that must survive.
+    dirty = (
+        clean[:33]
+        + gama
+        + phys
+        + _png_chunk(b"caBX", b"\x00\x00\x00\x20jumbc2pa.manifest")
+        + _png_chunk(b"eXIf", b"II*\x00\x08\x00\x00\x00\x00\x00")
+        + _png_chunk(b"tEXt", b"Comment\x00shot at 45.5N 122.75W")
+        + _png_chunk(b"prVt", b"private vendor payload")
+        + clean[33:]
+        + b"TRAILING-BYTES"
+    )
+
+    copy, kind = metadata_free_public_copy(dirty)
+    assert kind == "png"
+    kinds = _png_chunk_kinds(copy)
+    for banned in (b"caBX", b"eXIf", b"tEXt", b"prVt"):
+        assert banned not in kinds, (
+            f"chunk {banned.decode()} survived into the public copy"
+        )
+    for needle in (b"jumb", b"45.5N", b"private vendor payload", b"TRAILING-BYTES"):
+        assert needle not in copy
+    # Allowlisted chunks survive, in order, with their CRCs.
+    assert kinds[0] == b"IHDR" and kinds[-1] == b"IEND"
+    assert b"gAMA" in kinds and b"pHYs" in kinds and b"IDAT" in kinds
+    assert gama in copy, "gAMA moves byte for byte, CRC included"
+    assert phys in copy
+    # Pixels identical.
+    assert _rgba_pixels(copy) == _rgba_pixels(clean)
+
+
+def test_png_public_copy_keeps_hdr_colour_chunks():
+    """The HDR colour chunks (cICP coding-independent code points,
+    mDCv mastering display, cLLi content light level) are colour
+    rendering, not provenance: they move across byte for byte; the
+    metadata carriers still do not."""
+    clean = _clean_png(5, 3, (40, 80, 160, 255))
+    # BT.2020 primaries, PQ transfer, RGB matrix, full range.
+    cicp = _png_chunk(b"cICP", bytes([9, 16, 0, 1]))
+    mdcv = _png_chunk(
+        b"mDCv",
+        struct.pack(">8H", 35400, 14600, 8500, 39850, 6550, 2300, 15635, 16450)
+        + struct.pack(">II", 10_000_000, 1),
+    )
+    clli = _png_chunk(b"cLLi", struct.pack(">II", 10_000_000, 4_000_000))
+    dirty = (
+        clean[:33]
+        + cicp
+        + mdcv
+        + clli
+        + _png_chunk(b"caBX", b"\x00\x00\x00\x20jumbc2pa.manifest")
+        + _png_chunk(b"eXIf", b"II*\x00\x08\x00\x00\x00\x00\x00")
+        + _png_chunk(b"tEXt", b"Comment\x00shot at 45.5N 122.75W")
+        + clean[33:]
+    )
+
+    copy, kind = metadata_free_public_copy(dirty)
+    assert kind == "png"
+    kinds = _png_chunk_kinds(copy)
+    for name, chunk in (("cICP", cicp), ("mDCv", mdcv), ("cLLi", clli)):
+        assert chunk in copy, (
+            f"{name} must move across byte for byte (CRC included); "
+            f"chunks: {[k.decode() for k in kinds]}"
+        )
+    for banned in (b"caBX", b"eXIf", b"tEXt"):
+        assert banned not in kinds, (
+            f"chunk {banned.decode()} survived into the public copy"
+        )
+    assert b"45.5N" not in copy and b"jumb" not in copy
+    # Order kept: the colour chunks sit after IHDR, before IDAT.
+    at = kinds.index
+    assert at(b"IHDR") < at(b"cICP") < at(b"mDCv") < at(b"cLLi") < at(b"IDAT")
+    assert _rgba_pixels(copy) == _rgba_pixels(clean)

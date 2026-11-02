@@ -1248,6 +1248,37 @@ def attach_public_copy(block: dict, store, data: bytes, parent_asset_id=None) ->
 # ---------------------------------------------------------------------------
 
 
+# The PNG chunks a public copy keeps: image data and the colour /
+# display chunks needed to render it as the original renders,
+# including the HDR colour chunks (cICP coding-independent code
+# points, mDCv mastering display, cLLi content light level: colour
+# rendering, not provenance). An ALLOWLIST: every other chunk (C2PA
+# caBX, eXIf, the tEXt / zTXt / iTXt text and XMP carriers, tIME, and
+# any ancillary or private chunk we do not recognise) is dropped.
+# Same list, same order as the Rust build's PNG_PUBLIC_COPY_CHUNKS.
+PNG_PUBLIC_COPY_CHUNKS = (
+    b"IHDR", b"PLTE", b"tRNS", b"IDAT", b"IEND", b"gAMA", b"cHRM", b"sRGB",
+    b"iCCP", b"sBIT", b"bKGD", b"pHYs", b"cICP", b"mDCv", b"cLLi",
+)
+
+
+def _strip_png(data: bytes) -> bytes | None:
+    """Strip all metadata from a PNG: only allowlisted chunks
+    (PNG_PUBLIC_COPY_CHUNKS) move across, byte for byte (CRCs
+    included) and in their original order; the walk ends at IEND, so
+    trailing bytes are dropped. None when `data` is not a readable
+    PNG. Mirrors the Rust strip_png."""
+    walked = _png_walk(data)
+    if walked is None:
+        return None
+    chunks, _ = walked
+    out = bytearray(data[:8])
+    for kind, span, _ in chunks:
+        if kind in PNG_PUBLIC_COPY_CHUNKS:
+            out += data[span[0] : span[1]]
+    return bytes(out)
+
+
 def _jpeg_segment_allowed(marker: int, payload: bytes, after_first_scan: bool) -> bool:
     """Is a JPEG marker segment allowed in the public copy? An
     ALLOWLIST: anything not named here (every other APPn, COM, and
@@ -1367,17 +1398,10 @@ def metadata_free_public_copy(data: bytes):
             raise ValueError("JPEG carries no image scan to preserve")
         return _strip_jpeg(data), "jpeg"
     if fmt == "png":
-        walked = _png_walk(data)
-        if walked is None:
+        stripped = _strip_png(data)
+        if stripped is None:
             raise ValueError("not a readable PNG")
-        chunks, _ = walked
-        drop = {b"eXIf", b"iTXt", b"zTXt", b"tEXt", b"tIME"}
-        out = bytearray(data[:8])
-        for kind, span, _ in chunks:
-            if kind in drop:
-                continue
-            out += data[span[0] : span[1]]
-        return bytes(out), "png"
+        return stripped, "png"
     # HEIC and everything else: pixel-identical PNG transcode.
     try:
         from PIL import Image
