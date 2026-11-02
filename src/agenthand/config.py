@@ -32,22 +32,83 @@ def get_data_dir() -> Path:
     return Path(__file__).resolve().parents[2] / "data"
 
 
-def get_ledger_path() -> Path:
-    """Where the spend ledger lives.
+def get_cumulative_ledger_path() -> Path:
+    """The CUMULATIVE ledger: where meta_client.billed_call reserves,
+    settles, and checks the spend cap (fix pass F4).
 
-    Defaults to ``ledger.jsonl`` inside the data dir. The
-    AGENTHAND_LEDGER_PATH override separates the ledger from the asset
-    store: the dry-run gate isolates its store in a temp dir (gate
-    assets must never pollute the verified store) but spends against
-    the real ledger, so gate spend counts toward the same cumulative
-    cap as everything else. Before this override existed, every gate
-    run started against a fresh empty ledger with a full cap —
-    a way around the spend cap (architecture Gauntlet fix 3).
+    Selected by AGENTHAND_LEDGER, the same knob as the Rust build's
+    ledger store: unset or ``jsonl`` means ``ledger.jsonl`` inside the
+    data dir; ``jsonl:<path>`` moves the cumulative ledger to <path>
+    (``~`` expands). The Python build keeps a JSONL ledger only, so
+    ``sqlite`` / ``sqlite:<path>`` (the Rust build's SQLite store) and
+    any other value raise ValueError: a store this build cannot check
+    the cap against must stop spend, not silently pick a different one.
+
+    Every billed call, room runs included, reserves and settles here,
+    so the cap is checked against all spend, never against one run's
+    slice. AGENTHAND_LEDGER_PATH does NOT relocate this ledger (it
+    names a mirror; see get_mirror_ledger_path). Before F4 it did, and
+    the room runner pinned it to the room's own file, so every room
+    run started at $0 against a full cap. The dry-run gate isolates
+    its asset store in a temp data dir and points this ledger at the
+    real one with ``AGENTHAND_LEDGER=jsonl:<path>``, so gate spend
+    counts toward the same cumulative cap (architecture Gauntlet fix 3).
     """
+    _load_dotenv()
+    raw = os.environ.get("AGENTHAND_LEDGER", "").strip()
+    if raw in ("", "jsonl"):
+        return get_data_dir() / "ledger.jsonl"
+    if raw.startswith("jsonl:"):
+        path = raw[len("jsonl:") :].strip()
+        if not path:
+            raise ValueError(
+                "AGENTHAND_LEDGER=jsonl: has an empty path; refusing to "
+                "spend with an unknown ledger store."
+            )
+        return Path(path).expanduser()
+    if raw == "sqlite" or raw.startswith("sqlite:"):
+        raise ValueError(
+            f"AGENTHAND_LEDGER={raw!r} selects the SQLite ledger store, "
+            "which only the Rust build has; the Python build keeps its "
+            "cumulative ledger as JSONL (jsonl or jsonl:<path>). Refusing "
+            "to spend against a ledger this build cannot check."
+        )
+    raise ValueError(
+        f"AGENTHAND_LEDGER={raw!r} is not understood (expected jsonl or "
+        "jsonl:<path>); refusing to spend with an unknown ledger store."
+    )
+
+
+def get_mirror_ledger_path() -> Path | None:
+    """The mirror ledger (fix pass F4), or None.
+
+    AGENTHAND_LEDGER_PATH, when set and non-empty (``~`` expands),
+    names a JSONL file that meta_client.billed_call copies every
+    pending and settled row into, IN ADDITION to the cumulative
+    ledger. The room runner points it at the room's own ledger, so a
+    run's cost stays provable from the room directory alone (room
+    totals read back from that file), while every reservation is
+    checked against the one cumulative ledger, so the cap cannot
+    reset per run. Before F4 this variable REPLACED the ledger path,
+    which let each room run start at $0.
+    """
+    _load_dotenv()
     raw = os.environ.get("AGENTHAND_LEDGER_PATH", "").strip()
     if raw:
         return Path(raw).expanduser()
-    return get_data_dir() / "ledger.jsonl"
+    return None
+
+
+def get_ledger_path() -> Path:
+    """The JSONL ledger this context reads its own receipts from: the
+    mirror ledger (AGENTHAND_LEDGER_PATH) when one is set, otherwise
+    the cumulative ledger. This is NOT where the spend cap is checked
+    when a mirror is set: the cap always runs against the cumulative
+    ledger (get_cumulative_ledger_path)."""
+    mirror = get_mirror_ledger_path()
+    if mirror is not None:
+        return mirror
+    return get_cumulative_ledger_path()
 
 
 def get_total_spend_cap_usd() -> float:

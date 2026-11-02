@@ -12,6 +12,8 @@ from agenthand import config, ledger, meta_client, pricing
 def scratch_env(tmp_path, monkeypatch):
     monkeypatch.setenv("AGENTHAND_DATA_DIR", str(tmp_path))
     monkeypatch.setenv("AGENTHAND_TOTAL_SPEND_CAP_USD", "120")
+    monkeypatch.delenv("AGENTHAND_LEDGER", raising=False)
+    monkeypatch.delenv("AGENTHAND_LEDGER_PATH", raising=False)
     return tmp_path
 
 
@@ -258,3 +260,70 @@ def test_timeout_defaults_to_180_seconds():
     assert meta_client.http_timeout_from("1") == 1
     assert meta_client.http_timeout_from(" 42 ") == 42
     assert meta_client.http_timeout_from("+7") == 7
+
+
+# ---------------------------------------------------------------------------
+# Fix pass F4: one spend cap across room runs. A room run points
+# AGENTHAND_LEDGER_PATH at its own ledger; that file must be a MIRROR of
+# the run's rows, never the place the cap is checked: the cap always
+# runs against the cumulative ledger, so two runs cannot each spend
+# $0.90 under a $1.00 cap. (Mirror of the Rust build's
+# room_ledgers_share_one_spend_cap_in_both_stores, JSONL store.)
+# ---------------------------------------------------------------------------
+
+
+def _jsonl_rows(path):
+    if not path.exists():
+        return []
+    return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+
+def test_room_ledgers_share_one_spend_cap(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTHAND_TOTAL_SPEND_CAP_USD", "1.00")
+
+    # Run 1: its own room ledger; settles $0.90.
+    room1 = tmp_path / "room1" / "ledger.jsonl"
+    monkeypatch.setenv("AGENTHAND_LEDGER_PATH", str(room1))
+    first = meta_client.billed_call(
+        "draw", "muse-image-1.0", 0.90, lambda: {"images": 90}
+    )
+    assert first["actual_usd"] == pytest.approx(0.90)
+
+    # Run 2: a fresh room ledger; the $0.90 reservation must be refused
+    # against the cumulative $0.90 already spent, before its call runs.
+    room2 = tmp_path / "room2" / "ledger.jsonl"
+    monkeypatch.setenv("AGENTHAND_LEDGER_PATH", str(room2))
+    ran = []
+
+    def second_call():
+        ran.append(True)
+        return {"images": 90}
+
+    refused = None
+    try:
+        meta_client.billed_call("draw", "muse-image-1.0", 0.90, second_call)
+    except ledger.SpendCapExceeded as exc:
+        refused = exc
+    assert refused is not None, (
+        "run 2's $0.90 reservation passed a $1.00 cap after run 1 spent $0.90"
+    )
+    assert "Spend cap" in str(refused)
+    assert ran == [], "the refused call must not run"
+
+    # The cap ledger (the data dir's) holds run 1's spend only.
+    cumulative = config.get_cumulative_ledger_path()
+    assert cumulative == tmp_path / "ledger.jsonl"
+    assert ledger.ledger_total_usd(cumulative) == pytest.approx(0.90)
+    # Room totals stay readable from the room ledgers.
+    rows1 = _jsonl_rows(room1)
+    assert [r["phase"] for r in rows1] == ["pending", "settled"]
+    assert rows1 == _jsonl_rows(cumulative)  # the same rows, mirrored
+    assert ledger.ledger_total_usd(room1) == pytest.approx(0.90)
+    assert ledger.ledger_total_usd(room2) == 0.0
+
+
+def test_mirror_naming_the_cumulative_ledger_is_written_once(tmp_path, monkeypatch):
+    monkeypatch.setenv("AGENTHAND_LEDGER_PATH", str(tmp_path / "ledger.jsonl"))
+    meta_client.billed_call("draw", "muse-image-1.0", 0.01, lambda: {"images": 1})
+    rows = _jsonl_rows(tmp_path / "ledger.jsonl")
+    assert [r["phase"] for r in rows] == ["pending", "settled"]

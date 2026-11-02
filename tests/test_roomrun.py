@@ -637,9 +637,11 @@ def test_default_verifier_reproves_a_real_draw(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# Ledger isolation: a room run's receipts land in its own ledger
-# (default <out>/ledger.jsonl); the configured (cumulative) ledger
-# is never touched, and the manifest total is the room ledger's.
+# Room ledger: a room run's receipts land in its own ledger (default
+# <out>/ledger.jsonl) and the manifest total is the room ledger's; the
+# caller's AGENTHAND_LEDGER_PATH is restored after the run. Since fix
+# pass F4 billed_call MIRRORS rows into the room ledger and checks the
+# cap against the cumulative ledger (see test_room_runs_share_one_spend_cap).
 # ---------------------------------------------------------------------------
 
 
@@ -683,7 +685,7 @@ def test_room_run_spends_against_its_own_ledger(tmp_path, monkeypatch):
     assert manifest["ledger_path"] == str(room_ledger)
     assert ledger.ledger_total_usd(room_ledger) == pytest.approx(fake.spend)
     assert manifest["total_cost_usd"] == pytest.approx(fake.spend)
-    assert not submission_ledger.exists()  # the cumulative ledger untouched
+    assert not submission_ledger.exists()  # the caller's mirror untouched by the run
     # The caller's environment is restored after the run.
     assert os.environ["AGENTHAND_LEDGER_PATH"] == str(submission_ledger)
 
@@ -1684,3 +1686,46 @@ def test_failed_narration_keeps_its_reservation_counted(tmp_path):
     # The call may have billed: its reservation stays counted.
     assert [r["phase"] for r in rows] == ["pending"]
     assert rows[0]["usd_estimate"] == pytest.approx(record["projected_cost_usd"], abs=1e-6)
+
+
+class _HeavyNarration(FakeNarration):
+    """A narration reply whose reasoning used the whole token cap."""
+
+    def __call__(self, audio_path: Path) -> dict:
+        result = super().__call__(audio_path)
+        result["usage"] = {"prompt_tokens": 0, "completion_tokens": roomrun.NARRATION_MAX_TOKENS}
+        return result
+
+
+def test_room_runs_share_one_spend_cap(tmp_path, monkeypatch):
+    """Fix pass F4: two room runs, each with its own room ledger, under
+    one $0.10 cap. Run 1's narration settles $0.069632; run 2's
+    reservation (~$0.07) must be refused against the cumulative ledger,
+    not checked against run 2's fresh room ledger."""
+    monkeypatch.setenv("AGENTHAND_TOTAL_SPEND_CAP_USD", "0.10")
+    audio = _wav_file(tmp_path / "walk.wav")
+    heavy_usd = roomrun.NARRATION_MAX_TOKENS * 4.25e-6
+
+    manifest, _ = _narration_room(
+        tmp_path, "run1", _HeavyNarration(_NARRATION_REPLY), audio=audio
+    )
+    record = manifest["narration"]["files"][0]
+    assert record["error"] is None, record["error"]
+
+    second = _HeavyNarration(_NARRATION_REPLY)
+    manifest, _ = _narration_room(tmp_path, "run2", second, audio=audio)
+    record = manifest["narration"]["files"][0]
+    assert (record["error"] or {}).get("code") == "SPEND_CAP_REFUSED", (
+        f"run 2's narration passed a $0.10 cap after run 1 spent ${heavy_usd:.6f}: "
+        f"{record['error']}"
+    )
+    assert second.calls == [], "no Baseten call over the cap"
+
+    # The cumulative ledger (the data dir's) holds run 1's rows and
+    # counts them; each room ledger mirrors its own run.
+    cumulative = config.get_cumulative_ledger_path()
+    assert cumulative == tmp_path / "ledger.jsonl"
+    assert [r["phase"] for r in _ledger_rows(cumulative)] == ["pending", "settled"]
+    assert ledger.ledger_total_usd(cumulative) == pytest.approx(heavy_usd)
+    assert _ledger_rows(tmp_path / "run1" / "ledger.jsonl") == _ledger_rows(cumulative)
+    assert _ledger_rows(tmp_path / "run2" / "ledger.jsonl") == []

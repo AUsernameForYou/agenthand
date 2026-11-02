@@ -33,8 +33,9 @@ GATE: PASS only if every run is clean. Anything else is FAIL, with the
 failing run and check named. Runs use an isolated data dir (a temp
 dir; --keep-data-dir DIR to keep it) so the verified store is never
 polluted by gate runs. The LEDGER is deliberately NOT isolated: gate
-spend lands in the repo's real ledger (AGENTHAND_LEDGER_PATH), so it
-counts toward the same cumulative spend cap as everything else.
+spend lands in the repo's real ledger (AGENTHAND_LEDGER=jsonl:<path>,
+the cumulative ledger since fix pass F4), so it counts toward the
+same cumulative spend cap as everything else.
 Earlier versions pointed the data dir at a temp folder and the ledger
 went with it — every gate run started against an empty ledger with a
 full cap (architecture Gauntlet fix 3). --keep-data-dir isolates the
@@ -87,7 +88,7 @@ def _data_uri(photo: Path) -> str:
 
 
 def _ledger_total() -> float:
-    return ledger.ledger_total_usd(config.get_ledger_path())
+    return ledger.ledger_total_usd(config.get_cumulative_ledger_path())
 
 
 def _run_once(run_no: int, data_uri: str, scene: str, store: AssetStore) -> dict:
@@ -178,13 +179,15 @@ def main() -> int:
 
     if args.keep_data_dir:
         os.environ["AGENTHAND_DATA_DIR"] = str(args.keep_data_dir)
-    elif not os.environ.get("AGENTHAND_LEDGER_PATH"):
+    elif not os.environ.get("AGENTHAND_LEDGER"):
         # Isolated store, REAL ledger: the gate's asset store lives in
         # the temp dir set at import, but its spend must land in the
         # repo's ledger (the data dir config would use without the
-        # gate's override) so the cumulative cap sees it.
-        os.environ["AGENTHAND_LEDGER_PATH"] = str(REPO / "data" / "ledger.jsonl")
-    print(f"ledger: {config.get_ledger_path()}")
+        # gate's override) so the cumulative cap sees it. Since fix
+        # pass F4 AGENTHAND_LEDGER_PATH only names a mirror, so the
+        # cumulative ledger is moved with AGENTHAND_LEDGER instead.
+        os.environ["AGENTHAND_LEDGER"] = "jsonl:" + str(REPO / "data" / "ledger.jsonl")
+    print(f"ledger: {config.get_cumulative_ledger_path()}")
 
     projected = PER_RUN_PROJECTION_USD * args.runs
     print(f"photo: {args.photo}")

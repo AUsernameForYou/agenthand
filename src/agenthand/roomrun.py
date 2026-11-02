@@ -140,13 +140,18 @@ room's spend baseline is taken after narration), and a per-call
 projection cap refuses an absurd call before it is made. Room
 runs keep their OWN ledger (default: ledger.jsonl inside the output
 dir; --ledger overrides): during a run, AGENTHAND_LEDGER_PATH points
-at the room ledger so every receipt the run causes lands there, and
-the server's cumulative ledger — the one the published proof run's
-accounting lives in — is never touched by an experiment (demo-ready
-Gauntlet separation gate). The per-run budget (default $1.00) plus
-the worst-case projection checked before the first call are the
-binding bounds on room spend; the manifest's total is the room
-ledger's delta across the run.
+at the room ledger, and billed_call MIRRORS every receipt the run
+causes into it, so the run's cost stays provable from the room
+directory alone. The spend cap is NOT the room's (fix pass F4):
+every reservation and settle also lands in the operator's cumulative
+ledger (config.get_cumulative_ledger_path) and the cap is checked
+there, so it sees every run's spend. Before F4 the room ledger
+REPLACED the cumulative ledger for the run, so the cap reset to $0
+on every run ($0.90 + $0.90 passed a $1.00 cap); the old contract
+that a room run never moves the cumulative ledger is reversed on
+purpose. The per-run budget (default $1.00) plus the worst-case
+projection checked before the first call bound one room's spend;
+the manifest's total is the room ledger's delta across the run.
 """
 
 from __future__ import annotations
@@ -3011,13 +3016,13 @@ def run_room(
     (cheaper, thinner manifest).
 
     ledger_path: the run's own cost ledger. The default is
-    ledger.jsonl inside out_dir — room runs are experiments and
-    never spend against the server's cumulative ledger (the one the
-    published proof run's accounting lives in). For the run's
-    duration AGENTHAND_LEDGER_PATH points at this ledger, so every
-    receipt billed_call writes for the run lands in it; the previous
+    ledger.jsonl inside out_dir. For the run's duration
+    AGENTHAND_LEDGER_PATH points at this ledger, so every receipt
+    billed_call writes for the run is mirrored into it; the previous
     value is restored on exit. The manifest records the path and its
-    total is this ledger's delta across the run.
+    total is this ledger's delta across the run. The spend cap is
+    checked against the cumulative ledger, never this one (fix pass
+    F4), so the run's spend also lands there.
 
     verify_fn: (store, composite_handle) -> verifier report. The
     default is the repo's independent verifier
@@ -3058,6 +3063,13 @@ def run_room(
         Path(ledger_path) if ledger_path is not None else out_dir / "ledger.jsonl"
     )
 
+    # The room's cost stays provable from the room directory alone:
+    # every billed call during the run is MIRRORED into the room's own
+    # JSONL ledger (AGENTHAND_LEDGER_PATH, pinned here for the run's
+    # duration and restored afterwards), and the run's totals are read
+    # back from that file. The spend cap is not the room's (fix pass
+    # F4): reservations and settles always go to the cumulative ledger
+    # too, so the cap sees every run's spend.
     previous_ledger_env = os.environ.get("AGENTHAND_LEDGER_PATH")
     os.environ["AGENTHAND_LEDGER_PATH"] = str(room_ledger)
     try:
@@ -3777,10 +3789,12 @@ def main(argv: list[str] | None = None) -> int:
         type=Path,
         default=None,
         help=(
-            "The run's cost ledger (default: ledger.jsonl inside the "
-            "output dir). Room runs are isolated from the server's "
-            "cumulative ledger by default; point this at that ledger "
-            "only if the run's spend should deliberately count there."
+            "The run's own cost ledger (default: ledger.jsonl inside the "
+            "output dir). Every billed call during the run is mirrored "
+            "into it, and the manifest total is read from it. The spend "
+            "cap is checked against the cumulative ledger (the data dir's "
+            "ledger.jsonl, or AGENTHAND_LEDGER=jsonl:<path>), so the "
+            "run's spend always counts there too (fix pass F4)."
         ),
     )
     args = parser.parse_args(argv)

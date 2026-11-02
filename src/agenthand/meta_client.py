@@ -39,6 +39,14 @@ The key check happens BEFORE billed_call is invoked: a call attempted
 with no META_API_KEY configured raises NotConfiguredError before any
 reservation is written, so a missing key can never leave phantom spend
 in the ledger.
+
+One cap, all spend (fix pass F4): every reservation and settle goes to
+the CUMULATIVE ledger (config.get_cumulative_ledger_path), and the cap
+is checked there. When AGENTHAND_LEDGER_PATH names a mirror ledger (the
+room runner's <room>/ledger.jsonl), each row is ALSO appended to that
+JSONL file, so a room's own spend stays readable from its directory
+without the room ever owning the cap. A mirror that names the
+cumulative ledger itself is not written twice.
 """
 
 from __future__ import annotations
@@ -73,13 +81,26 @@ _current_call_id: ContextVar[str | None] = ContextVar(
 def _lock_file(ledger_dir: Path):
     """Open (creating if needed) the ledger lock file. Caller closes it.
 
-    The lock lives beside the LEDGER it guards, not beside the asset
-    store: with AGENTHAND_LEDGER_PATH separating the two (the dry-run
-    gate), two processes sharing one ledger through different data
-    dirs must still serialize on the same lock file.
+    The lock lives beside the cumulative LEDGER it guards, not beside
+    the asset store: with AGENTHAND_LEDGER=jsonl:<path> separating the
+    two (the dry-run gate), two processes sharing one ledger through
+    different data dirs must still serialize on the same lock file.
+    Mirror-ledger appends happen under the same lock.
     """
     ledger_dir.mkdir(parents=True, exist_ok=True)
     return (ledger_dir / "ledger.lock").open("a+")
+
+
+def _mirror_ledger(cumulative: Path) -> Path | None:
+    """The mirror ledger for this call, if any: AGENTHAND_LEDGER_PATH,
+    unless it names the cumulative ledger's own file (a row is never
+    written twice to one ledger)."""
+    mirror = config.get_mirror_ledger_path()
+    if mirror is None:
+        return None
+    if mirror == cumulative or mirror.resolve() == cumulative.resolve():
+        return None
+    return mirror
 
 
 def billed_call(
@@ -125,7 +146,10 @@ def billed_call(
     # Validate the projection before anything is written.
     ledger._validate_amount(projected_usd, "projected cost")
 
-    ledger_path = config.get_ledger_path()
+    # The cap ledger is the cumulative one (fix pass F4); the mirror,
+    # when set, receives a copy of every row.
+    ledger_path = config.get_cumulative_ledger_path()
+    mirror_path = _mirror_ledger(ledger_path)
     cap_usd = config.get_total_spend_cap_usd()
     call_id = uuid.uuid4().hex
 
@@ -133,18 +157,18 @@ def billed_call(
     with _lock_file(ledger_path.parent) as lock_fh:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
         ledger.check_spend_cap(ledger_path, projected_usd, cap_usd)
-        ledger.append_receipt(
-            ledger_path,
-            ledger.Receipt(
-                tool=tool,
-                model=model,
-                usd_estimate=float(projected_usd),
-                status=status,
-                phase=ledger.PHASE_PENDING,
-                call_id=call_id,
-                note=note,
-            ),
+        pending = ledger.Receipt(
+            tool=tool,
+            model=model,
+            usd_estimate=float(projected_usd),
+            status=status,
+            phase=ledger.PHASE_PENDING,
+            call_id=call_id,
+            note=note,
         )
+        ledger.append_receipt(ledger_path, pending)
+        if mirror_path is not None:
+            ledger.append_receipt(mirror_path, pending)
 
     # Unknown failures keep the reservation. A decoded cut failure carries
     # the exact completed image count, which can be settled before re-raising.
@@ -191,22 +215,22 @@ def billed_call(
     # Settle: append the actual, with the usage counts stored on the receipt.
     with _lock_file(ledger_path.parent) as lock_fh:
         fcntl.flock(lock_fh, fcntl.LOCK_EX)
-        ledger.append_receipt(
-            ledger_path,
-            ledger.Receipt(
-                tool=tool,
-                model=model,
-                usd_estimate=actual_usd,
-                input_tokens=usage["input_tokens"],
-                output_tokens=usage["output_tokens"],
-                cached_input_tokens=usage["cached_input_tokens"],
-                images=usage["images"],
-                status=status,
-                phase=ledger.PHASE_SETTLED,
-                call_id=call_id,
-                note=settle_note,
-            ),
+        settled = ledger.Receipt(
+            tool=tool,
+            model=model,
+            usd_estimate=actual_usd,
+            input_tokens=usage["input_tokens"],
+            output_tokens=usage["output_tokens"],
+            cached_input_tokens=usage["cached_input_tokens"],
+            images=usage["images"],
+            status=status,
+            phase=ledger.PHASE_SETTLED,
+            call_id=call_id,
+            note=settle_note,
         )
+        ledger.append_receipt(ledger_path, settled)
+        if mirror_path is not None:
+            ledger.append_receipt(mirror_path, settled)
 
     if cut_failure is not None:
         cut_failure.cost_counted_usd = actual_usd
