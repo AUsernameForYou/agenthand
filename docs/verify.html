@@ -65,7 +65,7 @@ var REGISTRY = {
 // Canonicalize raw JSON text directly. Number tokens are carried
 // through verbatim: the receipt producers (the Python and Rust
 // builds) already emit floats in canonical shortest form (1.0,
-// 0.184487), while a parse-then-stringify round trip would rewrite
+// 0.154487), while a parse-then-stringify round trip would rewrite
 // 1.0 to 1 and silently change the hash. Object keys are sorted;
 // the two annotation fields are dropped at the top level only.
 function canonicalizeRaw(text) {
