@@ -9,7 +9,7 @@ import numpy as np
 from PIL import Image
 from . import mask_evidence as evidence
 
-VERSION = "agenthand.cut-quality/5"
+VERSION = "agenthand.cut-quality/6"
 INSTRUCTIONS = {
     "SUPPORT_NOT_CAPTURED": "Move bins and clutter away from under the product. Photograph from a lower angle with every leg and foot visible against unobstructed, contrasting floor.",
     "TOP_OCCLUDED": "Remove everything resting on the product. Photograph its complete top and edges without objects overlapping them.",
@@ -95,6 +95,7 @@ def grade_cut(
         regions, refusals, _ = evidence.detect_regions(rgb, alpha)
         supports = sum(int(r.silhouette.sum()) for r in regions if r.cls == "support")
         ambiguous = 0
+        window_clipped = 0
         # A bounded dark mass can hide a support. Broad, border-connected
         # background alone is not evidence that a product has legs: applying
         # that assumption to screens/flat objects is a false reshoot.
@@ -142,7 +143,16 @@ def grade_cut(
                         and core_rows / max(1, core_pixels / max(1, core_rows))
                         >= evidence.SUPPORT_MIN_ASPECT
                     )
-                    if (
+                    if thin and not horizontally_bounded:
+                        # The component exits the analysis window sideways,
+                        # so its width and shape are window artifacts, not
+                        # scene measurements: a scene-scale structure (a
+                        # fence shadow sweeping out of frame, a wall line)
+                        # reads as a thin stem only because the window cut
+                        # it. It is counted and disclosed in the metrics
+                        # but cannot carry fatal support evidence.
+                        window_clipped += int(c.sum())
+                    elif (
                         not thin
                         and bounded
                         and horizontally_bounded
@@ -158,6 +168,7 @@ def grade_cut(
         metrics["observed_support_pixels"] = supports
         metrics["uncaptured_support_pixels"] = supports
         metrics["ambiguous_support_pixels"] = ambiguous
+        metrics["ambiguous_window_clipped_pixels"] = window_clipped
         if supports > max(4, 0.0005 * area) or ambiguous > max(64, 0.01 * area):
             codes.append("SUPPORT_NOT_CAPTURED")
             fatal |= ambiguous > max(64, 0.01 * area)

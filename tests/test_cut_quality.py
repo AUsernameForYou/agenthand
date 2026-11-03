@@ -299,3 +299,37 @@ def test_export_verifier_regrades_paper_like_preflight(tmp_path):
         store, fh, reconstruction_handle=report["layer_handle"], require_pass=True
     )
     assert checked["cut_quality"]["grade"] == "PASS"
+
+
+def _support_scene():
+    src = np.full((200, 300, 3), 180, np.uint8)
+    a = np.zeros((200, 300), np.uint8)
+    a[40:120, 40:260] = 255
+    return src, a
+
+
+def test_window_clipped_shadow_stripe_is_not_fatal():
+    """cut-quality/6: a thin dark mass that exits the analysis window
+    sideways (a fence shadow sweeping out of frame on IMG_1443 measured
+    58,877 such px) is disclosed in the metrics but cannot carry fatal
+    support evidence. Under /5 this scene graded RESHOOT."""
+    src, a = _support_scene()
+    for r in range(80):
+        cx = 120 + 2 * r
+        src[120 + r, cx - 3 : cx + 3] = 15
+    q = grade_cut(src, a)
+    assert q["metrics"]["ambiguous_window_clipped_pixels"] > 0, q
+    assert q["metrics"]["ambiguous_support_pixels"] == 0, q
+    assert q["grade"] != "RESHOOT", q
+
+
+def test_interior_thin_stripe_still_reshoots():
+    """The /6 window exemption is narrow: a thin dark stem fully inside
+    the window, running under the body, still counts as ambiguous
+    support evidence and still grades RESHOOT."""
+    src, a = _support_scene()
+    src[120:200, 140:146] = 15
+    q = grade_cut(src, a)
+    assert q["metrics"]["ambiguous_support_pixels"] >= 480, q
+    assert q["grade"] == "RESHOOT", q
+    assert "SUPPORT_NOT_CAPTURED" in q["codes"]
