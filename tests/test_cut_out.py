@@ -479,7 +479,13 @@ def test_cut_out_scales_oversize_source_and_maps_the_mask_back(monkeypatch):
     from agenthand.assets import png_text_of_bytes
 
     text = png_text_of_bytes(store.read_bytes(result["mask_asset"]))
-    assert json.loads(text["agenthand_mask_provenance"]) == result["mask_provenance"]
+    # The chunk carries the five provenance fields plus the accepted
+    # concept (the scene guard's check material); the result's
+    # mask_provenance stays the five fields alone.
+    assert json.loads(text["agenthand_mask_provenance"]) == {
+        **result["mask_provenance"],
+        "concept": result["concept"],
+    }
     mask_image = store.read_image(result["mask_asset"])
     assert mask_image.size == (8, 6)
 

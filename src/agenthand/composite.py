@@ -690,6 +690,39 @@ def mask_provenance_of(store: AssetStore, mask_handle: str) -> dict | None:
     return provenance
 
 
+def mask_concept_of(store: AssetStore, foreground_handle: str) -> str | None:
+    """The identify concept the foreground was cut with, from its
+    mask's PNG chunk (cut_out writes it there); None for older masks.
+
+    Mirror of the Rust build's `mask_concept_of`. The draw scene
+    guard (sceneguard.py) screens the caller's scene text against
+    this phrase. Anything missing or malformed reads as absent: the
+    concept is check material, not a gate — a mask written before it
+    was recorded must still draw, with the guard skipped.
+    """
+    try:
+        chain = validate_foreground(store, foreground_handle)
+    except Exception:
+        return None
+    mask = next((record for record in chain if record.kind == KIND_MASK), None)
+    if mask is None:
+        return None
+    try:
+        raw = png_text_of_bytes(
+            store.read_bytes(HANDLE_PREFIX + mask.asset_id)
+        ).get(MASK_PROVENANCE_PNG_KEY)
+        if raw is None:
+            return None
+        parsed = json.loads(raw)
+        concept = parsed.get("concept")
+    except Exception:
+        return None
+    if not isinstance(concept, str):
+        return None
+    concept = concept.strip()
+    return concept or None
+
+
 def validate_foreground(store: AssetStore, foreground_handle: str) -> list[AssetRecord]:
     """Check an asset may be composited; returns its lineage chain.
 

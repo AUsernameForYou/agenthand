@@ -13,6 +13,22 @@ pricing is pure post-processing of the result JSON.
 
 ### Added
 
+- Scene guard (`sceneguard.py`, Dan's rule 2026-11-03; tracker event
+  631): a draw scene prompt describes the environment only. Before
+  any paid call, `server.draw` screens the scene text against the
+  foreground's cut concept: a scene naming the item — its full
+  phrase, or its head noun as a whole word (singular or trailing
+  "s") — is refused with `SCENE_NAMES_PRODUCT`, the offending term,
+  and the correction, at $0 counted and no ledger row. The outcome
+  rides on the persisted receipt and the result as the additive
+  `scene_guard` record (`skipped`, with the reason, when the mask
+  carries no concept). Mirror of the Rust build's guard: same
+  matching, record shape, and refusal text. Supporting change:
+  `cut_out` now writes the accepted concept into the mask's PNG
+  provenance chunk (the chunk only; the result's `mask_provenance`
+  keeps the five frame fields), closing the gap with the Rust chunk,
+  and `composite.mask_concept_of` reads it back.
+
 - Comps pricing (`comps.py`): `identify` results gain a `pricing`
   block computed code-side from a local comps file
   (`AGENTHAND_COMPS_FILE`, default `<data dir>/pricing-comps.json`):
