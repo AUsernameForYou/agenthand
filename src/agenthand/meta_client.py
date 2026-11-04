@@ -944,16 +944,18 @@ def vision_identify(
 # Plate metrics vision calls (Muse Spark, chat transport).
 # ---------------------------------------------------------------------------
 
-#: Output cap for one plate-metrics read. The answer is seven
-#: short fields (~200 characters), but the cap must stay at
-#: identify's 2048: this endpoint silently returns an EMPTY
-#: completion when max_tokens is small — bisected live on
-#: 2026-11-03 during the metric-plate smoke, where the metrics
-#: shape at 512 came back empty every time, identify's known-good
-#: shape also came back empty at 512, and the same metrics shape
-#: answered correctly at 2048. The cap is a ceiling, not a
-#: target: billing settles on actual usage.
-METRICS_MAX_TOKENS = 2048
+#: Output cap for one plate-metrics read. The ANSWER is seven
+#: short fields (~200 characters), but the model reasons at
+#: length before answering, and this endpoint silently returns
+#: an EMPTY completion when the budget cuts that reasoning off —
+#: bisected live on 2026-11-03 during the metric-plate smoke:
+#: at 512 every call came back empty (identify's known-good
+#: shape included), at 2048 a flat test image answered (1,779
+#: output tokens used), and the real suitcase photo still came
+#: back empty at 2048 and answered at 4096, using 3,473 output
+#: tokens. The cap is a ceiling, not a target: billing settles
+#: on actual usage.
+METRICS_MAX_TOKENS = 4096
 
 #: Prompt-token allowance of the metrics instructions, for the
 #: projected cost (same accounting shape as identify's).
