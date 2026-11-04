@@ -47,7 +47,10 @@
   .btn.solid{background:var(--cyan-dark);border-color:var(--cyan-dark);color:#fff}
   .btn.ghost-light{border-color:#fff;color:#fff}
   .btn.ghost-light:hover{border-color:var(--cyan);color:var(--cyan)}
-  @media (max-width:640px){ header.site nav a.plain{display:none} }
+  @media (max-width:640px){
+    header.site .wrap{flex-wrap:wrap}
+    header.site nav{margin-left:0;gap:14px;font-size:13.5px;flex-wrap:wrap}
+  }
 
   /* ---------- cover ---------- */
   .cover{background:var(--ink);color:#fff;padding:64px 0 70px}
@@ -59,9 +62,20 @@
   .cover h1 .hl{color:var(--cyan)}
   .cover p.lede{font-size:clamp(17px,2vw,20px);color:#cfd8db;max-width:40em;margin:0 0 26px}
   .cover .ctas{display:flex;flex-wrap:wrap;gap:12px}
-  .video-slot{
-    margin-top:40px;border:2px dashed var(--cyan);border-radius:10px;color:var(--cyan);
-    text-align:center;padding:16px;font-weight:700;letter-spacing:.12em;font-size:13px;
+  .cover .ctas + .ctas{margin-top:12px}
+  .cover-mark{display:block;width:96px;height:auto;margin:0 auto 24px}
+  .cover video{
+    width:100%;margin-top:40px;border:2px solid var(--cyan);border-radius:10px;
+    background:#000;aspect-ratio:16/9;
+  }
+  .brandnote{margin:14px 0 0;font-size:13.5px;color:#9fb3ba;max-width:46em}
+  img[src*="assets/cast/"]{object-position:50% 0%}
+  @media (max-width:640px){
+    .cover .wrap{display:flex;flex-direction:column}
+    .cover .ctas{order:2}
+    .cover p.lede{order:3}
+    .cover video{order:4}
+    .cover .brandnote{order:5}
   }
   .pace{
     background:var(--wash);border-bottom:1px solid var(--line);padding:22px 0;
@@ -190,6 +204,7 @@
   .cols>*,.tools>*,.story-grid>*,.trio>*,.pair>*,.insets>*{min-width:0}
   @media (max-width:880px){ .cols{grid-template-columns:minmax(0,1fr)} }
   footer{background:var(--ink);color:#cfd8db;padding:56px 0 64px}
+  footer .footlogo{width:88px;height:auto;margin:0 0 20px}
   footer .motto{font-size:clamp(28px,4.4vw,44px);font-weight:800;color:#fff;letter-spacing:-.02em;margin:0 0 20px}
   footer .motto .hl{color:var(--cyan)}
   footer p{max-width:46em;font-size:15px}
@@ -200,7 +215,7 @@
 
 <header class="site">
   <div class="wrap">
-    <img src="assets/logo.png" alt="agenthand logo">
+    <img src="logo-rotating-v3.gif" alt="agenthand logo, a rotating blue circle" style="width:40px;height:40px">
     <a class="name" href="#">agenthand</a>
     <nav>
       <a class="plain" href="#built">The build</a>
@@ -214,6 +229,7 @@
 
 <div class="cover">
   <div class="wrap">
+    <img class="cover-mark" src="logo-rotating-v3.gif" alt="agenthand logo, a rotating blue circle">
     <span class="eyebrow">A BUILD BLOG, THEN THE DEMO, STORY BY STORY</span>
     <h1>Staged listing photos, with <span class="hl">proof the product never changed.</span></h1>
     <p class="lede">agenthand is an MCP server (MCP: the open protocol that lets AI agents call tools) that an AI agent uses to help someone sell a thing: it takes the seller's own photo, stages the product in a new room, and hands back a receipt that proves the product's core pixels are the exact ones from the photo, checked pixel for pixel, with the rebuilt edge counted and disclosed. This page opens with the build blog: how agenthand got made, and the calls along the way. Then it retells the demo film story by story, at reading pace. The film tells these stories in three minutes, and one of them gets barely a breath; here the rushed one gets its full record too.</p>
@@ -222,10 +238,11 @@
       <a class="btn ghost-light" href="#get">Get agenthand</a>
     </div>
     <div class="ctas">
-      <a class="btn solid" href="https://drive.google.com/file/d/1wjw5D1DGnBCPZ2kiHKgpfYRrIdT_tdNq/view">Watch the demo</a>
+      <a class="btn solid" href="#watch">Watch the demo</a>
       <a class="btn ghost-light" href="https://github.com/AUsernameForYou/agenthand-rust/releases/download/v1.0.0-hackathon/agenthand-demo-x.mp4">Download from GitHub</a>
     </div>
-    <div class="video-slot">▶ &nbsp;THE 3-MINUTE FILM IS LIVE: USE THE WATCH BUTTON ABOVE</div>
+    <video id="watch" controls preload="none" playsinline src="https://github.com/AUsernameForYou/agenthand-rust/releases/download/v1.0.0-hackathon/agenthand-demo-x.mp4"></video>
+    <p class="brandnote">Trademark caution: the bike maker's name is blurred in the film and on this page. The proof files in the repo are unaltered.</p>
   </div>
 </div>
 
@@ -246,8 +263,8 @@
     <p class="prose">The left picture was made with Muse's image generation, and it out-paints the models agenthand is allowed to call. The bike in it is my bike, unaltered. The courtyard around it is not agenthand's work: Muse generated that background, and the tool had no part in it. It is, honestly, the prettier picture, and I kept it pinned up as the look target for the whole project.</p>
     <div class="panel tilt-l">
       <div class="pair">
-        <div class="mini"><span class="tape">THE PERFECT ONE</span><img src="assets/bike-render.jpg" alt="The same blue bike, unaltered, in a courtyard background made with Muse's image generation"></div>
-        <div class="mini"><span class="tape after">THE ONE THAT SHIPS</span><img src="assets/bike-hero.jpg" alt="The same bike staged through agenthand, the shipped v109 hero"></div>
+        <div class="mini"><span class="tape">THE PERFECT ONE</span><img src="assets/bike-render-blur-v3.jpg" alt="The same blue bike, unaltered, in a courtyard background made with Muse's image generation; the maker's name on the frame is blurred"></div>
+        <div class="mini"><span class="tape after">THE ONE THAT SHIPS</span><img src="assets/bike-hero-blur-v3.jpg" alt="The same bike staged through agenthand, the shipped v109 hero; the maker's name on the frame is blurred"></div>
       </div>
     </div>
     <div class="vs-labels">
@@ -338,8 +355,8 @@
     <div class="story-grid">
       <div class="panel tilt-r">
         <div class="pair">
-          <div class="mini"><span class="tape">JOHN · BUYER</span><img src="assets/cast/john.jpg" alt="John, the lion buyer, in an I love Marketplace shirt" style="aspect-ratio:3/4;object-fit:cover"></div>
-          <div class="mini"><span class="tape after">STEPHANIE · BUYER</span><img src="assets/cast/stephanie.jpg" alt="Stephanie, the husky buyer, in a red Coug cap and number 7 jersey" style="aspect-ratio:3/4;object-fit:cover"></div>
+          <div class="mini"><span class="tape">JOHN · BUYER</span><img src="assets/cast/john-film-v3.jpg" alt="John, the lion buyer, in a Marketplace shirt, phone in hand, a still from the demo film" style="aspect-ratio:3/4;object-fit:cover"></div>
+          <div class="mini"><span class="tape after">STEPHANIE · BUYER</span><img src="assets/cast/stephanie.jpg" alt="Stephanie, the husky buyer, wearing her favorite team's colors" style="aspect-ratio:3/4;object-fit:cover"></div>
         </div>
       </div>
       <div>
@@ -364,8 +381,8 @@
       <div>
         <div class="panel tilt-l">
           <div class="pair">
-            <div class="mini"><span class="tape">BEFORE</span><img src="assets/bike-source.jpg" alt="The original photo of the bicycle in a garden"></div>
-            <div class="mini"><span class="tape after">STAGED</span><img src="assets/bike-hero.jpg" alt="The same bicycle staged on a clean courtyard plate"></div>
+            <div class="mini"><span class="tape">BEFORE</span><img src="assets/bike-source-blur-v3.jpg" alt="The original photo of the bicycle in a garden; the maker's name on the frame is blurred"></div>
+            <div class="mini"><span class="tape after">STAGED</span><img src="assets/bike-hero-blur-v3.jpg" alt="The same bicycle staged on a clean courtyard plate; the maker's name on the frame is blurred"></div>
           </div>
           <div class="insets">
             <img src="assets/spokes-front.jpg" alt="Close crop of the front wheel spokes in the staged hero">
@@ -582,28 +599,28 @@
     <h2>Everyone wins</h2>
     <p class="standfirst">The film closes on a lineup, under one banner: buyer, seller, homeowner, contractor, mover, home buyer, agent, landlord, tenant, driver, adjuster. Ten of them carry the stories in this book. The rest stand in the lineup, one name for each way the tool gets used.</p>
     <div class="panel tilt-l">
-      <img src="assets/cast/cast-line.jpg" alt="The film's closing cast lineup: seventeen drawn characters standing in a backyard under a clothesline of the film's photos, each labeled with a name and a role">
+      <img src="assets/cast/cast-line-r5-v2.jpg" alt="The film's closing cast lineup: seventeen drawn characters standing in a backyard under a clothesline of the film's photos, each labeled with a name and a role">
     </div>
-    <p class="caption" style="margin-top:18px">The closing frame of the film, labels and all. <b>Every character below is cut from this one frame.</b></p>
+    <p class="caption" style="margin-top:18px">The closing frame of the submitted film, <b>labels and all.</b></p>
 
     <div class="trio" style="margin-top:34px">
       <div>
-        <div class="panel"><img src="assets/cast/john.jpg" alt="John, a lion in an I love Marketplace shirt" style="aspect-ratio:3/4;object-fit:cover"></div>
+        <div class="panel"><img src="assets/cast/john-film-v3.jpg" alt="John, a lion in a Marketplace shirt, phone in hand, a still from the demo film" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>John · buyer</h3>
-        <p class="cap">The lion in the Marketplace shirt. Furnishing from listings across town, he gets each find placed into a photo of his own room at its real asking price before he messages a single seller.</p>
-        <p class="tech-mini"><b>Use case:</b> see it in your room before you buy it. Story 2.</p>
+        <p class="cap">The lion in the I love Marketplace shirt, furnishing a rental one listing at a time. Before he messages a single seller, agenthand drops each find into a photo of his own room at its real asking price, so he can judge the purifier or the suitcase against his own walls first.</p>
+        <p class="tech-mini"><b>Use case:</b> see a listing in your room, at its real price, before you spend anything. Story 2.</p>
       </div>
       <div>
-        <div class="panel"><img src="assets/cast/stephanie.jpg" alt="Stephanie, a husky in a red Coug cap and a number 7 jersey" style="aspect-ratio:3/4;object-fit:cover"></div>
+        <div class="panel"><img src="assets/cast/stephanie.jpg" alt="Stephanie, a husky wearing her favorite team's colors" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Stephanie · buyer</h3>
-        <p class="cap">The husky in the Coug cap and the number 7 jersey, buying alongside John in the deal-hunting scene.</p>
-        <p class="tech-mini"><b>Use case:</b> second-hand buying, product pixels proven. Story 2.</p>
+        <p class="cap">The husky in her favorite team's colors, hunting deals alongside John. When a listing photo looks too clean to trust, she checks its receipt before driving across town: the room in the photo can be staged, the product pixels cannot be faked.</p>
+        <p class="tech-mini"><b>Use case:</b> re-check a seller's staged photo before you buy, so the item that arrives is the item in the picture. Story 2.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/nova.jpg" alt="Nova, a small butterfly character with orange wings" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Nova · home buyer</h3>
-        <p class="cap">The butterfly with plans for the backyard. Her dream yard is staged into the real yard photo and priced piece by piece from real local listings.</p>
-        <p class="tech-mini"><b>Use case:</b> plan the place with real prices attached. Story 6.</p>
+        <p class="cap">The butterfly with plans for the backyard. Her dream yard gets staged into the real yard photo and priced piece by piece from real local listings, so the plan arrives with a bill she can argue with.</p>
+        <p class="tech-mini"><b>Use case:</b> stage the yard you want into the yard you have, with a real price on every piece. Story 6.</p>
       </div>
     </div>
 
@@ -611,20 +628,20 @@
       <div>
         <div class="panel"><img src="assets/cast/travis.jpg" alt="Travis, a goat in a maroon sweater" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Travis · homeowner</h3>
-        <p class="cap">The goat homeowner. He sends Brandon staged photos with their receipts attached, so the bid rests on proof instead of on his word.</p>
-        <p class="tech-mini"><b>Use case:</b> send photos a contractor can verify. Story 4.</p>
+        <p class="cap">The goat homeowner with a fence to fix. He photographs the damage as it stands, sends Brandon the photos with their receipts attached, and the bid rests on files anyone can re-check instead of on his word.</p>
+        <p class="tech-mini"><b>Use case:</b> send a contractor photos whose condition is proven, flaws and all. Story 4.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/brandon.jpg" alt="Brandon, a dog in a work jacket and cap" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Brandon · contractor</h3>
-        <p class="cap">The contractor who receives Travis's packet, checks the receipts himself, and sends back a bid.</p>
-        <p class="tech-mini"><b>Use case:</b> verify the photos before you price the job. Story 4.</p>
+        <p class="cap">The dog in the work jacket who prices jobs from other people's photos. He opens Travis's packet, re-runs the receipt check himself, and bids knowing the fence in the photos is the fence that is actually standing there.</p>
+        <p class="tech-mini"><b>Use case:</b> verify a customer's photos before you price the work, not after you arrive. Story 4.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/clay.jpg" alt="Clay, a fox carrying a dark backpack" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Clay · card buyer</h3>
-        <p class="cap">The fox who does not take a receipt's word for it. He re-runs the check, and the check re-does the counting from the files themselves.</p>
-        <p class="tech-mini"><b>Use case:</b> re-check any receipt with one command. Story 9.</p>
+        <p class="cap">The fox who buys collector cards from photos and does not take a receipt's word for anything. He re-runs the check, and the check re-counts the pixels from the stored files, so a retouched corner or a swapped card shows up before his money moves.</p>
+        <p class="tech-mini"><b>Use case:</b> re-verify a collectible's photo with one command before you pay for it. Story 9.</p>
       </div>
     </div>
 
@@ -632,20 +649,20 @@
       <div>
         <div class="panel"><img src="assets/cast/ana.jpg" alt="Ana, a deer in a blue dress with a red scarf" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Ana · mover</h3>
-        <p class="cap">The deer who photographs every room she is leaving. Each photo becomes a condition record with its receipt and notes attached, flaws kept in.</p>
-        <p class="tech-mini"><b>Use case:</b> a move-out record anyone can open from a link. Story 5.</p>
+        <p class="cap">The deer photographing every room she is leaving. Each photo becomes a condition record with its receipt and her notes attached, scratches and scuffs kept in, so move-out day ends with files instead of an argument.</p>
+        <p class="tech-mini"><b>Use case:</b> a move-out condition record the landlord can open and re-check from a link. Story 5.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/augustus.jpg" alt="Augustus, a rhino in a black gi with a red belt" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Augustus · landlord</h3>
-        <p class="cap">The rhino in the black gi and red belt, brows set permanently stern. His rental stands empty, so he fills it from real listings at real asking prices.</p>
-        <p class="tech-mini"><b>Use case:</b> furnish a rental from listings, priced and proven. Story 7.</p>
+        <p class="cap">The rhino in the black gi and red belt, brows set permanently stern. His rental stands empty, so he stages it full of furniture from real listings at real asking prices, and any tenant can check that the room itself was never altered.</p>
+        <p class="tech-mini"><b>Use case:</b> furnish an empty rental from real listings, priced per piece, with the room's own pixels proven untouched. Story 7.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/dustin.jpg" alt="Dustin, a penguin in a white shirt and black tie" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Dustin · tenant</h3>
-        <p class="cap">The penguin tenant. The film gives him one tile, "Dustin, move-out," and his place in this lineup. The tile stands for the tenant's side of the condition record.</p>
-        <p class="tech-mini"><b>Use case:</b> your own move-out record, receipt attached. Story 7.</p>
+        <p class="cap">The penguin tenant who learned the deposit lesson the expensive way, once. Now he photographs every wall and floor the week he moves in, receipts attached, so his side of the condition record exists before anyone can argue about a stain.</p>
+        <p class="tech-mini"><b>Use case:</b> your own move-in and move-out record, receipt attached, ready before a deposit dispute starts. Story 7.</p>
       </div>
     </div>
 
@@ -653,20 +670,20 @@
       <div>
         <div class="panel"><img src="assets/cast/hikaru.jpg" alt="Hikaru, a blue bird with a measuring tape around the neck" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Hikaru · maker</h3>
-        <p class="cap">The maker who lays a garment flat next to the printed agenthand card and gets real measurements out of a single photo.</p>
-        <p class="tech-mini"><b>Use case:</b> measurements without a tape measure. Story 8.</p>
+        <p class="cap">The blue bird with a measuring tape around his neck and no patience for guessed sizes. He lays a garment flat next to the printed agenthand card, takes one photo, and gets real measurements a buyer can trust.</p>
+        <p class="tech-mini"><b>Use case:</b> real measurements from a single photo, so a listing can state the size and prove it. Story 8.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/cj.jpg" alt="CJ, a tiger in a navy shirt holding a phone" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>CJ · seller</h3>
-        <p class="cap">The tiger seller, standing in the closing lineup.</p>
-        <p class="tech-mini"><b>Use case:</b> stage the listing photo, keep the product untouched.</p>
+        <p class="cap">The tiger who sells from his phone, photographing things where they sit: garage, driveway, spare room. agenthand restages each shot into a setting that sells, while the item itself stays pixel for pixel the one he owns, scuffs and dusty corners included.</p>
+        <p class="tech-mini"><b>Use case:</b> turn a cluttered garage photo into a listing photo, with a receipt proving nothing on the item was cleaned up.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/elliot.jpg" alt="Elliot, a bear in a grey hoodie holding a camera" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Elliot · marketer</h3>
-        <p class="cap">The bear with the camera, standing in the closing lineup.</p>
-        <p class="tech-mini"><b>Use case:</b> marketing photos that carry their own proof.</p>
+        <p class="cap">The bear with the camera, shooting product photos for people who sell online. He restages one honest photo for each shop and each feed instead of reshooting, and every version carries the same receipt, so the marketing can change its clothes but never the product.</p>
+        <p class="tech-mini"><b>Use case:</b> one product photo, restaged for every channel, with proof the product never changed between versions.</p>
       </div>
     </div>
 
@@ -674,35 +691,35 @@
       <div>
         <div class="panel"><img src="assets/cast/sheila.jpg" alt="Sheila, a snow leopard in a pink top carrying a gold trophy" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Sheila · neighbor</h3>
-        <p class="cap">The snow leopard neighbor, standing in the closing lineup.</p>
-        <p class="tech-mini"><b>Use case:</b> lend, borrow, and hand over with a record both sides can check.</p>
+        <p class="cap">The snow leopard everyone on the street borrows from: ladders, party gear, the good folding chairs. She photographs each thing as it leaves her garage, receipt attached, so what comes back can be checked against what went out.</p>
+        <p class="tech-mini"><b>Use case:</b> a handover record both sides can check, so lending to neighbors stays friendly.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/saul.jpg" alt="Saul, a red panda in a number 12 jersey holding two small red pandas" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Saul · collector</h3>
-        <p class="cap">The red panda collector, family in tow, standing in the closing lineup.</p>
-        <p class="tech-mini"><b>Use case:</b> know the item in the photo is the item that ships.</p>
+        <p class="cap">The red panda collector, family in tow, buying pieces he may only ever see in photographs. The receipt on a listing photo tells him the item pictured is the item that ships, not a cleaner stand-in swapped in for the camera.</p>
+        <p class="tech-mini"><b>Use case:</b> buy collectibles from photos, with proof the pictured item is the shipped item.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/chris.jpg" alt="Chris, a cheetah in a teal jersey and cap" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Chris · agent</h3>
-        <p class="cap">The cheetah agent, standing in the closing lineup.</p>
-        <p class="tech-mini"><b>Use case:</b> listings whose photos come with receipts.</p>
+        <p class="cap">The cheetah who lists homes for a living and knows buyers zoom in. He stages an empty room with furniture from real listings at real prices, while the room's own walls, floors and light stay exactly as photographed, which keeps him honest and out of trouble.</p>
+        <p class="tech-mini"><b>Use case:</b> stage a listing's rooms while proving the property itself was never retouched.</p>
       </div>
     </div>
 
     <div class="trio" style="margin-top:22px">
       <div>
-        <div class="panel"><img src="assets/cast/razvan.jpg" alt="Razvan, a beaver in a green shirt holding a coffee" style="aspect-ratio:3/4;object-fit:cover"></div>
+        <div class="panel"><img src="assets/cast/razvan.jpg" alt="Razvan, a Himalayan marmot in a green shirt holding a coffee" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Razvan · adjuster</h3>
-        <p class="cap">The beaver adjuster, coffee in hand, standing in the closing lineup.</p>
-        <p class="tech-mini"><b>Use case:</b> photo records that can be re-verified later.</p>
+        <p class="cap">The Himalayan marmot who reads damage claims, coffee in hand. When a claimant's photos arrive with receipts attached, he can re-verify months later that the dent, the stain or the crack in the file is the one photographed on the day, unedited since.</p>
+        <p class="tech-mini"><b>Use case:</b> claim photos that can be re-verified long after they were taken, so the file settles what the damage looked like.</p>
       </div>
       <div>
         <div class="panel"><img src="assets/cast/wade.jpg" alt="Wade, an armadillo in a teal polo shirt" style="aspect-ratio:3/4;object-fit:cover"></div>
         <h3>Wade · driver</h3>
-        <p class="cap">The armadillo driver, standing in the closing lineup.</p>
-        <p class="tech-mini"><b>Use case:</b> pickup and delivery photos with proof attached.</p>
+        <p class="cap">The armadillo who picks up and delivers the things everyone else here is buying and selling. He photographs each item at pickup and again at the door, receipts on both ends, so a scratch argument gets two checkable records instead of two opinions.</p>
+        <p class="tech-mini"><b>Use case:</b> pickup and delivery photos with proof attached, one record at each end of the trip.</p>
       </div>
     </div>
   </div>
@@ -802,6 +819,7 @@ agenthand evidence verify --all
 
 <footer>
   <div class="wrap">
+    <img class="footlogo" src="logo-rotating-v3.gif" alt="agenthand logo, a rotating blue circle">
     <p class="motto">Nothing changed <span class="hl">but the room.</span></p>
     <p>Built entirely during the hackathon · Oct 26 to Nov 4, 2026 · Pre-event work was research and planning only.</p>
     <p>The whole project, every run, test, and experiment, cost <b style="color:#fff">$4.52 in Meta API calls</b> (exact settled total $4.522337). The runs shown in the film cost $0.42 of that.</p>
