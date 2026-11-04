@@ -78,6 +78,7 @@ from . import (
     config,
     ingest,
     meta_client,
+    platemetrics,
     sceneguard,
     segmentation,
     staging,
@@ -105,6 +106,7 @@ def _persist_full_receipt(
     billing: dict,
     scene_prompt: str,
     scene_guard: dict,
+    plate_metrics: dict | None = None,
 ) -> dict:
     """Enrich the persisted fidelity receipt with run attribution.
 
@@ -129,8 +131,142 @@ def _persist_full_receipt(
             "call_ids": billing.get("call_ids", [billing.get("call_id")]),
         }
     )
+    if plate_metrics is not None:
+        full["plate_metrics"] = plate_metrics
     store.save_receipt(handle, full)
     return full
+
+
+def _measure_plate_metrics(store: AssetStore, source_handle: str) -> dict:
+    """The cut-time plate measurement (decision 152): one billed
+    Muse Spark vision read of the source photo. Never fatal: any
+    failure (no key, transport, unusable answer) records the
+    measurement as unavailable with the reason, and the cut
+    proceeds with every field an explicit unknown.
+
+    Returns the cut-result record; the mask chunk carries
+    {"status", **fields} from the same record.
+    """
+    base = {
+        "source": "vision",
+        "model": IDENTIFY_MODEL,
+        "rule": platemetrics.RULE,
+    }
+    try:
+        record = store.get_record(source_handle)
+        png_bytes = store.read_bytes(source_handle)
+        projected = meta_client.project_metrics_cost_usd(
+            IDENTIFY_MODEL, record.width, record.height
+        )
+    except Exception as exc:  # noqa: BLE001 - the record states the reason
+        return {
+            **base,
+            "status": "unavailable",
+            "fields": platemetrics.PlateMetrics.unknown().to_json(),
+            "reason": str(exc),
+        }
+    outcome: dict = {}
+
+    def _call() -> dict:
+        metrics, usage = meta_client.vision_plate_metrics(
+            png_bytes, model=IDENTIFY_MODEL
+        )
+        outcome["metrics"] = metrics
+        return usage
+
+    try:
+        billing = meta_client.billed_call(
+            "cut_out",
+            IDENTIFY_MODEL,
+            projected,
+            _call,
+            note="plate metrics vision read (decision 152)",
+        )
+    except Exception as exc:  # noqa: BLE001 - the record states the reason
+        return {
+            **base,
+            "status": "unavailable",
+            "fields": platemetrics.PlateMetrics.unknown().to_json(),
+            "reason": str(exc),
+        }
+    return {
+        **base,
+        "status": "measured",
+        "fields": outcome["metrics"].to_json(),
+        "cost_usd": billing["actual_usd"],
+        "call_id": billing["call_id"],
+    }
+
+
+def _plate_metrics_draw_record(
+    stored,
+    status: str,
+    conflicts: list,
+    gate_status: str,
+    gate_attempts: list,
+    gate_reason: str | None,
+    grounding: dict,
+    placement_json: dict | None,
+) -> dict:
+    """The `plate_metrics` record persisted on the draw receipt and
+    mirrored onto the tool result (decision 152): the stored
+    measurement, the clauses it composed (enforced draws only), the
+    scene phrases it overrode, and the gate's outcome as it stands.
+    """
+    gate = {"status": gate_status, "attempts": gate_attempts}
+    if gate_reason is not None:
+        gate["reason"] = gate_reason
+    record = {
+        "status": status,
+        "measured": stored[0].to_json() if stored else None,
+        "gate": gate,
+        "grounding": grounding,
+        "rule": platemetrics.RULE,
+    }
+    if placement_json is not None:
+        record["placement"] = placement_json
+    if status == "enforced" and stored:
+        record["clauses"] = platemetrics.clauses_for(stored[0]).to_json()
+        record["overridden_scene_phrases"] = conflicts
+    return record
+
+
+def _run_plate_gate(store: AssetStore, composite_handle: str) -> tuple:
+    """One gate read: the plate-metrics measurement of a finished
+    composite, billed through the choke point (decision 152).
+    Returns ("observed", metrics, cost_usd, call_id), or
+    ("unavailable", reason) — a read that cannot run is recorded
+    by the caller as unverified, never as passed.
+    """
+    try:
+        meta_client.require_meta_api_key()
+        record = store.get_record(composite_handle)
+        png_bytes = store.read_bytes(composite_handle)
+        projected = meta_client.project_metrics_cost_usd(
+            IDENTIFY_MODEL, record.width, record.height
+        )
+    except Exception as exc:  # noqa: BLE001 - the record states the reason
+        return ("unavailable", str(exc))
+    outcome: dict = {}
+
+    def _call() -> dict:
+        metrics, usage = meta_client.vision_plate_metrics(
+            png_bytes, model=IDENTIFY_MODEL
+        )
+        outcome["metrics"] = metrics
+        return usage
+
+    try:
+        billing = meta_client.billed_call(
+            "draw",
+            IDENTIFY_MODEL,
+            projected,
+            _call,
+            note="plate geometry gate read (decision 152)",
+        )
+    except Exception as exc:  # noqa: BLE001 - the record states the reason
+        return ("unavailable", str(exc))
+    return ("observed", outcome["metrics"], billing["actual_usd"], billing["call_id"])
 
 
 VERIFY_URL_BASE = "https://ausernameforyou.github.io/agenthand/verify"
@@ -299,74 +435,292 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
         return _error("NOT_CONFIGURED", str(exc))
 
     projected = meta_client.project_draw_cost_usd(DRAW_BACKGROUND_MODEL)
-    try:
-        plate_handle, billing = meta_client.generate_background_plate(
-            scene_prompt,
-            foreground_record.width,
-            foreground_record.height,
-            model=DRAW_BACKGROUND_MODEL,
-            store=store,
-            foreground_bbox=store.read_image(asset).getbbox(),
-        )
-    except meta_client.ImageResultError as exc:
-        return _error(
-            exc.code,
-            str(exc),
-            cost_counted_usd=getattr(exc, "cost_counted_usd", projected),
-        )
 
-    quality = billing["plate_quality"]
-    fallback_kwargs = {}
-    if quality["fallback"]:
-        from .backdrop import backdrop_info
-
-        fallback_kwargs = {
-            "plate_kind": "code_rendered",
-            "backdrop": backdrop_info("studio_gray"),
+    # Plate metrics (decision 152): the measurement cut_out stored
+    # in the mask chunk, read once here. The plate is composed with
+    # the measurement's system-owned clauses appended after the
+    # compiled plate instruction, and the finished composite is
+    # gated against the measurement below. Masks written before the
+    # record existed leave the draw as it was, with the record
+    # saying unmeasured.
+    stored_metrics = composite.mask_plate_metrics_of(store, asset)
+    metric_conflicts = (
+        platemetrics.scene_conflicts(stored_metrics[0], scene_prompt)
+        if stored_metrics
+        else []
+    )
+    metrics_status = (
+        "enforced"
+        if stored_metrics and stored_metrics[1] == "measured"
+        else "unmeasured"
+    )
+    # Grounding and placement (decisions 152/153), computed from
+    # local geometry before any spend: the source box's resting
+    # line predicts whether a painted surface can reach the
+    # product, and the draw plans the translation that grounds it —
+    # horizontally centred, base on the measured ground line. The
+    # plate is composed knowing the anchor (the anchor clause in
+    # clauses_for), the compositor applies the offset, and the gate
+    # reads the composite at the placed position.
+    foreground_image = store.read_image(asset)
+    _geometry = staging.analyze_subject(foreground_image)
+    _estimate = staging.estimate_shot_angle(_geometry)
+    grounding = platemetrics.grounding_assessment(
+        _estimate.signals.contact_y if _estimate.signals is not None else None
+    )
+    placement_json = None
+    placement_for_compositor = None
+    if metrics_status == "enforced" and _geometry.bbox is not None:
+        plan = platemetrics.plan_placement(
+            foreground_image.width,
+            foreground_image.height,
+            _geometry.bbox,
+            stored_metrics[0],
+        )
+        placement_json = plan.to_json()
+        if prepared.get("reconstruction_handle"):
+            # A paper reconstruction layer is anchored to the cut's
+            # own frame; moving the product would strand the paper.
+            # The plan is recorded, not applied.
+            placement_json = {
+                **placement_json,
+                "applied": False,
+                "reason": "not applied: a paper reconstruction layer is anchored to the cut's own frame, so the product layer stays where the cut put it",
+            }
+        else:
+            placement_for_compositor = placement_json
+    gate_attempts: list = []
+    gate_cost_usd = 0.0
+    gate_status = "pending"
+    gate_reason = None
+    plates_actual = 0.0
+    plates_projected = 0.0
+    plates_images = 0
+    plate_call_ids: list = []
+    attempt = 0
+    while True:
+        attempt += 1
+        clause = None
+        if metrics_status == "enforced":
+            clause = platemetrics.clause_text(
+                platemetrics.clauses_for(stored_metrics[0]),
+                strengthened=attempt > 1,
+            )
+        try:
+            plate_handle, gen_billing = meta_client.generate_background_plate(
+                scene_prompt,
+                foreground_record.width,
+                foreground_record.height,
+                model=DRAW_BACKGROUND_MODEL,
+                store=store,
+                foreground_bbox=foreground_image.getbbox(),
+                metric_clause=clause,
+            )
+        except meta_client.ImageResultError as exc:
+            return _error(
+                exc.code,
+                str(exc),
+                cost_counted_usd=plates_actual
+                + getattr(exc, "cost_counted_usd", projected),
+            )
+        # Plate spend accumulates across the gate's retry, the way
+        # identify accumulates its failed attempts: the delivered
+        # draw's receipt states what the draw actually cost in
+        # plates. Gate reads are itemized in the metrics record.
+        plates_actual = round(plates_actual + gen_billing["actual_usd"], 10)
+        plates_projected = round(plates_projected + gen_billing["projected_usd"], 10)
+        plates_images += (gen_billing.get("usage") or {}).get("images", 0)
+        plate_call_ids.extend(
+            gen_billing.get("call_ids", [gen_billing.get("call_id")])
+        )
+        billing = {
+            **gen_billing,
+            "actual_usd": plates_actual,
+            "projected_usd": plates_projected,
+            "usage": {"images": plates_images},
+            "call_ids": plate_call_ids,
         }
-    handle, receipt = composite.draw_product(
-        store,
-        asset,
-        scene_prompt,
-        plate_handle=plate_handle,
-        plate_quality_report=quality,
-        **prepared,
-        **fallback_kwargs,
-    )
-    # The receipt is persisted (with cost and call attribution) even
-    # when the composite fails the Lock checks below: a violation's
-    # receipt is exactly the evidence an inspector needs.
-    full_receipt = _persist_full_receipt(
-        store, handle, receipt, billing, scene_prompt, scene_guard_record
-    )
-    if receipt["changed_opaque_pixels"] != 0 or not receipt["color_profile_preserved"]:
-        # The Lock is measured, not assumed: a composite that changed
-        # opaque product pixels — or that lost/changed the source
-        # photo's colour profile, which changes the product's displayed
-        # colours while pixel values stay identical — must not ship
-        # under a fidelity receipt claiming otherwise. The composite
-        # stays stored for inspection (its handle rides in the error),
-        # but the tool reports failure.
-        failures = []
-        if receipt["changed_opaque_pixels"] != 0:
-            failures.append(
-                "the compositor measured "
-                f"{receipt['changed_opaque_pixels']} changed opaque "
-                "foreground pixels"
+        quality = gen_billing["plate_quality"]
+        fallback_kwargs = {}
+        if quality["fallback"]:
+            from .backdrop import backdrop_info
+
+            fallback_kwargs = {
+                "plate_kind": "code_rendered",
+                "backdrop": backdrop_info("studio_gray"),
+            }
+        handle, receipt = composite.draw_product(
+            store,
+            asset,
+            scene_prompt,
+            plate_handle=plate_handle,
+            plate_quality_report=quality,
+            placement=placement_for_compositor,
+            **prepared,
+            **fallback_kwargs,
+        )
+        # The receipt is persisted (with cost and call attribution) even
+        # when the composite fails the Lock checks below: a violation's
+        # receipt is exactly the evidence an inspector needs. The
+        # metrics record rides on it from the start (gate still
+        # pending), so even a composite refused further down carries
+        # the measurement it was drawn under.
+        full_receipt = _persist_full_receipt(
+            store,
+            handle,
+            receipt,
+            billing,
+            scene_prompt,
+            scene_guard_record,
+            plate_metrics=_plate_metrics_draw_record(
+                stored_metrics,
+                metrics_status,
+                metric_conflicts,
+                gate_status,
+                gate_attempts,
+                gate_reason,
+                grounding,
+                placement_json,
+            ),
+        )
+        if receipt["changed_opaque_pixels"] != 0 or not receipt["color_profile_preserved"]:
+            # The Lock is measured, not assumed: a composite that changed
+            # opaque product pixels — or that lost/changed the source
+            # photo's colour profile, which changes the product's displayed
+            # colours while pixel values stay identical — must not ship
+            # under a fidelity receipt claiming otherwise. The composite
+            # stays stored for inspection (its handle rides in the error),
+            # but the tool reports failure.
+            failures = []
+            if receipt["changed_opaque_pixels"] != 0:
+                failures.append(
+                    "the compositor measured "
+                    f"{receipt['changed_opaque_pixels']} changed opaque "
+                    "foreground pixels"
+                )
+            if not receipt["color_profile_preserved"]:
+                failures.append(
+                    "the composite does not carry the source photo's "
+                    "colour profile unchanged"
+                )
+            return _error(
+                "FIDELITY_VIOLATION",
+                "; ".join(failures)
+                + "; refusing to present this composite under the Fidelity Lock.",
+                output_asset=handle,
+                fidelity_receipt=receipt,
+                cost_usd=billing["actual_usd"],
             )
-        if not receipt["color_profile_preserved"]:
-            failures.append(
-                "the composite does not carry the source photo's "
-                "colour profile unchanged"
+        # --- plate geometry gate (decision 152): the composite is
+        # measured with the same read that measured the source, and
+        # the two measurements are compared. A mismatch retries the
+        # draw once with strengthened clauses; a second mismatch
+        # refuses. The gate never silently passes a plate it
+        # measured as disagreeing.
+        if quality["fallback"]:
+            gate_status = "not_applicable"
+            gate_reason = (
+                "the plate fell back to the deterministic studio backdrop "
+                "after the plate-quality checks; a code-rendered backdrop "
+                "has no painted camera or light to gate"
             )
+            break
+        if metrics_status != "enforced":
+            gate_status = "unmeasured"
+            gate_reason = (
+                "no plate metrics recorded in the foreground's mask; the cut predates the measurement"
+                if stored_metrics is None
+                else "the cut-time metrics read was unavailable, so every field is unknown; nothing to enforce or gate"
+            )
+            break
+        measured = stored_metrics[0]
+        if measured.nothing_to_gate():
+            gate_status = "unmeasured"
+            gate_reason = "the cut-time read recorded camera, light and frame share as unknown; nothing to gate against"
+            break
+        gate_outcome = _run_plate_gate(store, handle)
+        if gate_outcome[0] == "unavailable":
+            gate_attempts.append(
+                {
+                    "attempt": attempt,
+                    "plate_asset": plate_handle,
+                    "status": "unverified",
+                    "reason": gate_outcome[1],
+                }
+            )
+            gate_status = "unverified"
+            gate_reason = gate_outcome[1]
+            break
+        _, observed, gate_read_cost, gate_call_id = gate_outcome
+        gate_cost_usd = round(gate_cost_usd + gate_read_cost, 10)
+        comparison = platemetrics.compare(measured, observed)
+        gate_attempts.append(
+            {
+                "attempt": attempt,
+                "plate_asset": plate_handle,
+                "observed": observed.to_json(),
+                "mismatches": comparison.mismatches,
+                "notes": comparison.notes,
+                "cost_usd": gate_read_cost,
+                "call_id": gate_call_id,
+            }
+        )
+        if comparison.is_pass():
+            gate_status = "pass_after_retry" if attempt > 1 else "pass"
+            break
+        if attempt == 1:
+            gate_status = "retrying"
+            # Stamp the rejected attempt's receipt with the gate
+            # outcome before drawing its replacement: the rejected
+            # composite stays evidence, labelled.
+            full_receipt["plate_metrics"] = _plate_metrics_draw_record(
+                stored_metrics,
+                metrics_status,
+                metric_conflicts,
+                gate_status,
+                gate_attempts,
+                gate_reason,
+                grounding,
+                placement_json,
+            )
+            store.save_receipt(handle, full_receipt)
+            continue
+        gate_status = "refused"
+        record = _plate_metrics_draw_record(
+            stored_metrics,
+            metrics_status,
+            metric_conflicts,
+            gate_status,
+            gate_attempts,
+            gate_reason,
+            grounding,
+            placement_json,
+        )
+        full_receipt["plate_metrics"] = record
+        store.save_receipt(handle, full_receipt)
         return _error(
-            "FIDELITY_VIOLATION",
-            "; ".join(failures)
-            + "; refusing to present this composite under the Fidelity Lock.",
+            "PLATE_GEOMETRY_MISMATCH",
+            platemetrics.refusal_message(measured, comparison.mismatches),
+            cost_counted_usd=round(plates_actual + gate_cost_usd, 10),
+            call_made=True,
             output_asset=handle,
             fidelity_receipt=receipt,
-            cost_usd=billing["actual_usd"],
+            plate_metrics=record,
         )
+    # The final metrics record (gate resolved) on the persisted
+    # receipt, stamped before the verify annotation hashes it.
+    plate_metrics_record = _plate_metrics_draw_record(
+        stored_metrics,
+        metrics_status,
+        metric_conflicts,
+        gate_status,
+        gate_attempts,
+        gate_reason,
+        grounding,
+        placement_json,
+    )
+    full_receipt["plate_metrics"] = plate_metrics_record
+    store.save_receipt(handle, full_receipt)
 
     result = {
         "status": "ok",
@@ -376,6 +730,7 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
         "output_asset": handle,
         "plate_asset": plate_handle,
         "scene_guard": scene_guard_record,
+        "plate_metrics": plate_metrics_record,
         "stage_spec": quality["stage_spec"],
         "scene_prompt_note": "Scene prose was reduced to studio/concrete/warm selections; unmatched words were dropped.",
         "fidelity_receipt": receipt,
@@ -393,9 +748,8 @@ def draw(asset: str, scene_prompt: str) -> list | dict:
     # the foreground's mask geometry and recorded on the RESULT only,
     # never in the fidelity receipt. Python's plate is text-only (the
     # generated mode), so the clause takes the steering form, as in
-    # the Rust build's generated branch.
-    _geometry = staging.analyze_subject(store.read_image(asset))
-    _estimate = staging.estimate_shot_angle(_geometry)
+    # the Rust build's generated branch. The geometry and estimate
+    # are the ones the grounding assessment above already computed.
     result["angle_lock"] = staging.angle_lock_record(
         _estimate, staging.generated_angle_steer(_estimate)
     )
@@ -436,6 +790,31 @@ def _draw_with_placeholder_plate(
         status="stub",
         note="Local placeholder plate (dev flag AGENTHAND_DRAW_PLACEHOLDER_PLATE); no API call.",
     )
+    # Plate metrics (decision 152): no model call happens in
+    # placeholder mode, so nothing was generated to enforce or
+    # gate; the record carries the stored measurement and the gate
+    # states skipped, with the reason.
+    stored_metrics = composite.mask_plate_metrics_of(store, asset)
+    try:
+        _ph_geometry = staging.analyze_subject(store.read_image(asset))
+        _ph_estimate = staging.estimate_shot_angle(_ph_geometry)
+        grounding = platemetrics.grounding_assessment(
+            _ph_estimate.signals.contact_y
+            if _ph_estimate.signals is not None
+            else None
+        )
+    except Exception:  # noqa: BLE001 - the assessment is a record, not a gate
+        grounding = platemetrics.grounding_assessment(None)
+    plate_metrics_record = _plate_metrics_draw_record(
+        stored_metrics,
+        "skipped",
+        [],
+        "skipped",
+        [],
+        "placeholder plate (offline dev mode): no plate was generated, so there is nothing to gate",
+        grounding,
+        None,
+    )
     full_receipt = _persist_full_receipt(
         store,
         outcome["handle"],
@@ -443,6 +822,7 @@ def _draw_with_placeholder_plate(
         billing,
         scene_prompt,
         scene_guard_record,
+        plate_metrics=plate_metrics_record,
     )
     result = {
         "status": "ok",
@@ -452,6 +832,7 @@ def _draw_with_placeholder_plate(
         "output_asset": outcome["handle"],
         "plate_asset": None,
         "scene_guard": scene_guard_record,
+        "plate_metrics": plate_metrics_record,
         "stage_spec": None,
         "scene_prompt_note": "Offline placeholder mode uses the scene text directly; no StageSpec was sent to an image model.",
         "fidelity_receipt": outcome["receipt"],
@@ -670,6 +1051,18 @@ def cut_out(image: str, concept: str | None = None) -> dict:
             cost_counted_usd=getattr(exc, "cost_counted_usd", projected),
         )
 
+    # Plate metrics (decision 152): one vision read of the source
+    # photo measures how it was taken, and the record rides in the
+    # mask's provenance chunk — inside the file whose hashes the
+    # asset record pins — so a later draw can compose its plate
+    # from the measurement and gate the result against it. Never
+    # fatal: a failed read stores explicit unknowns instead.
+    plate_metrics_record = _measure_plate_metrics(store, handle)
+    plate_metrics_chunk = {
+        "status": plate_metrics_record["status"],
+        **plate_metrics_record["fields"],
+    }
+
     # The winning mask is in the SAM frame; map it onto the full source
     # frame before anything is cut, reviewed, or stored, so every
     # downstream artifact (mask asset, foreground, overlay) is at the
@@ -695,7 +1088,11 @@ def cut_out(image: str, concept: str | None = None) -> dict:
     # carried it from the start). The result's mask_provenance and
     # the receipt's mask_* fields are unchanged (draw republishes
     # only the five frame fields).
-    mask_text = {**mask_provenance, "concept": outcome["phrase"]}
+    mask_text = {
+        **mask_provenance,
+        "concept": outcome["phrase"],
+        "plate_metrics": plate_metrics_chunk,
+    }
     pnginfo.add_text(
         MASK_PROVENANCE_PNG_KEY,
         json.dumps(mask_text, separators=(",", ":"), sort_keys=True),
@@ -755,6 +1152,7 @@ def cut_out(image: str, concept: str | None = None) -> dict:
         "cut_evidence": evidence_records,
         "cut_pipeline_version": outcome["pipeline_version"],
         "mask_provenance": mask_provenance,
+        "plate_metrics": plate_metrics_record,
         "hashes": {
             "source": {
                 "sha256": source_record.sha256,

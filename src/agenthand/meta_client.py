@@ -71,7 +71,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from pathlib import Path
 
-from . import config, ledger, pricing
+from . import config, ledger, platemetrics, pricing
 
 # A usage dict as returned by a billable call: any of these keys.
 UsageDict = dict[str, int]
@@ -941,6 +941,81 @@ def vision_identify(
 
 
 # ---------------------------------------------------------------------------
+# Plate metrics vision calls (Muse Spark, chat transport).
+# ---------------------------------------------------------------------------
+
+#: Output cap for one plate-metrics read: the answer is seven
+#: short fields.
+METRICS_MAX_TOKENS = 512
+
+#: Prompt-token allowance of the metrics instructions, for the
+#: projected cost (same accounting shape as identify's).
+_METRICS_PROMPT_TOKENS = 320
+
+
+def project_metrics_cost_usd(
+    model: str, width: int | None, height: int | None
+) -> float:
+    """Worst-case USD projection for one plate-metrics read: the
+    single call's estimate (there is no repair path to cover)."""
+    input_tokens = estimate_image_input_tokens(width, height) + _METRICS_PROMPT_TOKENS
+    one_call = pricing.estimate_cost_usd(
+        model, input_tokens=input_tokens, output_tokens=METRICS_MAX_TOKENS
+    )
+    return round(one_call, 6)
+
+
+def vision_plate_metrics(
+    png_bytes: bytes,
+    *,
+    model: str,
+    client=None,
+) -> tuple[platemetrics.PlateMetrics, UsageDict]:
+    """One real plate-metrics call against the Meta Model API.
+
+    How the photo in `png_bytes` was taken — camera elevation and
+    azimuth, key light direction, ground line, product frame share,
+    surface texture period and quality register (platemetrics.py).
+    Used at cut_out on the source photo and by the draw gate on the
+    finished composite: the same measurement applied to both is
+    what makes the comparison honest. One call, no repair path: an
+    unusable answer raises IdentifyResultError and the caller
+    records the read as unavailable with the reason.
+
+    This function performs network I/O and must only be invoked as
+    the fn of billed_call, so the spend is reserved before it runs
+    and settled (or left counted) afterwards. `client` is
+    injectable for offline tests.
+    """
+    if client is None:
+        client = build_client()
+    data_uri = "data:image/png;base64," + base64.b64encode(png_bytes).decode()
+    response = client.chat.completions.create(
+        model=model,
+        max_tokens=METRICS_MAX_TOKENS,
+        response_format={
+            "type": "json_schema",
+            "json_schema": platemetrics.METRICS_SCHEMA,
+        },
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": platemetrics.METRICS_INSTRUCTIONS},
+                    {"type": "image_url", "image_url": {"url": data_uri}},
+                ],
+            }
+        ],
+    )
+    usage = _usage_of(response)
+    content = response.choices[0].message.content or ""
+    try:
+        return platemetrics.parse_metrics_payload(content), usage
+    except ValueError as exc:
+        raise IdentifyResultError(str(exc)) from exc
+
+
+# ---------------------------------------------------------------------------
 # SAM 3.1 segmentation calls (Responses API transport).
 # ---------------------------------------------------------------------------
 
@@ -1126,14 +1201,25 @@ class ImageResultError(RuntimeError):
         self.code = code
 
 
-def wrap_plate_prompt(scene_prompt: str | StageSpec) -> str:
-    """Compile a constrained versioned stage specification through one template."""
+def wrap_plate_prompt(
+    scene_prompt: str | StageSpec, metric_clause: str | None = None
+) -> str:
+    """Compile a constrained versioned stage specification through one template.
+
+    `metric_clause` (platemetrics.py, decision 152) is system-owned
+    text measured from the product photo itself; when given, it is
+    appended after the compiled instruction so it is the last word
+    the image model reads.
+    """
     spec = (
         scene_prompt
         if isinstance(scene_prompt, StageSpec)
         else StageSpec.from_scene(scene_prompt)
     )
-    return _PLATE_INSTRUCTION.format(**asdict(spec))
+    wrapped = _PLATE_INSTRUCTION.format(**asdict(spec))
+    if metric_clause:
+        return f"{wrapped} {metric_clause}"
+    return wrapped
 
 
 def closest_image_size(width: int | None, height: int | None) -> str:
@@ -1240,6 +1326,7 @@ def _request_plate_image(
     *,
     model: str,
     client=None,
+    metric_clause: str | None = None,
 ) -> tuple[bytes, UsageDict]:
     """One real muse-image call; returns (plate PNG bytes, usage).
 
@@ -1260,7 +1347,7 @@ def _request_plate_image(
     try:
         response = client.images.generate(
             model=model,
-            prompt=wrap_plate_prompt(prompt),
+            prompt=wrap_plate_prompt(prompt, metric_clause),
             size=size,
             n=1,
         )
@@ -1289,6 +1376,7 @@ def generate_background_plate(
     store=None,
     client=None,
     foreground_bbox: list[int] | tuple[int, ...] | None = None,
+    metric_clause: str | None = None,
 ) -> tuple[str, dict]:
     """Generate a background plate through the billing choke point.
 
@@ -1332,7 +1420,8 @@ def generate_background_plate(
 
         def _call() -> UsageDict:
             png_bytes, usage = _request_plate_image(
-                spec, width, height, model=model, client=client
+                spec, width, height, model=model, client=client,
+                metric_clause=metric_clause,
             )
             outcome["handle"] = store.put_bytes(
                 png_bytes, kind=KIND_PLATE, suffix=".png"

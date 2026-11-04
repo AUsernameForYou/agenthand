@@ -35,6 +35,19 @@ IDENTIFY_PAYLOAD = {
     "condition_notes": "Light corner wear visible; no tears or stains.",
 }
 
+# The plate-metrics read (decision 152) that cut_out runs on the
+# source photo after a successful cut: one more chat call on the
+# same fake transport, scripted alongside the SAM responses.
+METRICS_PAYLOAD = {
+    "camera_elevation": "high",
+    "camera_azimuth": "front-left",
+    "light_direction": "left",
+    "ground_line": 0.78,
+    "product_frame_share": 0.31,
+    "surface_texture_period": 0.12,
+    "surface_quality": "premium",
+}
+
 
 @pytest.fixture(autouse=True)
 def scratch_env(tmp_path, monkeypatch):
@@ -114,7 +127,11 @@ def _install_fake(monkeypatch, client: _FakeClient) -> _FakeClient:
 
 def test_cut_out_success_with_provided_concept(monkeypatch):
     client = _install_fake(
-        monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)])
+        monkeypatch,
+        _FakeClient(
+            chat_responses=[_chat_response(METRICS_PAYLOAD)],
+            sam_responses=[_sam_response(GOOD_TEXT)],
+        ),
     )
     result = server.cut_out(_photo_uri(), "brown leather wallet")
 
@@ -170,7 +187,13 @@ def test_cut_out_success_with_provided_concept(monkeypatch):
 
     # Ledger: one reservation, settled at one image.
     records = _records("cut_out")
-    assert [r["phase"] for r in records] == ["pending", "settled"]
+    # Two billed calls: the SAM cut, then the plate-metrics read.
+    assert [r["phase"] for r in records] == [
+        "pending",
+        "settled",
+        "pending",
+        "settled",
+    ]
     assert records[0]["usd_estimate"] == 0.0025
     assert records[1]["usd_estimate"] == 0.0025
     assert records[1]["images"] == 1
@@ -228,7 +251,10 @@ def test_cut_out_recovers_with_first_alternate_after_zero_match(monkeypatch):
     client = _install_fake(
         monkeypatch,
         _FakeClient(
-            chat_responses=[_chat_response(IDENTIFY_PAYLOAD)],
+            chat_responses=[
+                _chat_response(IDENTIFY_PAYLOAD),
+                _chat_response(METRICS_PAYLOAD),
+            ],
             sam_responses=[
                 _sam_response(""),
                 _sam_response(GOOD_TEXT),
@@ -265,11 +291,18 @@ def test_cut_out_recovers_with_first_alternate_after_zero_match(monkeypatch):
     assert result["usage"]["images"] == 3
     assert result["cost_usd"] == 0.0075
     cut_records = _records("cut_out")
-    assert [r["phase"] for r in cut_records] == ["pending", "settled"]
+    assert [r["phase"] for r in cut_records] == [
+        "pending",
+        "settled",
+        "pending",
+        "settled",
+    ]
     assert cut_records[0]["usd_estimate"] == 0.0075  # reservation priced both attempts
     assert cut_records[1]["images"] == 3
     tools = [r["tool"] for r in _records() if r["phase"] == "pending"]
-    assert tools == ["identify", "cut_out"]
+    # identify plans, cut_out segments, and cut_out measures the
+    # plate metrics (decision 152) — three reservations in all.
+    assert tools == ["identify", "cut_out", "cut_out"]
 
 
 # -- failure paths: spend counted, structured errors -----------------------------
@@ -393,7 +426,11 @@ def test_cut_out_refuses_a_composite_handle(monkeypatch):
     # would launder them into a "foreground" chained to the photo.
     monkeypatch.setenv("AGENTHAND_DRAW_PLACEHOLDER_PLATE", "1")
     client = _install_fake(
-        monkeypatch, _FakeClient(sam_responses=[_sam_response(GOOD_TEXT)])
+        monkeypatch,
+        _FakeClient(
+            chat_responses=[_chat_response(METRICS_PAYLOAD)],
+            sam_responses=[_sam_response(GOOD_TEXT)],
+        ),
     )
     cut = server.cut_out(_photo_uri(), "brown leather wallet")
     assert cut["status"] == "ok"
@@ -404,9 +441,17 @@ def test_cut_out_refuses_a_composite_handle(monkeypatch):
     assert result["status"] == "error"
     assert result["error"]["code"] == "NOT_A_SOURCE_PHOTO"
     assert result["output_asset"] is None
-    # No second SAM call, no second cut_out reservation.
+    # No second SAM call, no second cut_out reservation: the first
+    # cut's two calls (SAM, then the plate-metrics read) are all
+    # the ledger holds.
     assert len(client.responses.calls) == 1
-    assert [r["phase"] for r in _records("cut_out")] == ["pending", "settled"]
+    assert len(client.completions.calls) == 1
+    assert [r["phase"] for r in _records("cut_out")] == [
+        "pending",
+        "settled",
+        "pending",
+        "settled",
+    ]
 
 
 def test_cut_out_refuses_over_cap_before_any_api_call(monkeypatch):
@@ -441,7 +486,11 @@ def test_cut_out_scales_oversize_source_and_maps_the_mask_back(monkeypatch):
 
     monkeypatch.setattr(segmentation, "SAM_MAX_PIXELS", 12)
     client = _install_fake(
-        monkeypatch, _FakeClient(sam_responses=[_sam_response(SCALED_TEXT)])
+        monkeypatch,
+        _FakeClient(
+            chat_responses=[_chat_response(METRICS_PAYLOAD)],
+            sam_responses=[_sam_response(SCALED_TEXT)],
+        ),
     )
     result = server.cut_out(_photo_uri(), "brown leather wallet")
     assert result["status"] == "ok"
@@ -480,11 +529,13 @@ def test_cut_out_scales_oversize_source_and_maps_the_mask_back(monkeypatch):
 
     text = png_text_of_bytes(store.read_bytes(result["mask_asset"]))
     # The chunk carries the five provenance fields plus the accepted
-    # concept (the scene guard's check material); the result's
-    # mask_provenance stays the five fields alone.
+    # concept (the scene guard's check material) and the plate
+    # metrics (decision 152); the result's mask_provenance stays the
+    # five fields alone.
     assert json.loads(text["agenthand_mask_provenance"]) == {
         **result["mask_provenance"],
         "concept": result["concept"],
+        "plate_metrics": {"status": "measured", **METRICS_PAYLOAD},
     }
     mask_image = store.read_image(result["mask_asset"])
     assert mask_image.size == (8, 6)

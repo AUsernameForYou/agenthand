@@ -336,7 +336,11 @@ def verify_quality(store, foreground_handle, receipt):
             layer,
         )
     else:
-        rebuilt, _, _ = composite.composite_images(fg, plate, layer)
+        # A placed draw (decision 153) is rebuilt from the layer at
+        # its receipted offset.
+        rebuilt, _, _ = composite.composite_images(
+            composite.placed_foreground(receipt, fg), plate, layer
+        )
     delivered = store.read_image(receipt["output_asset"])
     check(
         "quality_layer_reproduction",

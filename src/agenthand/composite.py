@@ -723,6 +723,85 @@ def mask_concept_of(store: AssetStore, foreground_handle: str) -> str | None:
     return concept or None
 
 
+def mask_plate_metrics_of(
+    store: AssetStore, foreground_handle: str
+) -> tuple["platemetrics.PlateMetrics", str] | None:
+    """The plate metrics cut_out stored in the foreground's mask
+    chunk (decision 152), as (metrics, chunk status); None when the
+    mask predates the record or cannot be read.
+
+    Mirror of the Rust build's `mask_plate_metrics_of`. Like the
+    concept, the metrics are check material, not a gate: a mask
+    written before they were recorded must still draw, with the
+    draw's record saying unmeasured.
+    """
+    from . import platemetrics
+
+    try:
+        chain = validate_foreground(store, foreground_handle)
+    except Exception:
+        return None
+    mask = next((record for record in chain if record.kind == KIND_MASK), None)
+    if mask is None:
+        return None
+    try:
+        raw = png_text_of_bytes(
+            store.read_bytes(HANDLE_PREFIX + mask.asset_id)
+        ).get(MASK_PROVENANCE_PNG_KEY)
+        if raw is None:
+            return None
+        parsed = json.loads(raw)
+        record = parsed.get("plate_metrics")
+        if not isinstance(record, dict):
+            return None
+        status = record.get("status")
+        if not isinstance(status, str):
+            status = "measured"
+    except Exception:
+        return None
+    return platemetrics.PlateMetrics.from_json(record), status
+
+
+def translate_layer(image: Image.Image, dx: int, dy: int) -> Image.Image:
+    """A copy of `image` translated by (dx, dy) on a transparent
+    canvas of the same size (decision 153): every pixel value is
+    copied byte for byte, nothing is resampled; pixels that would
+    land outside the frame are dropped (placement plans clamp the
+    offset so a product's bounding box never clips). The ICC
+    profile rides along, as on every composite.
+
+    Mirror of the Rust build's `translate_layer`.
+    """
+    out = Image.new("RGBA", image.size, (0, 0, 0, 0))
+    out.paste(image.convert("RGBA"), (dx, dy))
+    icc = image.info.get("icc_profile")
+    if icc is not None:
+        out.info["icc_profile"] = icc
+    return out
+
+
+def placed_foreground(receipt: dict, foreground: Image.Image) -> Image.Image:
+    """The stored foreground as the draw placed it (decision 153):
+    translated by the receipt's placement offset when the receipt
+    carries one, else the foreground itself. Every verifier path
+    that recounts or rebuilds the composite from the stored layer
+    goes through here, so a placed draw is checked at its placed
+    offset everywhere — and a receipt claiming an offset its
+    composite does not honour fails each of those checks.
+    """
+    placement = receipt.get("placement") or {}
+    dx, dy = placement.get("dx"), placement.get("dy")
+    if (
+        isinstance(dx, int)
+        and not isinstance(dx, bool)
+        and isinstance(dy, int)
+        and not isinstance(dy, bool)
+        and (dx != 0 or dy != 0)
+    ):
+        return translate_layer(foreground, dx, dy)
+    return foreground
+
+
 def validate_foreground(store: AssetStore, foreground_handle: str) -> list[AssetRecord]:
     """Check an asset may be composited; returns its lineage chain.
 
@@ -892,6 +971,7 @@ def draw_product(
     region_map_handle: str | None = None,
     reconstruction_report: dict | None = None,
     plate_quality_report: dict | None = None,
+    placement: dict | None = None,
 ) -> tuple[str, dict]:
     """Composite a stored foreground into a scene; returns (handle, receipt).
 
@@ -1048,6 +1128,20 @@ def draw_product(
         "stage_spec": None,
     }
 
+    # Placement (decision 153), model-generated plates only: the
+    # verbatim layer is translated to its grounded anchor before
+    # the composite reads it, so every positional read sees the
+    # product where it will sit. Translation only: pixel values
+    # are byte-identical, and the delivered counts below are
+    # measured against the placed layer.
+    placed_layer = None
+    composite_fg = foreground
+    if placement is not None and plate_kind == "model_generated":
+        placed_layer = translate_layer(
+            foreground, int(placement["dx"]), int(placement["dy"])
+        )
+        composite_fg = placed_layer
+
     # Edge fix (docs/EDGE-FIX.md) for source-derived plates only;
     # every other draw keeps its exact composite. The source photo
     # comes from the layer's own lineage; the thin-structure flag
@@ -1069,14 +1163,14 @@ def draw_product(
             )
         else:
             composite, _in_memory_counts, transformations = composite_images(
-                foreground, plate, layer_image
+                composite_fg, plate, layer_image
             )
             edge_fix_record = EdgeFixReport.skipped(
                 f"disabled by {EDGE_FIX_ENV}"
             ).to_json()
     else:
         composite, _in_memory_counts, transformations = composite_images(
-            foreground, plate, layer_image
+            composite_fg, plate, layer_image
         )
     if _in_memory_counts["opaque_pixels"] == 0:
         # Draw and verify share one contract (badass Gauntlet defect
@@ -1115,9 +1209,15 @@ def draw_product(
     # film shows the file"). A later re-encode or cast that changed
     # pixels would show up here, and the independent verifier
     # (verify_receipt_from_disk) recounts the same files the same way.
-    counts = _measure(
-        store.read_image(foreground_handle), store.read_image(composite_handle)
-    )
+    delivered_fg = store.read_image(foreground_handle)
+    if placed_layer is not None:
+        # With placement, the counts are measured against the
+        # stored layer translated by the receipted offset: the
+        # exact pixels at the placed offset (decision 153).
+        delivered_fg = translate_layer(
+            delivered_fg, int(placement["dx"]), int(placement["dy"])
+        )
+    counts = _measure(delivered_fg, store.read_image(composite_handle))
 
     # The reconstruction block, measured on the stored files like
     # every other count: the layer's own pixels and their overlap
@@ -1253,6 +1353,24 @@ def draw_product(
         # around the product. The counts above are over the stored
         # layer's pixel set, unchanged by it.
         receipt["edge_fix"] = edge_fix_record
+    if placed_layer is not None:
+        # Additive record (decision 153): the translation applied
+        # to the product layer, with the placed layer's pixel hash,
+        # so anyone can rebuild the placed layer from the stored
+        # layer plus this offset and recount the exact pixels
+        # there. The layer was translated only — never scaled or
+        # rotated — so `product_layer_scaled` above stays false
+        # and every count is measured at the placed offset.
+        placement_record = dict(placement)
+        placement_record["placed_pixel_sha256"] = pixel_hash_of_image(placed_layer)
+        placement_record["claim"] = (
+            "The stored product layer was translated by (dx, dy) with no "
+            "resampling: every product pixel value in the composite is "
+            "byte-identical to the stored layer, at the placed offset, "
+            "and the counts above were measured against the layer at "
+            "that offset."
+        )
+        receipt["placement"] = placement_record
     receipt["reconstruction"] = reconstruction_block
     from .plate_quality import VERSION as PLATE_QUALITY_VERSION
     from .cut_quality import VERSION as CUT_QUALITY_VERSION
@@ -2089,7 +2207,12 @@ def verify_receipt_from_disk(
                 f"{composite_image.size}; sizes must match exactly",
             )
         else:
-            counts = _measure(foreground, composite_image)
+            # A placed draw (decision 153) is recounted against the
+            # stored layer at the receipted offset — the exact
+            # pixels at the placed offset. A receipt that claims an
+            # offset its composite does not honour fails here,
+            # because the recount finds the product's pixels changed.
+            counts = _measure(placed_foreground(receipt, foreground), composite_image)
             recomputed.update(counts)
             for field in (
                 "changed_opaque_pixels",
@@ -2286,7 +2409,9 @@ def verify_receipt_from_disk(
                     else None
                 )
                 rebuilt, _, _ = composite_images(
-                    foreground, plate_image, layer_for_rebuild
+                    placed_foreground(receipt, foreground),
+                    plate_image,
+                    layer_for_rebuild,
                 )
                 reproduced = rebuilt.tobytes() == composite_image.tobytes()
                 check(
