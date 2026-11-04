@@ -1,4 +1,4 @@
-"""Interface contract tests (EXPERIMENT — Grok lane prescription).
+"""Interface contract tests (Differential Conformance Suite).
 
 Loads the single written contract (spec/interface.schema.json) and the
 shared differential fixture (tests/fixtures/interface/differential.json,
@@ -181,7 +181,7 @@ def test_own_v4_receipt_validates_clean():
 
 
 def test_rust_v2_receipt_validates_under_its_own_policy():
-    """Grok's kill-shot, this direction: a receipt the Rust build
+    """The kill-shot, this direction: a receipt the Rust build
     issued (schema 2, with its enrichment keys) must verify under this
     build's validator, which keeps the v2 policy."""
     shape, terms = composite._validate_receipt(_receipt("rust-v2.json"))
