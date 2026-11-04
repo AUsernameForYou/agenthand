@@ -67,7 +67,22 @@ _INFLATE_CAP = 1024 * 1024
 
 
 def round6(x: float) -> float:
-    return math.floor(x * 1e6 + 0.5) / 1e6
+    # Round-half-even at the 6th decimal, matching Rust's `round6` and
+    # the interface contract (spec/interface.schema.json). Decision 149:
+    # the previous floor(x * 1e6 + 0.5) form rounded exact ties half-up
+    # and diverged from every other rounding path in either build.
+    s = x * 1e6
+    f = math.floor(s)
+    diff = s - f
+    if diff > 0.5:
+        r = f + 1.0
+    elif diff < 0.5:
+        r = float(f)
+    elif f % 2 == 0:
+        r = float(f)
+    else:
+        r = f + 1.0
+    return r / 1e6
 
 
 # ---------------------------------------------------------------------------
