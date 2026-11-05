@@ -133,29 +133,27 @@ def test_baseline_slot_stays_empty_without_a_baseline_run():
     assert baseline["status"] == "not_measured"
     assert baseline["changed_opaque_pixels"] is None
     assert "TODO(baseline-regeneration)" in baseline["todo"]
-    for page in (INDEX, REPLAY_PAGE):
-        assert 'data-baseline-status="not-measured"' in page
-        assert "NOT MEASURED" in page
-        assert "TODO(baseline-regeneration)" in page
+    # The slot itself lives on the replay page; the longform front
+    # page carries no baseline slot, only the frozen-replay card.
+    assert 'data-baseline-status="not-measured"' in REPLAY_PAGE
+    assert "NOT MEASURED" in REPLAY_PAGE
+    assert "TODO(baseline-regeneration)" in REPLAY_PAGE
+    assert "Frozen replay" in INDEX
+    assert "A recorded run ships in the repo" in INDEX
 
 
-def test_one_click_judge_path_preloads_the_frozen_sample():
-    verify_block = INDEX[
-        INDEX.index('<div class="verify"') : INDEX.index('<div class="opencode">')
-    ]
-    assert "ONE-CLICK JUDGE PATH — FROZEN SAMPLE PRELOADED" in verify_block
-    assert "No upload and no file picker" in verify_block
-    for filename in (
-        "proof-source-v1.png",
-        "proof-mask-v1.png",
-        "proof-layer-v1.png",
-        "proof-output-v1.png",
-    ):
-        assert f'src="{filename}"' in verify_block
-    assert '<input' not in verify_block
-    assert "Verify frozen sample" in verify_block
-    assert "Run one-pixel tamper check" in verify_block
-    assert 'href="replay-v1.html"' in verify_block
+def test_judge_path_on_the_front_page_is_the_frozen_evidence():
+    # The old one-click verify block was retired with the proof
+    # page. The front page's judge path now prints the evidence
+    # commands instead: re-verify every receipt, with the frozen
+    # recorded run shipped in the repo for offline replay. No
+    # upload, no file picker, no live call.
+    get_block = INDEX[INDEX.index("Check the claims yourself") :]
+    assert "agenthand evidence verify --all" in get_block
+    assert "re-verify every receipt" in get_block
+    assert "a frozen recorded run also ships in the repo" in get_block
+    assert "replayed offline" in get_block
+    assert "<input" not in get_block
 
 
 def test_changed_site_assets_use_versioned_filenames():

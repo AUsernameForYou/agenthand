@@ -69,11 +69,35 @@ def test_published_receipt_matches_the_served_files():
 
 
 def test_page_figures_agree_with_the_receipt():
+    # The longform redesign (8b73060) split the old proof page's
+    # jobs across the site: the front page carries the hero run's
+    # figures and the Proof Graph root, the verify page's registry
+    # carries the frozen run's receipt values, and the replay page
+    # prints the receipt's source hash. Each printed figure must
+    # still agree with the published record.
     page = (DOCS / "index.html").read_text(encoding="utf-8")
-    assert f"{RECEIPT['opaque_pixels']:,}" in page  # the hero figure
-    # The printed receipt block carries the receipt file's hashes.
-    assert RECEIPT["source_sha256"] in page
-    assert RECEIPT["foreground_pixel_sha256"] in page
+    # The hero run the front page features (Receipt 33 in the
+    # Proof Graph): core figure, margin count, receipts root.
+    assert "4,053,953" in page
+    assert "381,802" in page
+    assert (
+        "1179530968c27879e3d84aa5475998a475cba64ba5b95f1823a8e7310174ecc3"
+        in page
+    )
+    # The frozen run's receipt values, printed in the verify
+    # page's registry of published demo receipts.
+    verify = (DOCS / "verify.html").read_text(encoding="utf-8")
+    assert f'"opaque_pixels": {RECEIPT["opaque_pixels"]}' in verify
+    assert (
+        f'"changed_opaque_pixels": {RECEIPT["changed_opaque_pixels"]}'
+        in verify
+    )
+    assert RECEIPT["source_pixel_sha256"] in verify
+    assert RECEIPT["foreground_pixel_sha256"] in verify
+    assert RECEIPT["output_pixel_sha256"] in verify
+    # The replay page prints the receipt's source file hash.
+    replay_page = (DOCS / "replay-v1.html").read_text(encoding="utf-8")
+    assert RECEIPT["source_sha256"] in replay_page
 
 
 MANIFEST = json.loads((DOCS / "proof-run.json").read_text(encoding="utf-8"))
@@ -128,17 +152,32 @@ def test_proof_run_manifest_matches_replay_readme_and_page():
         assert f"{tool} ${MANIFEST['costs_usd'][tool]}" in readme
 
     page = (DOCS / "index.html").read_text(encoding="utf-8")
-    # The static fallback standing in the hero is the manifest's
-    # figure, and the display script reads the manifest itself —
-    # no run constant is baked into the page's JS.
-    assert (
-        f'<span id="hero-checked">{MANIFEST["pixels"]["opaque_checked"]:,}</span>'
-        in page
-    )
-    assert "fetch('proof-run.json')" in page
-    assert 'id="receipt-costs"' in page
+    # The longform page carries the manifest's world in prose: the
+    # three tools under their display model names, and the frozen
+    # replay presented as a recorded run that ships in the repo.
+    # The page's only script is the demo player; no run figure is
+    # baked into page JS, so the prose figures above are the page's
+    # own and must agree with the manifest unaided.
+    for tool, display in (
+        ("identify", "Muse Spark 1.3"),
+        ("cut_out", "SAM 3.1"),
+        ("draw", "Muse Image 1.0"),
+    ):
+        assert tool in MANIFEST["models"]
+        assert f'<div class="mono">{tool}</div>' in page
+        assert f'<p class="model">{display}</p>' in page
+    assert "Frozen replay" in page
+    assert "A recorded run ships in the repo" in page
     scripts = re.findall(r"<script>(.*?)</script>", page, flags=re.DOTALL)
-    assert all("580613" not in s and "580,613" not in s for s in scripts)
+    for constant in (
+        "580613",
+        "580,613",
+        "4053953",
+        "4,053,953",
+        "381802",
+        "381,802",
+    ):
+        assert all(constant not in s for s in scripts), constant
 
 
 def test_verifier_grades_the_receipt_not_constants():
@@ -165,27 +204,28 @@ def test_verifier_grades_the_receipt_not_constants():
     assert "createImageBitmap" not in js
     assert "refuses it rather than grading approximately" not in js
     page = (DOCS / "index.html").read_text(encoding="utf-8")
-    assert "embedded Display P3 profile does not change the pixel values" in page
+    # The longform page no longer wires the browser verifier in;
+    # its re-check path is the printed evidence command, and the
+    # old iCCP-refusal claim stays absent. The verifier file above
+    # still ships in docs/ as the graded implementation.
+    assert "agenthand evidence verify --all" in page
     assert "file carrying an embedded colour profile is refused outright" not in page
-    assert 'src="verifier-v6.js"' in page
-    assert 'id="verify-btn"' in page
-    assert 'id="verify-tamper-btn"' in page
-    assert 'id="verify-tamper"' not in page  # no checkbox gate before the click
 
 
 def test_displayed_counting_code_matches_the_verifier_file():
+    # The longform page displays no counting code, so there is no
+    # second copy to drift against: the single shipped
+    # implementation is the one in verifier-v6.js. This pin keeps
+    # its canonical block intact and the page free of a re-typed
+    # copy that could silently diverge from it.
     page = (DOCS / "index.html").read_text(encoding="utf-8")
-    start = page.index('<div class="opencode">')
-    pre = page[page.index('<pre class="code">', start) : page.index("</pre>", start)]
-    displayed = html_module.unescape(re.sub(r"<[^>]+>", "", pre)).strip()
+    assert 'class="opencode"' not in page
 
     js = (DOCS / "verifier-v6.js").read_text(encoding="utf-8")
     match = re.search(
         r"/\* Replicates composite\.py.*?\n\}\n", js, flags=re.DOTALL
     )
     assert match, "countChanged not found in verifier-v6.js"
-    shipped = match.group(0).strip()
-    assert displayed == shipped
 
 
 @pytest.mark.skipif(shutil.which("node") is None, reason="node not available")
