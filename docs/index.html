@@ -69,6 +69,18 @@
     overflow:hidden;background:#000;
   }
   .video-frame iframe{width:100%;height:100%;border:0;display:block}
+  .poster{
+    width:100%;height:100%;border:0;background:#fff;cursor:pointer;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;
+    font-family:inherit;padding:10px;
+  }
+  .poster img{width:min(200px,46%);height:auto}
+  .poster .poster-word{font-size:clamp(26px,4.4vw,40px);font-weight:800;letter-spacing:-.02em;color:var(--ink);line-height:1.1}
+  .poster .play-pill{
+    margin-top:12px;background:var(--cyan-dark);color:#fff;font-weight:700;font-size:15.5px;
+    border-radius:999px;padding:10px 22px;
+  }
+  .poster:hover .play-pill{background:var(--cyan)}
   .brandnote{margin:14px 0 0;font-size:13.5px;color:#9fb3ba;max-width:46em}
   img[src*="assets/cast/"]{object-position:50% 0%}
   @media (max-width:640px){
@@ -246,7 +258,19 @@
       <a class="btn solid" href="#watch">Watch the demo</a>
       <a class="btn ghost-light" href="https://github.com/AUsernameForYou/agenthand-rust/releases/download/v1.0.0-hackathon/agenthand-demo-x.mp4">Download from GitHub</a>
     </div>
-    <div class="video-frame"><iframe id="watch" src="https://drive.google.com/file/d/1wjw5D1DGnBCPZ2kiHKgpfYRrIdT_tdNq/preview" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen title="The agenthand demo film, 3 minutes"></iframe></div>
+    <div class="video-frame" id="watch"><button class="poster" id="posterBtn" type="button" aria-label="Play the agenthand demo film"><img src="logo-rotating-v3.gif" alt="agenthand logo with its rotating blue circle"><span class="poster-word">agenthand</span><span class="play-pill">▶ &nbsp;Watch the 3-minute film</span></button></div>
+    <script>
+      document.getElementById('posterBtn').addEventListener('click', function () {
+        var f = document.createElement('iframe');
+        f.src = 'https://drive.google.com/file/d/1wjw5D1DGnBCPZ2kiHKgpfYRrIdT_tdNq/preview';
+        f.allow = 'autoplay; fullscreen; picture-in-picture';
+        f.allowFullscreen = true;
+        f.title = 'The agenthand demo film, 3 minutes';
+        var w = document.getElementById('watch');
+        w.innerHTML = '';
+        w.appendChild(f);
+      });
+    </script>
     <p class="brandnote">Trademark caution: the bike maker's name is blurred wherever it appears, in the film and on this page. The proof files in the repo are unaltered.</p>
   </div>
 </div>
