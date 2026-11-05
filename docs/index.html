@@ -72,11 +72,15 @@
   .brandnote{margin:14px 0 0;font-size:13.5px;color:#9fb3ba;max-width:46em}
   img[src*="assets/cast/"]{object-position:50% 0%}
   @media (max-width:640px){
+    .cover{padding:34px 0 44px}
     .cover .wrap{display:flex;flex-direction:column}
-    .cover .ctas{order:2}
-    .cover p.lede{order:3}
-    .cover .video-frame{order:4}
-    .cover .brandnote{order:5}
+    .cover-mark{width:150px;margin-bottom:16px;order:0}
+    .cover .video-frame{order:1;margin-top:0}
+    .cover .brandnote{order:2}
+    .cover .eyebrow{order:3;margin-top:22px}
+    .cover h1{order:4}
+    .cover .ctas{order:5}
+    .cover p.lede{order:6}
   }
   .pace{
     background:var(--wash);border-bottom:1px solid var(--line);padding:22px 0;
