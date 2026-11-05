@@ -64,17 +64,18 @@
   .cover .ctas{display:flex;flex-wrap:wrap;gap:12px}
   .cover .ctas + .ctas{margin-top:12px}
   .cover-mark{display:block;width:96px;height:auto;margin:0 auto 24px}
-  .cover video{
-    width:100%;margin-top:40px;border:2px solid var(--cyan);border-radius:10px;
-    background:#000;aspect-ratio:16/9;
+  .video-frame{
+    margin-top:40px;aspect-ratio:16/9;border:2px solid var(--cyan);border-radius:10px;
+    overflow:hidden;background:#000;
   }
+  .video-frame iframe{width:100%;height:100%;border:0;display:block}
   .brandnote{margin:14px 0 0;font-size:13.5px;color:#9fb3ba;max-width:46em}
   img[src*="assets/cast/"]{object-position:50% 0%}
   @media (max-width:640px){
     .cover .wrap{display:flex;flex-direction:column}
     .cover .ctas{order:2}
     .cover p.lede{order:3}
-    .cover video{order:4}
+    .cover .video-frame{order:4}
     .cover .brandnote{order:5}
   }
   .pace{
@@ -241,8 +242,8 @@
       <a class="btn solid" href="#watch">Watch the demo</a>
       <a class="btn ghost-light" href="https://github.com/AUsernameForYou/agenthand-rust/releases/download/v1.0.0-hackathon/agenthand-demo-x.mp4">Download from GitHub</a>
     </div>
-    <video id="watch" controls preload="none" playsinline src="https://github.com/AUsernameForYou/agenthand-rust/releases/download/v1.0.0-hackathon/agenthand-demo-x.mp4"></video>
-    <p class="brandnote">Trademark caution: the bike maker's name is blurred in the film and on this page. The proof files in the repo are unaltered.</p>
+    <div class="video-frame"><iframe id="watch" src="https://drive.google.com/file/d/1wjw5D1DGnBCPZ2kiHKgpfYRrIdT_tdNq/preview" allow="autoplay; fullscreen; picture-in-picture" allowfullscreen title="The agenthand demo film, 3 minutes"></iframe></div>
+    <p class="brandnote">Trademark caution: the bike maker's name is blurred wherever it appears, in the film and on this page. The proof files in the repo are unaltered.</p>
   </div>
 </div>
 
