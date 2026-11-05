@@ -274,14 +274,23 @@
     <div class="video-frame" id="watch"><button class="poster" id="posterBtn" type="button" aria-label="Play the agenthand demo film"><img src="logo-rotating-v3.gif" alt="agenthand logo with its rotating blue circle"><span class="poster-word">agenthand</span><span class="play-pill">▶ &nbsp;Watch the 3-minute film</span></button></div>
     <script>
       document.getElementById('posterBtn').addEventListener('click', function () {
-        var f = document.createElement('iframe');
-        f.src = 'https://drive.google.com/file/d/1wjw5D1DGnBCPZ2kiHKgpfYRrIdT_tdNq/preview';
-        f.allow = 'autoplay; fullscreen; picture-in-picture';
-        f.allowFullscreen = true;
-        f.title = 'The agenthand demo film, 3 minutes';
+        var v = document.createElement('video');
+        v.src = 'assets/demo-phone.mp4';
+        v.poster = 'assets/video-poster.jpg';
+        v.controls = true;
+        v.autoplay = true;
+        v.playsInline = true;
+        v.setAttribute('playsinline', '');
+        v.title = 'The agenthand demo film, 3 minutes';
+        v.style.width = '100%';
+        v.style.height = '100%';
+        v.style.display = 'block';
+        v.style.background = '#000';
         var w = document.getElementById('watch');
         w.innerHTML = '';
-        w.appendChild(f);
+        w.appendChild(v);
+        var p = v.play();
+        if (p && p.catch) { p.catch(function () {}); }
       });
     </script>
     <p class="brandnote">Trademark caution: the bike maker's name is blurred wherever it appears, in the film and on this page. The proof files in the repo are unaltered.</p>
